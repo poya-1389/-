@@ -4,6 +4,7 @@ import pytz
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError
 from telethon.tl.functions.account import UpdateProfileRequest
 
 API_ID = int(os.environ.get("API_ID"))
@@ -12,8 +13,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 # ربات مرکزی هلپر
 bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
 user_data = {}
-active_clients = {}  # برای زنده نگه داشتن کلاینت کاربران بدون دیسکانکت شدن
+active_clients = {}
+generator_data = {} # ذخیره موقت مراحل ساخت سشن کاربران
 
 FONTS = {
     0: {'0':'0','1':'1','2':'2','3':'3','4':'4','5':'5','6':'6','7':'7','8':'8','9':'9'},
@@ -38,89 +41,78 @@ def apply_font(t_str, font_id):
     f_dict = FONTS.get(font_id, FONTS[0])
     return "".join(f_dict.get(c, c) for c in t_str)
 
-# پردازشگر لحظه‌ای و متصل برای تغییر ساعت
 async def self_bot_worker(user_id, client):
     last_time = ""
     try:
         me = await client.get_me()
         f_name = me.first_name or "User"
-        
         while True:
-            # اگر کاربر سلف را خاموش کرد، حلقه کاملاً متوقف شود
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
-                
             ud = user_data[user_id]
             tz = pytz.timezone('Asia/Tehran')
             curr_time = datetime.now(tz).strftime("%H:%M")
-            
-            # تغییر لحظه‌ای اسم به محض تغییر دقیقه ساعت گوشی
             if curr_time != last_time:
                 f_time = apply_font(curr_time, ud["font_id"])
                 await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
                 last_time = curr_time
-                print(f"ساعت اکانت {user_id} آپدیت شد به: {f_time}")
-                
-            await asyncio.sleep(5) # هر ۵ ثانیه چک میکند که آیا دقیقه عوض شده یا نه (بدون مصرف رم زیاد)
-            
+            await asyncio.sleep(5)
     except Exception as e:
-        print(f"خطای داخلی در اجرای سلف {user_id}: {e}")
+        print(f"Loop error for {user_id}: {e}")
     finally:
         await client.disconnect()
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     user_id = event.sender_id
-    if user_id not in user_data:
-        user_data[user_id] = {"session": None, "font_id": 1, "status": False, "task": None, "step": "get_session"}
-        await event.respond("سلام! ⚡️\nلطفاً کُد نشست (Session String) تلتون خود را ارسال کنید:")
+    # اگر کاربر در حال ساختن سشن است، منو را نشان ندهیم تا مراحلش خراب نشود
+    if user_id in generator_data:
         return
-    ud = user_data[user_id]
-    st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
-    ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
-    btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-    await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
 
-@bot.on(events.NewMessage)
-async def message_handler(event):
-    user_id = event.sender_id
-    if user_id in user_data and user_data[user_id].get("step") == "get_session":
-        # پاکسازی تمام فضاهای خالی پنهان تلگرام
-        clean_session = event.text.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    if user_id not in user_data:
+        user_data[user_id] = {"session": None, "font_id": 1, "status": False, "task": None, "step": "menu"}
         
-        # تست زنده و آنی سشن قبل از هرکاری برای جلوگیری از ارور دیسک
-        try:
-            client = TelegramClient(StringSession(clean_session), API_ID, API_HASH)
-            await client.connect()
-            if not await client.is_user_authorized():
-                await event.respond("❌ این سشن معتبر نیست یا منقضی شده است. دوباره تلاش کنید.")
-                await client.disconnect()
-                return
-        except Exception:
-            await event.respond("❌ ساختار متن ارسال شده اشتباه است و تلتون آن را نمی‌شناسد.\nمطمئن شوید سشن تلتون (Telethon) است.")
-            return
-            
-        # ذخیره اطلاعات و زنده نگه داشتن کلاینت
-        user_data[user_id]["session"] = clean_session
-        user_data[user_id]["step"] = "managed"
-        user_data[user_id]["status"] = True
-        active_clients[user_id] = client
-        
-        loop = asyncio.get_event_loop()
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        await event.respond("✅ سلف با موفقیت به سرور متصل شد و زنده است! برای مدیریت دوباره /start بزنید.")
+    ud = user_data[user_id]
+    
+    if ud["session"] is None:
+        # کاربری که هنوز اکانت متصل نکرده است دو دکمه دارد
+        btns = [
+            [Button.inline("🔑 ساخت خودکار سشن (سریع)", b"start_gen")],
+            [Button.inline("✍️ ارسال سشن آماده متنی", b"send_ready_session")]
+        ]
+        await event.respond("⚡️ به ربات مدیریت سلف‌بات خوش آمدید!\nلطفاً یکی از روش‌های زیر را برای متصل کردن اکانت انتخاب کنید:", buttons=btns)
+    else:
+        st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
+        ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
+        btns = [
+            [Button.inline(f"وضعیت سلف: {st}", b"t_status")],
+            [Button.inline(f"فونت ساعت: {ft}", b"t_font")],
+            [Button.inline("❌ حذف اکانت", b"del")]
+        ]
+        await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
+    
+    if data == b"send_ready_session":
+        user_data[user_id]["step"] = "get_session"
+        await event.edit("✍️ لطفاً کُد نشست (Session String) متنی تلتون خود را ارسال کنید:")
+        return
+
+    elif data == b"start_gen":
+        # شروع فرآیند گرفتن ای‌پی‌آیدی و ای‌پی‌هش
+        generator_data[user_id] = {"step": "get_api_id", "api_id": None, "api_hash": None, "phone": None, "client": None, "phone_code_hash": None}
+        await event.edit("📥 قدم اول:\nلطفاً **API_ID** اکانت خود را بفرستید:\n(مثال: 123456)")
+        return
+
     if user_id not in user_data:
         return
         
     if data == b"t_status":
         user_data[user_id]["status"] = not user_data[user_id]["status"]
         if user_data[user_id]["status"]:
-            # روشن کردن مجدد و ساخت کلاینت پایدار
             try:
                 client = TelegramClient(StringSession(user_data[user_id]["session"]), API_ID, API_HASH)
                 await client.connect()
@@ -149,5 +141,132 @@ async def callback_handler(event):
     btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
     await event.edit("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
 
+# هندلر اصلی برای دریافت متن‌ها و کدهای سشن‌ساز و سشن آماده
+@bot.on(events.NewMessage)
+async def message_handler(event):
+    user_id = event.sender_id
+    text = event.text.strip()
+    
+    # بخش اول: اگر کاربر دارد سشن به صورت خودکار می‌سازد
+    if user_id in generator_data:
+        gd = generator_data[user_id]
+        
+        if gd["step"] == "get_api_id":
+            if not text.isdigit():
+                await event.respond("❌ لطفاً فقط عدد بفرستید! مجدداً API_ID را وارد کنید:")
+                return
+            gd["api_id"] = int(text)
+            gd["step"] = "get_api_hash"
+            await event.respond("📥 قدم دوم:\nلطفاً **API_HASH** اکانت خود را بفرستید:")
+            
+        elif gd["step"] == "get_api_hash":
+            gd["api_hash"] = text
+            gd["step"] = "get_phone"
+            await event.respond("📞 قدم سوم:\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
+            
+        elif gd["step"] == "get_phone":
+            gd["phone"] = text
+            await event.respond("⏳ در حال برقراری ارتباط با تلگرام و ارسال کد تایید...")
+            
+            try:
+                # ایجاد کلاینت موقت با اطلاعات اختصاصی خود کاربر
+                client = TelegramClient(StringSession(), gd["api_id"], gd["api_hash"])
+                await client.connect()
+                
+                # درخواست ارسال کد تایید به اکانت کاربر
+                send_code_res = await client.send_code_request(gd["phone"])
+                
+                gd["client"] = client
+                gd["phone_code_hash"] = send_code_res.phone_code_hash
+                gd["step"] = "get_code"
+                
+                await event.respond("📩 قدم چهارم:\nیک کُد از طرف تلگرام برای شما ارسال شد. لطفاً آن را اینجا بفرستید:\n\n⚠️ **نکته مهم:** برای اینکه تلگرام کد را خراب نکند، بین اعداد آن فاصله بگذارید یا یک کاراکتر مثل خط تیره اضافه کنید. (مثال: `1-2-3-4-5` یا `1 2 3 4 5`)")
+            except Exception as e:
+                await event.respond(f"❌ خطایی رخ داد: {e}\nمراحل لغو شد. مجدداً /start کنید.")
+                del generator_data[user_id]
+                
+        elif gd["step"] == "get_code":
+            # تمیز کردن فاصله یا خط تیره‌ای که کاربر بین اعداد کد گذاشته است
+            clean_code = text.replace(" ", "").replace("-", "").replace("_", "")
+            client = gd["client"]
+            
+            try:
+                # تلاش برای ورود با کد تایید
+                await client.sign_in(gd["phone"], clean_code, phone_code_hash=gd["phone_code_hash"])
+                
+                # اگر ورود موفق بود، سشن ساخته می‌شود
+                session_string = client.session.save()
+                
+                user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
+                active_clients[user_id] = client
+                
+                loop = asyncio.get_event_loop()
+                user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+                
+                await event.respond("🎉 فوق‌العاده است! سشن اکانت شما با موفقیت در پس‌زمینه ساخته و فعال شد!")
+                del generator_data[user_id]
+                
+                # باز کردن پنل مدیریت برای کاربر
+                st = "🟢 روشن"
+                ft = FONT_NAMES[1]
+                btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
+                await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+                
+            except SessionPasswordNeededError:
+                # اگر اکانت رمز دو مرحله‌ای داشته باشد وارد این بخش می‌شود
+                gd["step"] = "get_password"
+                await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
+                
+            except Exception as e:
+                await event.respond(f"❌ کد اشتباه است یا خطایی رخ داد: {e}\nمجدداً کُد ارسالی را به درستی وارد کنید:")
+                
+        elif gd["step"] == "get_password":
+            client = gd["client"]
+            try:
+                # ورود با استفاده از رمز دو مرحله‌ای
+                await client.sign_in(password=text)
+                
+                session_string = client.session.save()
+                user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
+                active_clients[user_id] = client
+                
+                loop = asyncio.get_event_loop()
+                user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+                
+                await event.respond("🎉 فوق‌العاده است! با رمز دو مرحله‌ای وارد شدید و سلف فعال شد!")
+                del generator_data[user_id]
+                
+                st = "🟢 روشن"
+                ft = FONT_NAMES[1]
+                btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
+                await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+            except Exception as e:
+                await event.respond(f"❌ رمز عبور اشتباه است: {e}\nلطفاً مجدداً رمز صحیح را بفرستید:")
+        return
+
+    # بخش دوم: اگر کاربر تمایل داشت سشن آماده متنی بفرستد (همان قابلیت قبلی)
+    if user_id in user_data and user_data[user_id].get("step") == "get_session":
+        clean_session = text.replace("\n", "").replace("\r", "").replace(" ", "")
+        try:
+            client = TelegramClient(StringSession(clean_session), API_ID, API_HASH)
+            await client.connect()
+            if not await client.is_user_authorized():
+                await event.respond("❌ این سشن معتبر نیست یا منقضی شده است. دوباره تلاش کنید.")
+                await client.disconnect()
+                return
+        except Exception:
+            await event.respond("❌ ساختار متن ارسال شده اشتباه است.\nمطمئن شوید سشن تلتون (Telethon) است.")
+            return
+            
+        user_data[user_id]["session"] = clean_session
+        user_data[user_id]["step"] = "managed"
+        user_data[user_id]["status"] = True
+        active_clients[user_id] = client
+        
+        loop = asyncio.get_event_loop()
+        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+        await event.respond("✅ سلف با موفقیت به سرور متصل شد و زنده است! برای مدیریت دوباره /start بزنید.")
+
 if __name__ == "__main__":
     bot.run_until_disconnected()
+
