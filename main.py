@@ -8,16 +8,15 @@ from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.functions.account import UpdateProfileRequest
 
-# دریافت اطلاعات اصلی ربات از متغیرهای ریلوی شما
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# راه‌اندازی ربات مرکزی هلپر
 bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 active_clients = {}
 generator_data = {}
+active_signins = {}  # برای زنده نگه داشتن کلاینت ثبت‌نام در حافظه
 
 # ----------------- دیتابیس SQLite دایمی -----------------
 DB_FILE = "selfbot_database.db"
@@ -178,7 +177,7 @@ async def callback_handler(event):
         return
 
     elif data == b"start_gen_fast":
-        generator_data[user_id] = {"step": "get_phone", "phone": None, "client": None, "phone_code_hash": None}
+        generator_data[user_id] = {"step": "get_phone", "phone": None, "phone_code_hash": None}
         await event.edit("📞 **قدم اول:**\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
         return
 
@@ -233,26 +232,34 @@ async def message_handler(event):
             gd["phone"] = text
             await event.respond("⏳ در حال ارتباط مستقیم با سرورهای تلگرام و ارسال کد...")
             try:
-                # ترفند طلایی: استفاده از API_ID و API_HASH خود شما که کاملاً با سرور هماهنگ است
+                # کلاینت را در دایرکتوری یا متغیر سراسری ذخیره می‌کنیم تا از بین نرود
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
                 await client.connect()
                 
                 send_code_res = await client.send_code_request(gd["phone"])
-                gd["client"] = client
+                active_signins[user_id] = client # کلاینت به این کاربر قفل شد
                 gd["phone_code_hash"] = send_code_res.phone_code_hash
                 gd["step"] = "get_code"
                 
                 await event.respond(
                     "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد. لطفاً آن را ارسال کنید:\n\n"
-                    "⚠️ **نکته بسیار مهم:** برای جلوگیری از بلاک شدن پیام توسط تلگرام، حتماً بین اعداد کد **فاصله** بگذارید.\n(مثال: `1 2 3 4 5`)"
+                    "⚠️ **نکته بسیار مهم:** حتماً بین اعداد کد **فاصله** بگذارید.\n(مثال: `1 2 3 4 5`)"
                 )
             except Exception as e:
                 await event.respond(f"❌ خطایی در ارسال کد رخ داد: {e}\nمراحل لغو شد. مجدداً /start کنید.")
+                if user_id in active_signins: del active_signins[user_id]
                 del generator_data[user_id]
                 
         elif gd["step"] == "get_code":
             clean_code = text.replace(" ", "").replace("-", "").replace("_", "")
-            client = gd["client"]
+            
+            # فراخوانی کلاینتِ اختصاصی زنده نگه داشته شده
+            client = active_signins.get(user_id)
+            if not client:
+                await event.respond("❌ نشست شما منقضی شده یا سرور ری‌استارت شده است. لطفاً فرآیند را دوباره با زدن /start آغاز کنید.")
+                del generator_data[user_id]
+                return
+                
             try:
                 await client.sign_in(gd["phone"], clean_code, phone_code_hash=gd["phone_code_hash"])
                 session_string = client.session.save()
@@ -264,8 +271,9 @@ async def message_handler(event):
                 loop = asyncio.get_event_loop()
                 user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
                 
-                await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ذخیره شد!**\n\n⚙️ سلف‌بات شما هم‌اکنون روشن است و دقیقه‌ای نام فامیلی را آپدیت می‌کند.")
+                await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ذخیره شد!**\n\n⚙️ سلف‌بات شما هم‌اکنون روشن است.")
                 del generator_data[user_id]
+                if user_id in active_signins: del active_signins[user_id]
                 
                 st = "🟢 روشن"
                 ft = FONT_NAMES[1]
@@ -276,10 +284,15 @@ async def message_handler(event):
                 gd["step"] = "get_password"
                 await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
             except Exception as e:
-                await event.respond(f"❌ کد اشتباه است یا مشکلی پیش آمد: {e}\nمجدداً کُد ارسالی را به درستی وارد کنید:")
+                await event.respond(f"❌ کد اشتباه است یا مشکلی پیش آمد: {e}\nمجدداً کُد ارسالی را به درستی با فاصله وارد کنید:")
                 
         elif gd["step"] == "get_password":
-            client = gd["client"]
+            client = active_signins.get(user_id)
+            if not client:
+                await event.respond("❌ نشست منقضی شد. دوباره /start بزنید.")
+                del generator_data[user_id]
+                return
+                
             try:
                 await client.sign_in(password=text)
                 session_string = client.session.save()
@@ -293,6 +306,7 @@ async def message_handler(event):
                 
                 await event.respond("🎉 **با رمز دو مرحله‌ای وارد شدید و اکانت متصل شد!**")
                 del generator_data[user_id]
+                if user_id in active_signins: del active_signins[user_id]
                 
                 st = "🟢 روشن"
                 ft = FONT_NAMES[1]
