@@ -88,9 +88,9 @@ FONTS = {
 }
 
 FONT_NAMES = {
-    0: "معمولی (123)", 1: "بولد (𝟭𝟮𝟯)", 2: "ماشین تحریر (𝟷𝟸𝟹)", 
+    0: "معمولی (123)", 1: "بولد (𝟭𝟮𝟯)", 2: "تحریر (𝟷𝟸𝟹)", 
     3: "دایره‌ای (①②③)", 4: "نقطه‌دار (⒈⒉⒊)", 5: "مربعی (🄿🄱🄲)", 
-    6: "کج (𝟢𝟣𝟤)", 7: "ریاضی (𝞯🞱🞲)", 8: "فارسی (۱۲۳)", 9: "عربی (١٢٣)"
+    6: "کج (𝟢𝟣𝟤)", 7: "محور (𝞯🞱🞲)", 8: "فارسی (۱۲۳)", 9: "عربی (١٢٣)"
 }
 
 def apply_font(t_str, font_id):
@@ -163,10 +163,10 @@ async def start_handler(event):
     
     if ud["session"] is None:
         btns = [
-            [Button.inline("📱 ساخت خودکار سلف با شماره تلفن", b"start_gen_fast")],
-            [Button.inline("✍️ ارسال سشن آماده متنی", b"send_ready_session")]
+            [Button.inline("• ‹ساخت خودکار ‹پیشنهادی ", b"start_gen_fast")],
+            [Button.inline("• ارسال سشن آماده", b"send_ready_session")]
         ]
-        await event.respond("⚡️ به ربات مدیریت سلف‌بات خوش آمدید!\nلطفاً یکی از روش‌های زیر را انتخاب کنید:", buttons=btns)
+        await event.respond("⚡️ به ربات نوا سلف منیجر خوش آمدید!\nلطفاً یکی از روش‌های زیر را انتخاب کنید:", buttons=btns)
     else:
         st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
         ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
@@ -193,7 +193,7 @@ async def callback_handler(event):
 
     elif data == b"start_gen_fast":
         generator_data[user_id] = {"step": "get_phone", "phone": None, "phone_code_hash": None, "code_buffer": ""}
-        await event.edit("📞 **قدم اول:**\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
+        await event.edit("🔗 **نوا سلف منیجر**\nلطفاً **شماره تلفن** اکانت خود را به صورت انگلیسی بدون صفر و فاصله همراه با کد کشور بفرستید:\n(مثال: `+980123456789`)")
         return
 
     if user_id in generator_data and generator_data[user_id]["step"] == "get_code":
@@ -203,10 +203,10 @@ async def callback_handler(event):
             if action.isdigit():
                 if len(gd["code_buffer"]) < 5:
                     gd["code_buffer"] += action
-                await event.edit("📩 **قدم دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:\n(این روش ۱۰۰٪ امن است و تلگرام متوجه کد نمی‌شود)", buttons=get_keyboard_layout(gd["code_buffer"]))
+                await event.edit("📩 **نوا سلف منیجر**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
             elif action == "clear":
                 gd["code_buffer"] = ""
-                await event.edit("📩 **قدم دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:\n(این روش ۱۰۰٪ امن است و تلگرام متوجه کد نمی‌شود)", buttons=get_keyboard_layout(gd["code_buffer"]))
+                await event.edit("📩 **نوا سلف منیجر**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
             elif action == "submit":
                 if len(gd["code_buffer"]) < 5:
                     await event.answer("⚠️ لطفاً کد ۵ رقمی را کامل وارد کنید!", alert=True)
@@ -273,7 +273,7 @@ async def process_code_signin(event, user_id, code):
         loop = asyncio.get_event_loop()
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
         
-        await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ذخیره شد!**\n\n⚙️ سلف‌بات شما هم‌اکنون روشن است.")
+        await event.respond("🎉 **اکانت با موفقیت متصل و اطلاعات در دیتابیس ذخیره شد!**\n\n⚙️ نواسلف هم‌اکنون روی اکانت شما روشن است.")
         del generator_data[user_id]
         if user_id in active_signins: del active_signins[user_id]
         
@@ -371,7 +371,7 @@ async def message_handler(event):
         
         loop = asyncio.get_event_loop()
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        await event.respond("✅ سلف متنی با موفقیت ثبت، دیتابیس و زنده شد!")
+        await event.respond("✅ سلف با موفقیت ثبت، اطلاعات از دیتابیس دریافت شد!")
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
