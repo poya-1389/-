@@ -11,7 +11,7 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING").strip()
 
-# راه اندازی کلاینت تلتون با سشن استرینگ شما
+# راه اندازی کلاینت تلتون
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # تبدیل اعداد انگلیسی به فونت بولد درخواستی شما
@@ -45,25 +45,8 @@ async def main():
         except Exception as e:
             print(f"خطایی رخ داد: {e}")
             
-        await asyncio.sleep(30) # هر ۳۰ ثانیه چک می‌کنه
+        await asyncio.sleep(30)
 
 if __name__ == "__main__":
     client.start()
     client.loop.run_until_complete(main())
-                    
-                    # دریافت اطلاعات اکانت خودت برای حفظ نام کوچک
-                    me = await app.get_me()
-                    first_name = me.first_name or ""
-                    
-                    # آپدیت پروفایل با فامیلی جدید (ساعت بولد)
-                    await app.update_profile(first_name=first_name, last_name=bold_time)
-                    last_time = current_time
-                    print(f"ساعت به روز رسانی شد: {bold_time}")
-                    
-            except Exception as e:
-                print(f"خطایی رخ داد: {e}")
-                
-            await asyncio.sleep(30) # هر ۳۰ ثانیه چک می‌کنه
-
-if __name__ == "__main__":
-    app.run(main())
