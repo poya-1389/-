@@ -10,11 +10,11 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# راه‌اندازی ربات هلپر اصلی
+# راه‌اندازی ربات مرکزی
 bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 user_data = {}
 
-# لیست ۱۰ فونت مختلف برای اعداد
+# آرشیو ۱۰ فونت مختلف برای اعداد
 FONTS = {
     0: {'0':'0','1':'1','2':'2','3':'3','4':'4','5':'5','6':'6','7':'7','8':'8','9':'9'}, # معمولی
     1: {'0':'𝟬','1':'𝟭','2':'𝟮','3':'𝟯','4':'𝟰','5':'𝟱','6':'𝟲','7':'𝟳','8':'𝟴','9':'𝟵'}, # بولد انگلیسی
@@ -46,25 +46,33 @@ async def self_bot_worker(user_id):
                 break
             ud = user_data[user_id]
             
-            clean_session = ud["session"].strip().replace("\n", "").replace("\r", "")
+            # لود کلاینت از سشن متنی خالص
+            client = TelegramClient(StringSession(ud["session"]), API_ID, API_HASH)
             
-            # رفع مشکل اصلی: ساخت کلاینت تلتون کاملاً مجزا در حافظه RAM سرور بدون تداخل دیسک
-            client = TelegramClient(StringSession(clean_session), API_ID, API_HASH, base_logger='telethon')
+            # اتصال و استارت کلاینت کاربر به صورت صحیح در بک‌گراند ریلوی
+            await client.connect()
+            if not await client.is_user_authorized():
+                print(f"سشن کاربر {user_id} منقضی شده است.")
+                break
+                
+            me = await client.get_me()
+            f_name = me.first_name or "User"
             
-            async with client:
-                me = await client.get_me()
-                f_name = me.first_name or "User"
+            tz = pytz.timezone('Asia/Tehran')
+            curr_time = datetime.now(tz).strftime("%H:%M")
+            
+            if curr_time != last_time:
+                f_time = apply_font(curr_time, ud["font_id"])
+                # آپدیت فامیلی با حفظ اسم کوچک
+                await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
+                last_time = curr_time
+                print(f"زمان برای {user_id} به {f_time} تغییر کرد.")
                 
-                tz = pytz.timezone('Asia/Tehran')
-                curr_time = datetime.now(tz).strftime("%H:%M")
-                
-                if curr_time != last_time:
-                    f_time = apply_font(curr_time, ud["font_id"])
-                    await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
-                    last_time = curr_time
-                    print(f"Time updated for {user_id} -> {f_time}")
+            await client.disconnect() # دیسکانکت برای جلوگیری از باز ماندن سشن‌ها و ارور
+            
         except Exception as e:
-            print(f"Error for {user_id}: {e}")
+            print(f"خطا در سلف {user_id}: {e}")
+            
         await asyncio.sleep(30)
 
 @bot.on(events.NewMessage(pattern='/start'))
@@ -72,7 +80,7 @@ async def start_handler(event):
     user_id = event.sender_id
     if user_id not in user_data:
         user_data[user_id] = {"session": None, "font_id": 1, "status": False, "task": None, "step": "get_session"}
-        await event.respond("سلام!\nلطفاً کُد نشست (Session String) تلتون اکانت خود را بفرستید:")
+        await event.respond("سلام!\nلطفاً کُد نشست (Session String) متنی تلتون خود را ارسال کنید:")
         return
     ud = user_data[user_id]
     st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
@@ -84,13 +92,16 @@ async def start_handler(event):
 async def message_handler(event):
     user_id = event.sender_id
     if user_id in user_data and user_data[user_id].get("step") == "get_session":
-        user_data[user_id]["session"] = event.text.strip()
+        # پاکسازی کاراکترهای مخفی که تلگرام به متون طولانی اضافه میکنه
+        raw_session = event.text.strip().replace("\n", "").replace("\r", "")
+        
+        user_data[user_id]["session"] = raw_session
         user_data[user_id]["step"] = "managed"
         user_data[user_id]["status"] = True
         
         loop = asyncio.get_event_loop()
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id))
-        await event.respond("✅ سلف با موفقیت فعال شد! برای مدیریت دکمه‌ها دوباره /start بزنید.")
+        await event.respond("✅ سلف متنی با موفقیت ثبت شد! برای مدیریت دکمه‌ها دوباره /start بزنید.")
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -106,7 +117,7 @@ async def callback_handler(event):
         else:
             if user_data[user_id]["task"]: user_data[user_id]["task"].cancel()
     elif data == b"t_font":
-        # جابجایی بین ۱۰ نوع فونت
+        # چرخیدن بین ۱۰ فونت
         user_data[user_id]["font_id"] = (user_data[user_id]["font_id"] + 1) % 10
     elif data == b"del":
         if user_data[user_id]["task"]: user_data[user_id]["task"].cancel()
