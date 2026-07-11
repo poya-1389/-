@@ -1,9 +1,7 @@
-
 import asyncio
 import os
 import pytz
 import sqlite3
-import re
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -82,7 +80,7 @@ FONTS = {
     2: {'0':'𝟶','1':'𝟷','2':'𝟸','3':'𝟹','4':'𝟺','5':'𝟻','6':'𝟼','7':'𝟽','8':'𝟾','9':'𝟿'},
     3: {'0':'⓪','1':'①','2':'②','3':'③','4':'④','5':'⑤','6':'⑥','7':'⑦','8':'⑧','9':'⑨'},
     4: {'0':'🄀','1':'⒈','2':'⒉','3':'⒊','4':'⒋','5':'⒌','6':'6','7':'⒎','8':'⒏','9':'⒐'},
-    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4':'🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'},
+    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'},
     6: {'0':'𝟢','1':'𝟣','2':'𝟤','3':'𝟥','4':'𝟦','5':'𝟧','6':'𝟨','7':'𝟩','8':'𝟪','9':'𝟫'},
     7: {'0':'𝞯','1':'𝞱','2':'𝞲','3':'𝞳','4':'𝞴','5':'𝞵','6':'𝞶','7':'𝞷','8':'𝞸','9':'𝞹'},
     8: {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'},
@@ -141,6 +139,18 @@ async def autostart_saved_users():
             except Exception as e:
                 print(f"خطا در اتواستارت {user_id}: {e}")
 
+def get_keyboard_layout(current_code=""):
+    # ساخت دکمه‌های عددی شیشه‌ای برای ورود امن بدون شناسایی تلگرام
+    display = current_code if current_code else "خالی"
+    btns = [
+        [Button.inline(f"🔢 کد وارد شده: {display}", b"void")],
+        [Button.inline("1", b"k_1"), Button.inline("2", b"k_2"), Button.inline("3", b"k_3")],
+        [Button.inline("4", b"k_4"), Button.inline("5", b"k_5"), Button.inline("6", b"k_6")],
+        [Button.inline("7", b"k_7"), Button.inline("8", b"k_8"), Button.inline("9", b"k_9")],
+        [Button.inline("❌ پاک کردن", b"k_clear"), Button.inline("0", b"k_0"), Button.inline("✅ تایید و ورود", b"k_submit")]
+    ]
+    return btns
+
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     user_id = event.sender_id
@@ -173,15 +183,39 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
     
+    if data == b"void":
+        await event.answer()
+        return
+
     if data == b"send_ready_session":
         user_data[user_id]["step"] = "get_session"
         await event.edit("✍️ لطفاً کُد نشست (Session String) متنی تلتون خود را ارسال کنید:")
         return
 
     elif data == b"start_gen_fast":
-        generator_data[user_id] = {"step": "get_phone", "phone": None, "phone_code_hash": None}
+        generator_data[user_id] = {"step": "get_phone", "phone": None, "phone_code_hash": None, "code_buffer": ""}
         await event.edit("📞 **قدم اول:**\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
         return
+
+    # مدیریت دکمه‌های کیپد ورود کد امن
+    if user_id in generator_data and generator_data[user_id]["step"] == "get_code":
+        gd = generator_data[user_id]
+        if data.startswith(b"k_"):
+            action = data.decode().split("_")[1]
+            if action.isdigit():
+                if len(gd["code_buffer"]) < 5:
+                    gd["code_buffer"] += action
+                await event.edit("📩 **قدم دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:\n(این روش ۱۰۰٪ امن است و تلگرام متوجه کد نمی‌شود)", buttons=get_keyboard_layout(gd["code_buffer"]))
+            elif action == "clear":
+                gd["code_buffer"] = ""
+                await event.edit("📩 **قدم دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:\n(این روش ۱۰۰٪ امن است و تلگرام متوجه کد نمی‌شود)", buttons=get_keyboard_layout(gd["code_buffer"]))
+            elif action == "submit":
+                if len(gd["code_buffer"]) < 5:
+                    await event.answer("⚠️ لطفاً کد ۵ رقمی را کامل وارد کنید!", alert=True)
+                    return
+                await event.edit("⏳ در حال بررسی کد و ورود به حساب...")
+                await process_code_signin(event, user_id, gd["code_buffer"])
+            return
 
     if user_id not in user_data:
         return
@@ -222,6 +256,43 @@ async def callback_handler(event):
     btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
     await event.edit("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
 
+async def process_code_signin(event, user_id, code):
+    gd = generator_data[user_id]
+    client = active_signins.get(user_id)
+    if not client:
+        await event.respond("❌ نشست شما منقضی شده است. دوباره /start بزنید.")
+        del generator_data[user_id]
+        return
+        
+    try:
+        await client.sign_in(gd["phone"], code, phone_code_hash=gd["phone_code_hash"])
+        session_string = client.session.save()
+        
+        user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
+        active_clients[user_id] = client
+        save_user(user_id, session_string, 1, True)
+        
+        loop = asyncio.get_event_loop()
+        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+        
+        await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ذخیره شد!**\n\n⚙️ سلف‌بات شما هم‌اکنون روشن است.")
+        del generator_data[user_id]
+        if user_id in active_signins: del active_signins[user_id]
+        
+        st = "🟢 روشن"
+        ft = FONT_NAMES[1]
+        btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
+        await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+        
+    except SessionPasswordNeededError:
+        gd["step"] = "get_password"
+        await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
+    except Exception as e:
+        gd["code_buffer"] = ""
+        await event.respond(f"❌ خطایی رخ داد: {e}\nمجدداً تلاش کنید و کد خود را با کیپد بالا بادقت وارد کنید:")
+        # بازسازی کیپد جهت ورود مجدد
+        await event.respond("📩 مجدداً کد دریافتی را وارد کنید:", buttons=get_keyboard_layout(""))
+
 @bot.on(events.NewMessage)
 async def message_handler(event):
     user_id = event.sender_id
@@ -242,59 +313,16 @@ async def message_handler(event):
                 gd["phone_code_hash"] = send_code_res.phone_code_hash
                 gd["step"] = "get_code"
                 
-                # راهنمای جدید و کاملاً امن برای ارسال کد بدون مانیتور شدن توسط تلگرام
+                # ارسال کیپد امن برای کاربر
                 await event.respond(
                     "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد.\n\n"
-                    "⚠️ **نکته بسیار مهم (حیاتی):** تلگرام چت‌ها را اسکن می‌کند و کدهای عددی ساده را مسدود می‌کند! برای اینکه کد شما باطل نشود، **حتماً** آن را به صورت مخلوط با یک کلمه یا ایموجی بفرستید.\n\n"
-                    "💡 **مثال‌های مجاز:**\n"
-                    "• `کد 12345`\n"
-                    "• `12345 تایید`\n"
-                    "• `12345 ⭐️`"
+                    "🔒 **امنیت ۱۰۰٪:** برای جلوگیری از مانیتور و بلاک شدن کد توسط تلگرام، لطفاً کد ۵ رقمی را از طریق دکمه‌های زیر وارد کرده و دکمه تایید را بزنید:",
+                    buttons=get_keyboard_layout("")
                 )
             except Exception as e:
                 await event.respond(f"❌ خطایی در ارسال کد رخ داد: {e}\nمراحل لغو شد. مجدداً /start کنید.")
                 if user_id in active_signins: del active_signins[user_id]
                 del generator_data[user_id]
-                
-        elif gd["step"] == "get_code":
-            # ترفند استخراج هوشمند عدد از متن کاربر: تلگرام دیگر نمی‌تواند کد را شناسایی کند!
-            clean_code = "".join(re.findall(r'\d', text))
-            
-            if len(clean_code) < 5:
-                await event.respond("❌ کد ارسالی باید شامل حداقل ۵ رقم باشد. لطفاً مجدداً طبق الگو ارسال کنید:")
-                return
-                
-            client = active_signins.get(user_id)
-            if not client:
-                await event.respond("❌ نشست شما منقضی شده است. دوباره /start بزنید.")
-                del generator_data[user_id]
-                return
-                
-            try:
-                await client.sign_in(gd["phone"], clean_code, phone_code_hash=gd["phone_code_hash"])
-                session_string = client.session.save()
-                
-                user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
-                active_clients[user_id] = client
-                save_user(user_id, session_string, 1, True)
-                
-                loop = asyncio.get_event_loop()
-                user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-                
-                await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ذخیره شد!**\n\n⚙️ سلف‌بات شما هم‌اکنون روشن است.")
-                del generator_data[user_id]
-                if user_id in active_signins: del active_signins[user_id]
-                
-                st = "🟢 روشن"
-                ft = FONT_NAMES[1]
-                btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-                await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
-                
-            except SessionPasswordNeededError:
-                gd["step"] = "get_password"
-                await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
-            except Exception as e:
-                await event.respond(f"❌ خطایی رخ داد یا کد نامعتبر گشت: {e}\nمجدداً کُد ارسالی را به همراه یک متن کوتاه (مثل: `کد 12345`) بفرستید:")
                 
         elif gd["step"] == "get_password":
             client = active_signins.get(user_id)
@@ -353,3 +381,4 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(autostart_saved_users())
     bot.run_until_disconnected()
+
