@@ -163,7 +163,7 @@ async def start_handler(event):
     
     if ud["session"] is None:
         btns = [
-            [Button.inline("• ‹ساخت خودکار ‹پیشنهادی ", b"start_gen_fast")],
+            [Button.inline("• ساخت خودکار ‹پیشنهادی‹ ", b"start_gen_fast")],
             [Button.inline("• ارسال سشن آماده", b"send_ready_session")]
         ]
         await event.respond("⚡️ به ربات نوا سلف منیجر خوش آمدید!\nلطفاً یکی از روش‌های زیر را انتخاب کنید:", buttons=btns)
@@ -252,7 +252,7 @@ async def callback_handler(event):
     st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
     ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
     btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-    await event.edit("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+    await event.edit("🔗 پنل مدیریت نواسلف:", buttons=btns)
 
 async def process_code_signin(event, user_id, code):
     gd = generator_data[user_id]
@@ -280,7 +280,7 @@ async def process_code_signin(event, user_id, code):
         st = "🟢 روشن"
         ft = FONT_NAMES[1]
         btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-        await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+        await event.respond("🔗 پنل مدیریت نواسلف:", buttons=btns)
         
     except SessionPasswordNeededError:
         gd["step"] = "get_password"
@@ -345,7 +345,7 @@ async def message_handler(event):
                 st = "🟢 روشن"
                 ft = FONT_NAMES[1]
                 btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-                await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+                await event.respond("🔗 پنل مدیریت نواسلف:", buttons=btns)
             except Exception as e:
                 await event.respond(f"❌ رمز عبور دو مرحله‌ای اشتباه است: {e}\nلطفاً مجدداً رمز صحیح را بفرستید:")
         return
