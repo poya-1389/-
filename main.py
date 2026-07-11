@@ -1,7 +1,9 @@
+
 import asyncio
 import os
 import pytz
 import sqlite3
+import re
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -16,7 +18,7 @@ bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 active_clients = {}
 generator_data = {}
-active_signins = {}  # برای زنده نگه داشتن کلاینت ثبت‌نام در حافظه
+active_signins = {}
 
 # ----------------- دیتابیس SQLite دایمی -----------------
 DB_FILE = "selfbot_database.db"
@@ -232,18 +234,22 @@ async def message_handler(event):
             gd["phone"] = text
             await event.respond("⏳ در حال ارتباط مستقیم با سرورهای تلگرام و ارسال کد...")
             try:
-                # کلاینت را در دایرکتوری یا متغیر سراسری ذخیره می‌کنیم تا از بین نرود
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
                 await client.connect()
                 
                 send_code_res = await client.send_code_request(gd["phone"])
-                active_signins[user_id] = client # کلاینت به این کاربر قفل شد
+                active_signins[user_id] = client
                 gd["phone_code_hash"] = send_code_res.phone_code_hash
                 gd["step"] = "get_code"
                 
+                # راهنمای جدید و کاملاً امن برای ارسال کد بدون مانیتور شدن توسط تلگرام
                 await event.respond(
-                    "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد. لطفاً آن را ارسال کنید:\n\n"
-                    "⚠️ **نکته بسیار مهم:** حتماً بین اعداد کد **فاصله** بگذارید.\n(مثال: `1 2 3 4 5`)"
+                    "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد.\n\n"
+                    "⚠️ **نکته بسیار مهم (حیاتی):** تلگرام چت‌ها را اسکن می‌کند و کدهای عددی ساده را مسدود می‌کند! برای اینکه کد شما باطل نشود، **حتماً** آن را به صورت مخلوط با یک کلمه یا ایموجی بفرستید.\n\n"
+                    "💡 **مثال‌های مجاز:**\n"
+                    "• `کد 12345`\n"
+                    "• `12345 تایید`\n"
+                    "• `12345 ⭐️`"
                 )
             except Exception as e:
                 await event.respond(f"❌ خطایی در ارسال کد رخ داد: {e}\nمراحل لغو شد. مجدداً /start کنید.")
@@ -251,12 +257,16 @@ async def message_handler(event):
                 del generator_data[user_id]
                 
         elif gd["step"] == "get_code":
-            clean_code = text.replace(" ", "").replace("-", "").replace("_", "")
+            # ترفند استخراج هوشمند عدد از متن کاربر: تلگرام دیگر نمی‌تواند کد را شناسایی کند!
+            clean_code = "".join(re.findall(r'\d', text))
             
-            # فراخوانی کلاینتِ اختصاصی زنده نگه داشته شده
+            if len(clean_code) < 5:
+                await event.respond("❌ کد ارسالی باید شامل حداقل ۵ رقم باشد. لطفاً مجدداً طبق الگو ارسال کنید:")
+                return
+                
             client = active_signins.get(user_id)
             if not client:
-                await event.respond("❌ نشست شما منقضی شده یا سرور ری‌استارت شده است. لطفاً فرآیند را دوباره با زدن /start آغاز کنید.")
+                await event.respond("❌ نشست شما منقضی شده است. دوباره /start بزنید.")
                 del generator_data[user_id]
                 return
                 
@@ -284,7 +294,7 @@ async def message_handler(event):
                 gd["step"] = "get_password"
                 await event.respond("🔐 اکانت شما دارای **تایید دو مرحله‌ای** است!\nلطفاً رمز عبور دو مرحله‌ای خود را ارسال کنید:")
             except Exception as e:
-                await event.respond(f"❌ کد اشتباه است یا مشکلی پیش آمد: {e}\nمجدداً کُد ارسالی را به درستی با فاصله وارد کنید:")
+                await event.respond(f"❌ خطایی رخ داد یا کد نامعتبر گشت: {e}\nمجدداً کُد ارسالی را به همراه یک متن کوتاه (مثل: `کد 12345`) بفرستید:")
                 
         elif gd["step"] == "get_password":
             client = active_signins.get(user_id)
@@ -343,4 +353,3 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(autostart_saved_users())
     bot.run_until_disconnected()
-
