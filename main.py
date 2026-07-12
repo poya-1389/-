@@ -90,12 +90,10 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    """راه‌اندازی دیتابیس با پشتیبانی از آپدیت خودکار"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # بررسی وجود جدول
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -105,7 +103,6 @@ def init_db():
         table_exists = cursor.fetchone()[0]
         
         if not table_exists:
-            # ایجاد جدول جدید
             cursor.execute('''
                 CREATE TABLE novaself_users (
                     user_id BIGINT PRIMARY KEY,
@@ -120,7 +117,6 @@ def init_db():
             conn.commit()
             logging.info("✅ جدول novaself_users با موفقیت ایجاد شد.")
         else:
-            # بررسی وجود ستون joined_at
             cursor.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.columns 
@@ -130,7 +126,6 @@ def init_db():
             column_exists = cursor.fetchone()[0]
             
             if not column_exists:
-                # اضافه کردن ستون joined_at
                 cursor.execute('''
                     ALTER TABLE novaself_users 
                     ADD COLUMN joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -144,12 +139,10 @@ def init_db():
         logging.error(f"❌ خطا در راه‌اندازی دیتابیس: {e}")
 
 def get_all_users():
-    """بارگذاری تمام کاربران از دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=DictCursor)
         
-        # بررسی وجود ستون joined_at
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.columns 
@@ -196,7 +189,6 @@ def get_all_users():
         return {}
 
 def save_user(user_id, session, font_id, status, name_time, bio_time, active_action):
-    """ذخیره یا بروزرسانی اطلاعات کاربر در دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -219,7 +211,6 @@ def save_user(user_id, session, font_id, status, name_time, bio_time, active_act
         logging.error(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
 
 def delete_user_db(user_id):
-    """حذف کاربر از دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -231,7 +222,6 @@ def delete_user_db(user_id):
         logging.error(f"❌ خطا در حذف کاربر {user_id}: {e}")
 
 def get_user_stats():
-    """دریافت آمار کاربران"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -333,8 +323,7 @@ def get_admin_main_menu():
         [Button.inline("📋 لیست کاربران", b"admin_users_list")],
         [Button.inline("📨 ارسال پیام همگانی", b"admin_broadcast")],
         [Button.inline("🔍 جستجوی کاربر", b"admin_search_user")],
-        [Button.inline("🔄 بروزرسانی همه کاربران", b"admin_refresh_all")],
-        [Button.inline("🔙 بازگشت به منوی کاربر", b"back_to_main")]
+        [Button.inline("🔄 بروزرسانی همه کاربران", b"admin_refresh_all")]
     ]
 
 def get_users_list_page(page=0, per_page=10):
@@ -343,7 +332,6 @@ def get_users_list_page(page=0, per_page=10):
         cursor = conn.cursor()
         offset = page * per_page
         
-        # بررسی وجود ستون joined_at
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.columns 
@@ -379,7 +367,6 @@ def get_users_list_page(page=0, per_page=10):
                 f"admin_view_user_{user[0]}".encode()
             )])
         
-        # دکمه‌های صفحه‌بندی
         nav_buttons = []
         if page > 0:
             nav_buttons.append(Button.inline("⬅️ قبلی", f"admin_users_page_{page-1}".encode()))
@@ -505,24 +492,13 @@ async def autostart_saved_users():
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """هندلر دستور /start برای کاربران عادی"""
+    """هندلر دستور /start برای همه کاربران (ادمین و غیرادمین)"""
     user_id = event.sender_id
     
     if user_id in generator_data:
         return
     
-    # ادمین‌ها با /admin وارد پنل می‌شوند، نه /start
-    if is_admin(user_id):
-        await event.respond(
-            "👤 **منوی کاربری**\n\n"
-            "برای ورود به پنل ادمین از دستور /admin استفاده کنید.",
-            buttons=get_main_menu_keyboard(user_data.get(user_id, {
-                "status": False, "font_id": 1, "name_time": True, 
-                "bio_time": False, "active_action": "none"
-            }))
-        )
-        return
-    
+    # ادمین‌ها هم مثل کاربران عادی منوی کاربری رو می‌بینند
     if user_id not in user_data:
         user_data[user_id] = {
             "session": None,
@@ -544,16 +520,25 @@ async def start_handler(event):
             [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
             [Button.inline("✍️ ثبت با سشن آماده", b"send_ready_session")]
         ]
+        # اگر ادمین هست، دکمه ورود به پنل ادمین هم اضافه میشه
+        if is_admin(user_id):
+            buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
         await event.respond(
             "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**\n\n"
             "لطفاً یکی از روش‌های زیر را برای اتصال حساب خود انتخاب کنید:",
             buttons=buttons
         )
     else:
+        main_buttons = get_main_menu_keyboard(user)
+        # اگر ادمین هست، دکمه ورود به پنل ادمین هم اضافه میشه
+        if is_admin(user_id):
+            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user)
+            buttons=main_buttons
         )
 
 @bot.on(events.NewMessage(pattern='/admin'))
@@ -584,6 +569,19 @@ async def callback_handler(event):
     if is_admin(user_id):
         # پنل ادمین
         if data == b"admin_panel":
+            # اگر کاربر سشن ندارد، اول منوی ثبت نشون داده میشه
+            if user_id not in user_data or user_data[user_id]["session"] is None:
+                await event.edit(
+                    "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**\n\n"
+                    "لطفاً یکی از روش‌های زیر را برای اتصال حساب خود انتخاب کنید:",
+                    buttons=[
+                        [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
+                        [Button.inline("✍️ ثبت با سشن آماده", b"send_ready_session")],
+                        [Button.inline("👑 پنل ادمین", b"admin_panel")]
+                    ]
+                )
+                return
+            
             await event.edit(
                 "👑 **پنل مدیریت NovaSelf**\n\n"
                 "از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
@@ -850,18 +848,16 @@ async def callback_handler(event):
     user = user_data[user_id]
     
     if data == b"back_to_main":
+        # برگشت به منوی اصلی کاربر
+        main_buttons = get_main_menu_keyboard(user)
         if is_admin(user_id):
-            await event.edit(
-                "👑 **پنل مدیریت NovaSelf**\n\n"
-                "از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
-                buttons=get_admin_main_menu()
-            )
-        else:
-            await event.edit(
-                "🔗 **پنل مدیریت NovaSelf**\n"
-                "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-                buttons=get_main_menu_keyboard(user)
-            )
+            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
+        await event.edit(
+            "🔗 **پنل مدیریت NovaSelf**\n"
+            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+            buttons=main_buttons
+        )
         return
     
     if data == b"menu_time":
@@ -949,10 +945,14 @@ async def callback_handler(event):
             if user_id in active_clients:
                 del active_clients[user_id]
         
+        main_buttons = get_main_menu_keyboard(user)
+        if is_admin(user_id):
+            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
         await event.edit(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user)
+            buttons=main_buttons
         )
         return
     
@@ -1042,10 +1042,14 @@ async def process_code_signin(event, user_id, code):
         if user_id in active_signins:
             del active_signins[user_id]
         
+        main_buttons = get_main_menu_keyboard(user_data[user_id])
+        if is_admin(user_id):
+            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user_data[user_id])
+            buttons=main_buttons
         )
         
     except SessionPasswordNeededError:
@@ -1083,7 +1087,6 @@ async def message_handler(event):
     if user_id in broadcast_data and is_admin(user_id):
         broadcast = broadcast_data[user_id]
         
-        # جستجوی کاربر
         if broadcast.get("type") == "search" and broadcast.get("step") == "get_user_id":
             try:
                 target_id = int(text)
@@ -1099,7 +1102,6 @@ async def message_handler(event):
                 await event.respond("❌ شناسه معتبر نیست. لطفاً یک عدد وارد کنید.")
             return
         
-        # دریافت پیام برای ارسال
         if broadcast.get("step") == "get_message":
             broadcast["message"] = text
             broadcast["step"] = "confirm"
@@ -1207,10 +1209,14 @@ async def message_handler(event):
                 if user_id in active_signins:
                     del active_signins[user_id]
                 
+                main_buttons = get_main_menu_keyboard(user_data[user_id])
+                if is_admin(user_id):
+                    main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+                
                 await event.respond(
                     "🔗 **پنل مدیریت NovaSelf**\n"
                     "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-                    buttons=get_main_menu_keyboard(user_data[user_id])
+                    buttons=main_buttons
                 )
             except Exception as e:
                 await event.respond(
@@ -1268,10 +1274,14 @@ async def message_handler(event):
             "سلف شما هم‌اکنون فعال است و اطلاعات در دیتابیس ابری ذخیره شد."
         )
         
+        main_buttons = get_main_menu_keyboard(user_data[user_id])
+        if is_admin(user_id):
+            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
+        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user_data[user_id])
+            buttons=main_buttons
         )
 
 # ======================== هندلر دکمه‌های تایید ارسال پیام ========================
@@ -1309,7 +1319,7 @@ async def broadcast_callback_handler(event):
                     buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
                 )
         
-        else:  # broadcast
+        else:
             total_users = len(user_data)
             success_count = 0
             fail_count = 0
