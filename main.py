@@ -15,7 +15,6 @@ from telethon.tl.types import (
     SendMessageGamePlayAction, SendMessageChooseStickerAction
 )
 import logging
-import time
 
 # ======================== تنظیمات اولیه ========================
 API_ID = int(os.environ.get("API_ID"))
@@ -28,7 +27,7 @@ if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
     raise ValueError("تمامی متغیرهای محیطی باید تنظیم شوند!")
 
 if not ADMIN_IDS:
-    print("⚠️ هشدار: هیچ ادمینی تنظیم نشده است!")
+    logging.warning("⚠️ هشدار: هیچ ادمینی تنظیم نشده است!")
 
 bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,7 +37,7 @@ active_clients = {}
 generator_data = {}
 active_signins = {}
 user_data = {}
-broadcast_data = {}  # برای ذخیره وضعیت ارسال پیام همگانی
+broadcast_data = {}
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -91,10 +90,12 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
+    """راه‌اندازی دیتابیس با پشتیبانی از آپدیت خودکار"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # بررسی وجود جدول
         cursor.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -104,6 +105,7 @@ def init_db():
         table_exists = cursor.fetchone()[0]
         
         if not table_exists:
+            # ایجاد جدول جدید
             cursor.execute('''
                 CREATE TABLE novaself_users (
                     user_id BIGINT PRIMARY KEY,
@@ -112,12 +114,29 @@ def init_db():
                     status INTEGER DEFAULT 0,
                     name_time INTEGER DEFAULT 1,
                     bio_time INTEGER DEFAULT 0,
-                    active_action TEXT DEFAULT 'none',
-                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    active_action TEXT DEFAULT 'none'
                 )
             ''')
             conn.commit()
             logging.info("✅ جدول novaself_users با موفقیت ایجاد شد.")
+        else:
+            # بررسی وجود ستون joined_at
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
+                )
+            """)
+            column_exists = cursor.fetchone()[0]
+            
+            if not column_exists:
+                # اضافه کردن ستون joined_at
+                cursor.execute('''
+                    ALTER TABLE novaself_users 
+                    ADD COLUMN joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ''')
+                conn.commit()
+                logging.info("✅ ستون joined_at با موفقیت به جدول اضافه شد.")
         
         cursor.close()
         conn.close()
@@ -125,28 +144,48 @@ def init_db():
         logging.error(f"❌ خطا در راه‌اندازی دیتابیس: {e}")
 
 def get_all_users():
+    """بارگذاری تمام کاربران از دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=DictCursor)
+        
+        # بررسی وجود ستون joined_at
         cursor.execute("""
-            SELECT user_id, session, font_id, status, name_time, bio_time, active_action, joined_at 
-            FROM novaself_users 
-            ORDER BY joined_at DESC
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
+            )
         """)
+        has_joined_at = cursor.fetchone()[0]
+        
+        if has_joined_at:
+            cursor.execute("""
+                SELECT user_id, session, font_id, status, name_time, bio_time, active_action, joined_at 
+                FROM novaself_users 
+                ORDER BY joined_at DESC
+            """)
+        else:
+            cursor.execute("""
+                SELECT user_id, session, font_id, status, name_time, bio_time, active_action
+                FROM novaself_users 
+                ORDER BY user_id DESC
+            """)
+        
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
         
         data = {}
         for row in rows:
-            data[row['user_id']] = {
+            user_id = row['user_id']
+            data[user_id] = {
                 "session": row['session'],
                 "font_id": row['font_id'],
                 "status": bool(row['status']),
                 "name_time": bool(row['name_time']),
                 "bio_time": bool(row['bio_time']),
                 "active_action": row['active_action'],
-                "joined_at": row['joined_at'],
+                "joined_at": row.get('joined_at', datetime.now()),
                 "step": "managed",
                 "task": None,
                 "action_task": None
@@ -157,6 +196,7 @@ def get_all_users():
         return {}
 
 def save_user(user_id, session, font_id, status, name_time, bio_time, active_action):
+    """ذخیره یا بروزرسانی اطلاعات کاربر در دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -179,6 +219,7 @@ def save_user(user_id, session, font_id, status, name_time, bio_time, active_act
         logging.error(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
 
 def delete_user_db(user_id):
+    """حذف کاربر از دیتابیس"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -190,6 +231,7 @@ def delete_user_db(user_id):
         logging.error(f"❌ خطا در حذف کاربر {user_id}: {e}")
 
 def get_user_stats():
+    """دریافت آمار کاربران"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -301,12 +343,29 @@ def get_users_list_page(page=0, per_page=10):
         cursor = conn.cursor()
         offset = page * per_page
         
+        # بررسی وجود ستون joined_at
         cursor.execute("""
-            SELECT user_id, status, joined_at 
-            FROM novaself_users 
-            ORDER BY joined_at DESC 
-            LIMIT %s OFFSET %s
-        """, (per_page, offset))
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
+            )
+        """)
+        has_joined_at = cursor.fetchone()[0]
+        
+        if has_joined_at:
+            cursor.execute("""
+                SELECT user_id, status, joined_at 
+                FROM novaself_users 
+                ORDER BY joined_at DESC 
+                LIMIT %s OFFSET %s
+            """, (per_page, offset))
+        else:
+            cursor.execute("""
+                SELECT user_id, status, NULL as joined_at
+                FROM novaself_users 
+                ORDER BY user_id DESC 
+                LIMIT %s OFFSET %s
+            """, (per_page, offset))
         
         users = cursor.fetchall()
         cursor.close()
@@ -446,17 +505,21 @@ async def autostart_saved_users():
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
+    """هندلر دستور /start برای کاربران عادی"""
     user_id = event.sender_id
     
     if user_id in generator_data:
         return
     
-    # پیام خوش‌آمدگویی برای ادمین‌ها
+    # ادمین‌ها با /admin وارد پنل می‌شوند، نه /start
     if is_admin(user_id):
         await event.respond(
-            "👑 **پنل مدیریت NovaSelf**\n\n"
-            "به پنل ادمین خوش آمدید! از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
-            buttons=get_admin_main_menu()
+            "👤 **منوی کاربری**\n\n"
+            "برای ورود به پنل ادمین از دستور /admin استفاده کنید.",
+            buttons=get_main_menu_keyboard(user_data.get(user_id, {
+                "status": False, "font_id": 1, "name_time": True, 
+                "bio_time": False, "active_action": "none"
+            }))
         )
         return
     
@@ -470,7 +533,8 @@ async def start_handler(event):
             "active_action": "none",
             "task": None,
             "action_task": None,
-            "step": "menu"
+            "step": "menu",
+            "joined_at": datetime.now()
         }
     
     user = user_data[user_id]
@@ -491,6 +555,21 @@ async def start_handler(event):
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
+
+@bot.on(events.NewMessage(pattern='/admin'))
+async def admin_handler(event):
+    """هندلر دستور /admin برای ورود به پنل ادمین"""
+    user_id = event.sender_id
+    
+    if not is_admin(user_id):
+        await event.respond("❌ شما دسترسی ادمین ندارید!")
+        return
+    
+    await event.respond(
+        "👑 **پنل مدیریت NovaSelf**\n\n"
+        "به پنل ادمین خوش آمدید! از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
+        buttons=get_admin_main_menu()
+    )
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -551,7 +630,6 @@ async def callback_handler(event):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
                 user = user_data[target_id]
-                total, active = get_user_stats()
                 
                 status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
                 font_name = FONT_NAMES.get(user["font_id"], "نامشخص")
@@ -581,7 +659,6 @@ async def callback_handler(event):
                 user["status"] = not user["status"]
                 
                 if user["status"]:
-                    # راه‌اندازی سلف کاربر
                     try:
                         client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
                         await client.connect()
@@ -617,7 +694,6 @@ async def callback_handler(event):
         if data.startswith(b"admin_delete_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
-                # توقف وظایف
                 user = user_data[target_id]
                 if user["task"]:
                     user["task"].cancel()
@@ -681,10 +757,8 @@ async def callback_handler(event):
         if data == b"admin_refresh_all":
             await event.edit("⏳ در حال بروزرسانی اطلاعات همه کاربران...")
             
-            # ریستارت سلف همه کاربران فعال
             for uid, user in user_data.items():
                 if user["status"] and user["session"]:
-                    # توقف وظایف قبلی
                     if user["task"]:
                         user["task"].cancel()
                     if user["action_task"]:
@@ -696,7 +770,6 @@ async def callback_handler(event):
                             pass
                         del active_clients[uid]
                     
-                    # راه‌اندازی مجدد
                     try:
                         client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
                         await client.connect()
@@ -779,7 +852,8 @@ async def callback_handler(event):
     if data == b"back_to_main":
         if is_admin(user_id):
             await event.edit(
-                "👑 **پنل مدیریت NovaSelf**",
+                "👑 **پنل مدیریت NovaSelf**\n\n"
+                "از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
                 buttons=get_admin_main_menu()
             )
         else:
@@ -1199,11 +1273,6 @@ async def message_handler(event):
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user_data[user_id])
         )
-    
-    # ====== پردازش تایید/لغو ارسال پیام ======
-    elif user_id in broadcast_data and is_admin(user_id):
-        # این بخش توسط CallbackHandler مدیریت می‌شود
-        pass
 
 # ======================== هندلر دکمه‌های تایید ارسال پیام ========================
 @bot.on(events.CallbackQuery)
@@ -1245,12 +1314,11 @@ async def broadcast_callback_handler(event):
             success_count = 0
             fail_count = 0
             
-            # ارسال پیام به همه کاربران
             for uid in user_data.keys():
                 try:
                     await bot.send_message(uid, message)
                     success_count += 1
-                    await asyncio.sleep(0.1)  # جلوگیری از محدودیت
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     fail_count += 1
                     logging.error(f"❌ خطا در ارسال به {uid}: {e}")
