@@ -1,3 +1,5 @@
 telethon
 pytz
 psycopg2-binary
+jdatetime
+hijri-converter
