@@ -6,9 +6,12 @@ from psycopg2.extras import DictCursor
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError, AuthKeyDuplicatedError
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError, AuthKeyDuplicatedError,
+    AuthKeyError
+)
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.messages import SetTypingRequest
+from telethon.tl.functions.messages import SetTypingRequest, EditMessageRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
@@ -41,7 +44,6 @@ generator_data = {}
 active_signins = {}
 user_data = {}
 broadcast_data = {}
-reconnect_tasks = {}
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -459,65 +461,8 @@ def get_user_detail_buttons(user_id):
         [Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
     ]
 
-# ======================== توابع اصلی سلف با reconnect ========================
-async def self_bot_worker_with_reconnect(user_id, client):
-    """کارگر سلف با قابلیت reconnect خودکار"""
-    max_retries = 5
-    retry_delay = 10
-    
-    while True:
-        try:
-            if user_id not in user_data or not user_data[user_id]["status"]:
-                break
-                
-            if not client.is_connected():
-                logging.warning(f"⚠️ کلاینت کاربر {user_id} قطع است. در حال reconnect...")
-                try:
-                    await client.connect()
-                    if not await client.is_user_authorized():
-                        logging.error(f"❌ کاربر {user_id} احراز هویت نشد!")
-                        user_data[user_id]["status"] = False
-                        save_user(user_id, user_data[user_id]["session"], user_data[user_id]["font_id"], False,
-                                 user_data[user_id]["name_time"], user_data[user_id]["bio_time"],
-                                 user_data[user_id]["active_action"], user_data[user_id].get("text_mode", "none"),
-                                 user_data[user_id].get("date_enabled", False),
-                                 user_data[user_id].get("calendar_type", "jalali"),
-                                 user_data[user_id].get("date_font_id", 1))
-                        break
-                except Exception as e:
-                    logging.error(f"❌ خطا در reconnect کاربر {user_id}: {e}")
-                    await asyncio.sleep(retry_delay)
-                    continue
-            
-            # اجرای کارگر اصلی
-            await self_bot_worker(user_id, client)
-            
-        except AuthKeyDuplicatedError:
-            logging.warning(f"⚠️ AuthKeyDuplicatedError برای کاربر {user_id}. تلاش مجدد...")
-            await asyncio.sleep(5)
-            try:
-                await client.disconnect()
-            except:
-                pass
-            # ایجاد کلاینت جدید
-            session_str = user_data[user_id]["session"]
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            active_clients[user_id] = client
-            await client.connect()
-            if await client.is_user_authorized():
-                logging.info(f"✅ کلاینت جدید برای کاربر {user_id} ایجاد شد.")
-            else:
-                logging.error(f"❌ کلاینت جدید برای کاربر {user_id} معتبر نیست!")
-                break
-                
-        except Exception as e:
-            logging.error(f"❌ خطا در سلف کاربر {user_id}: {e}")
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 60)
-            continue
-
+# ======================== توابع اصلی سلف ========================
 async def self_bot_worker(user_id, client):
-    """کارگر اصلی سلف"""
     try:
         me = await client.get_me()
         first_name = me.first_name or "کاربر"
@@ -531,7 +476,6 @@ async def self_bot_worker(user_id, client):
             tehran_tz = pytz.timezone('Asia/Tehran')
             current_time = datetime.now(tehran_tz).strftime("%H:%M")
             
-            # ساخت بیوگرافی
             bio_parts = []
             if user.get("date_enabled", False):
                 date_str = get_formatted_date(
@@ -546,7 +490,6 @@ async def self_bot_worker(user_id, client):
             
             bio_text = " | ".join(bio_parts) if bio_parts else ""
             
-            # بروزرسانی نام و بیو
             if current_time != last_time:
                 formatted_time = apply_font(current_time, user["font_id"])
                 
@@ -562,8 +505,7 @@ async def self_bot_worker(user_id, client):
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
                     logging.error(f"⚠️ خطا در بروزرسانی پروفایل کاربر {user_id}: {e}")
-                    raise  # برای reconnect
-                
+            
             await asyncio.sleep(5)
             
     except Exception as e:
@@ -571,15 +513,10 @@ async def self_bot_worker(user_id, client):
         raise
 
 async def self_bot_action_worker(user_id, client):
-    """کارگر نمایش اکشن با reconnect"""
     while True:
         try:
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
-                
-            if not client.is_connected():
-                await asyncio.sleep(2)
-                continue
                 
             user = user_data[user_id]
             action_key = user["active_action"]
@@ -607,14 +544,25 @@ async def self_bot_action_worker(user_id, client):
             logging.error(f"❌ خطای اکشن برای کاربر {user_id}: {e}")
             await asyncio.sleep(5)
 
-async def restart_self_bot(user_id):
-    """راه‌اندازی مجدد سلف یک کاربر"""
+async def start_self_bot(user_id):
+    """راه‌اندازی سلف یک کاربر با سشن جدید"""
     if user_id not in user_data:
         return
     
     user = user_data[user_id]
     
-    # توقف وظایف قبلی
+    if not user["status"] or not user["session"]:
+        return
+    
+    # حذف کلاینت قدیمی
+    if user_id in active_clients:
+        try:
+            await active_clients[user_id].disconnect()
+        except:
+            pass
+        del active_clients[user_id]
+    
+    # توقف تسک‌های قدیمی
     if user.get("task"):
         try:
             user["task"].cancel()
@@ -626,60 +574,61 @@ async def restart_self_bot(user_id):
         except:
             pass
     
-    if user_id in active_clients:
-        try:
-            await active_clients[user_id].disconnect()
-        except:
-            pass
-        del active_clients[user_id]
-    
-    if not user["status"] or not user["session"]:
-        return
-    
     try:
-        # ایجاد کلاینت جدید
-        client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
+        # ایجاد کلاینت جدید با سشن جدید
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
+        
+        # ورود با سشن ذخیره شده
+        await client.start(session=StringSession(user["session"]))
         
         if await client.is_user_authorized():
             active_clients[user_id] = client
             loop = asyncio.get_event_loop()
-            user["task"] = loop.create_task(self_bot_worker_with_reconnect(user_id, client))
+            user["task"] = loop.create_task(self_bot_worker(user_id, client))
             user["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-            logging.info(f"✅ سلف کاربر {user_id} با reconnect راه‌اندازی شد.")
+            
+            # ذخیره سشن جدید (در صورت تغییر)
+            new_session = client.session.save()
+            if new_session != user["session"]:
+                user["session"] = new_session
+                save_user(user_id, new_session, user["font_id"], user["status"],
+                         user["name_time"], user["bio_time"], user["active_action"],
+                         user.get("text_mode", "none"), user.get("date_enabled", False),
+                         user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+            
+            logging.info(f"✅ سلف کاربر {user_id} با سشن جدید راه‌اندازی شد.")
+            return True
         else:
+            logging.error(f"❌ کاربر {user_id} احراز هویت نشد!")
             user["status"] = False
             save_user(user_id, user["session"], user["font_id"], False,
                      user["name_time"], user["bio_time"], user["active_action"],
                      user.get("text_mode", "none"), user.get("date_enabled", False),
                      user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+            return False
+            
+    except AuthKeyDuplicatedError:
+        logging.warning(f"⚠️ AuthKeyDuplicatedError برای کاربر {user_id}. تلاش با سشن جدید...")
+        # سشن قبلی باطل شده، از کاربر میخواهیم دوباره ثبت نام کنه
+        user["status"] = False
+        save_user(user_id, user["session"], user["font_id"], False,
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+        return False
+        
     except Exception as e:
-        logging.error(f"❌ خطا در راه‌اندازی مجدد کاربر {user_id}: {e}")
+        logging.error(f"❌ خطا در راه‌اندازی سلف کاربر {user_id}: {e}")
+        return False
 
 async def autostart_saved_users():
-    """راه‌اندازی خودکار کاربران ذخیره شده با reconnect"""
+    """راه‌اندازی خودکار کاربران ذخیره شده"""
     await asyncio.sleep(5)
     
     for user_id, user in list(user_data.items()):
         if user["status"] and user["session"]:
-            try:
-                client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
-                await client.connect()
-                
-                if await client.is_user_authorized():
-                    active_clients[user_id] = client
-                    loop = asyncio.get_event_loop()
-                    user["task"] = loop.create_task(self_bot_worker_with_reconnect(user_id, client))
-                    user["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-                    logging.info(f"✅ سلف کاربر {user_id} با reconnect راه‌اندازی شد.")
-                else:
-                    user["status"] = False
-                    save_user(user_id, user["session"], user["font_id"], False,
-                             user["name_time"], user["bio_time"], user["active_action"],
-                             user.get("text_mode", "none"), user.get("date_enabled", False),
-                             user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
-            except Exception as e:
-                logging.error(f"❌ خطا در راه‌اندازی خودکار کاربر {user_id}: {e}")
+            await start_self_bot(user_id)
 
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
@@ -826,7 +775,10 @@ async def callback_handler(event):
                 user["status"] = not user["status"]
                 
                 if user["status"]:
-                    await restart_self_bot(target_id)
+                    success = await start_self_bot(target_id)
+                    if not success:
+                        user["status"] = False
+                        await event.answer("❌ خطا در راه‌اندازی! سشن نامعتبر است.", alert=True)
                 else:
                     if user["task"]:
                         user["task"].cancel()
@@ -921,7 +873,7 @@ async def callback_handler(event):
             
             for uid in list(user_data.keys()):
                 if user_data[uid]["status"]:
-                    await restart_self_bot(uid)
+                    await start_self_bot(uid)
             
             await event.edit(
                 "✅ **همه کاربران با موفقیت بروزرسانی شدند!**",
@@ -929,7 +881,7 @@ async def callback_handler(event):
             )
             return
     
-    # ====== منوی کاربر (ادامه دارد...) ======
+    # ====== منوی کاربر ======
     if data == b"send_ready_session":
         user_data[user_id]["step"] = "get_session"
         await event.edit(
@@ -1078,7 +1030,7 @@ async def callback_handler(event):
         )
         return
     
-    # ====== سایر تنظیمات ======
+    # ====== تنظیمات ======
     if data == b"toggle_date":
         user["date_enabled"] = not user.get("date_enabled", False)
         save_user(user_id, user["session"], user["font_id"], user["status"],
@@ -1186,7 +1138,10 @@ async def callback_handler(event):
                  user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         if user["status"]:
-            await restart_self_bot(user_id)
+            success = await start_self_bot(user_id)
+            if not success:
+                user["status"] = False
+                await event.answer("❌ خطا در راه‌اندازی! سشن نامعتبر است.", alert=True)
         else:
             if user["task"]:
                 user["task"].cancel()
@@ -1290,7 +1245,7 @@ async def process_code_signin(event, user_id, code):
         save_user(user_id, session_string, 1, True, True, False, "none")
         
         loop = asyncio.get_event_loop()
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker_with_reconnect(user_id, client))
+        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
         user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
         
         await event.respond(
@@ -1418,16 +1373,8 @@ async def message_handler(event):
                 elif mode == 'blockquote':
                     entities.append(MessageEntityBlockquote(0, len(text)))
                 
-                client = active_clients.get(user_id)
-                if client and client.is_connected():
-                    await client(EditMessageRequest(
-                        peer=event.chat_id,
-                        id=event.id,
-                        message=text,
-                        entities=entities
-                    ))
-                else:
-                    await event.edit(text, entities=entities)
+                # استفاده از formatting_entities به جای entities
+                await event.edit(text, formatting_entities=entities)
                     
             except Exception as e:
                 logging.error(f"❌ خطا در اعمال حالت متن: {e}")
@@ -1500,7 +1447,7 @@ async def message_handler(event):
                 save_user(user_id, session_string, 1, True, True, False, "none")
                 
                 loop = asyncio.get_event_loop()
-                user_data[user_id]["task"] = loop.create_task(self_bot_worker_with_reconnect(user_id, client))
+                user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
                 user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
                 
                 await event.respond(
@@ -1569,7 +1516,7 @@ async def message_handler(event):
         save_user(user_id, clean_session, 1, True, True, False, "none")
         
         loop = asyncio.get_event_loop()
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker_with_reconnect(user_id, client))
+        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
         user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
         
         await event.respond(
