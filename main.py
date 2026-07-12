@@ -1,12 +1,19 @@
 import asyncio
 import os
 import pytz
-import sqlite3
+import psycopg2
+from psycopg2.extras import DictCursor
 from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateProfileRequest as UpdateBioRequest # جهت بیوگرافی
+from telethon.tl.functions.messages import SetTypingRequest
+from telethon.tl.types import (
+    SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
+    SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
+    SendMessageGamePlayAction, SendMessageChooseStickerAction
+)
 
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
@@ -18,56 +25,74 @@ active_clients = {}
 generator_data = {}
 active_signins = {}
 
-# ----------------- دیتابیس SQLite دایمی -----------------
-DB_FILE = "selfbot_database.db"
+# ----------------- دیتابیس ابری PostgreSQL -----------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
+    # ساخت جدول جدید با تمام ویژگی‌های درخواستی شما برای ذخیره ماندگار
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS novaself_users (
+            user_id BIGINT PRIMARY KEY,
             session TEXT,
-            font_id INTEGER,
-            status INTEGER
+            font_id INTEGER DEFAULT 1,
+            status INTEGER DEFAULT 0,
+            name_time INTEGER DEFAULT 1,
+            bio_time INTEGER DEFAULT 0,
+            active_action TEXT DEFAULT 'none'
         )
     ''')
     conn.commit()
+    cursor.close()
     conn.close()
 
 def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, session, font_id, status FROM users")
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=DictCursor)
+    cursor.execute("SELECT user_id, session, font_id, status, name_time, bio_time, active_action FROM novaself_users")
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     
     data = {}
     for row in rows:
-        data[row[0]] = {
-            "session": row[1],
-            "font_id": row[2],
-            "status": bool(row[3]),
+        data[row['user_id']] = {
+            "session": row['session'],
+            "font_id": row['font_id'],
+            "status": bool(row['status']),
+            "name_time": bool(row['name_time']),
+            "bio_time": bool(row['bio_time']),
+            "active_action": row['active_action'], # ذخیره نام اکشن فعال یا 'none'
             "step": "managed",
-            "task": None
+            "task": None,
+            "action_task": None
         }
     return data
 
-def save_user(user_id, session, font_id, status):
-    conn = sqlite3.connect(DB_FILE)
+def save_user(user_id, session, font_id, status, name_time, bio_time, active_action):
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO users (user_id, session, font_id, status)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, session, font_id, int(status)))
+        INSERT INTO novaself_users (user_id, session, font_id, status, name_time, bio_time, active_action)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) 
+        DO UPDATE SET session = EXCLUDED.session, font_id = EXCLUDED.font_id, status = EXCLUDED.status,
+                      name_time = EXCLUDED.name_time, bio_time = EXCLUDED.bio_time, active_action = EXCLUDED.active_action
+    ''', (user_id, session, font_id, int(status), int(name_time), int(bio_time), active_action))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def delete_user_db(user_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM novaself_users WHERE user_id = %s", (user_id,))
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
@@ -80,7 +105,7 @@ FONTS = {
     2: {'0':'𝟶','1':'𝟷','2':'𝟸','3':'𝟹','4':'𝟺','5':'𝟻','6':'𝟼','7':'𝟽','8':'𝟾','9':'𝟿'},
     3: {'0':'⓪','1':'①','2':'②','3':'③','4':'④','5':'⑤','6':'⑥','7':'⑦','8':'⑧','9':'⑨'},
     4: {'0':'🄀','1':'⒈','2':'⒉','3':'⒊','4':'⒋','5':'⒌','6':'6','7':'⒎','8':'⒏','9':'⒐'},
-    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4':'🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'}, # خطای تایپی در اینجا رفع شد
+    5: {'0':'🄿','1':'🄱','2':'🄲','3':'🄳','4':'🄴','5':'🄵','6':'🄶','7':'🄷','8':'🄸','9':'🄹'},
     6: {'0':'𝟢','1':'𝟣','2':'𝟤','3':'𝟥','4':'𝟦','5':'𝟧','6':'𝟨','7':'𝟩','8':'𝟪','9':'𝟫'},
     7: {'0':'𝞯','1':'𝞱','2':'𝞲','3':'𝞳','4':'𝞴','5':'𝞵','6':'𝞶','7':'𝞷','8':'𝞸','9':'𝞹'},
     8: {'0':'۰','1':'۱','2':'۲','3':'۳','4':'۴','5':'۵','6':'۶','7':'۷','8':'۸','9':'۹'},
@@ -88,29 +113,73 @@ FONTS = {
 }
 
 FONT_NAMES = {
-    0: "معمولی (123)", 1: "بولد (𝟭𝟮𝟯)", 2: "تحریر (𝟷𝟸𝟹)", 
+    0: "معمولی (123)", 1: "بولد (𝟭𝟮𝟯)", 2: "ماشین تحریر (𝟷𝟸𝟹)", 
     3: "دایره‌ای (①②③)", 4: "نقطه‌دار (⒈⒉⒊)", 5: "مربعی (🄿🄱🄲)", 
-    6: "کج (𝟢𝟣𝟤)", 7: "محور (𝞯🞱🞲)", 8: "فارسی (۱۲۳)", 9: "عربی (١٢٣)"
+    6: "کج (𝟢𝟣𝟤)", 7: "ریاضی (𝞯🞱🞲)", 8: "فارسی (۱۲۳)", 9: "عربی (١٢٣)"
+}
+
+ACTIONS = {
+    'typing': ('تایپ', SendMessageTypingAction()),
+    'voice': ('ویس', SendMessageRecordAudioAction()),
+    'photo': ('عکس', SendMessageUploadPhotoAction(0)),
+    'round': ('ویدیوگرد', SendMessageRecordRoundAction()),
+    'doc': ('سند', SendMessageUploadDocumentAction(0)),
+    'video': ('ویدیو', SendMessageUploadVideoAction(0)),
+    'game': ('بازی', SendMessageGamePlayAction()),
+    'sticker': ('استیکر', SendMessageChooseStickerAction())
 }
 
 def apply_font(t_str, font_id):
     f_dict = FONTS.get(font_id, FONTS[0])
     return "".join(f_dict.get(c, c) for c in t_str)
 
+# وورکر فرستادن وضعیت‌های فیک اکشن به صورت مداوم
+async def self_bot_action_worker(user_id, client):
+    try:
+        while True:
+            if user_id not in user_data or not user_data[user_id]["status"]:
+                break
+            ud = user_data[user_id]
+            act = ud["active_action"]
+            if act == 'none' or act not in ACTIONS:
+                await asyncio.sleep(4)
+                continue
+            
+            # ارسال سیگنال اکشن به یک چت فیک یا کلی (خود کاربر)
+            await client(SetTypingActionRequest(peer='me', action=ACTIONS[act][1]))
+            await asyncio.sleep(4)
+    except Exception:
+        pass
+
 async def self_bot_worker(user_id, client):
     last_time = ""
     try:
         me = await client.get_me()
         f_name = me.first_name or "User"
+        # گرفتن بیوگرافی اولیه جهت آپدیت تایم روی آن
+        full_user = await client.get_me()
+        base_bio = "NovaSelf Bot"
+        
         while True:
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
             ud = user_data[user_id]
             tz = pytz.timezone('Asia/Tehran')
             curr_time = datetime.now(tz).strftime("%H:%M")
+            
             if curr_time != last_time:
                 f_time = apply_font(curr_time, ud["font_id"])
-                await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
+                
+                # تنظیم ساعت روی نام
+                if ud["name_time"]:
+                    await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
+                else:
+                    await client(UpdateProfileRequest(first_name=f_name, last_name=""))
+                
+                # تنظیم ساعت روی بیو
+                if ud["bio_time"]:
+                    await client(UpdateProfileRequest(about=f"{base_bio} | {f_time}"))
+                
                 last_time = curr_time
             await asyncio.sleep(5)
     except Exception as e:
@@ -132,10 +201,11 @@ async def autostart_saved_users():
                     active_clients[user_id] = client
                     loop = asyncio.get_event_loop()
                     user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+                    user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
                     print(f"سلف اکانت {user_id} خودکار روشن شد.")
                 else:
                     user_data[user_id]["status"] = False
-                    save_user(user_id, ud["session"], ud["font_id"], False)
+                    save_user(user_id, ud["session"], ud["font_id"], False, ud["name_time"], ud["bio_time"], ud["active_action"])
             except Exception as e:
                 print(f"خطا در اتواستارت {user_id}: {e}")
 
@@ -150,6 +220,61 @@ def get_keyboard_layout(current_code=""):
     ]
     return btns
 
+# ساخت کیبورد منوی اصلی
+def get_main_menu_keyboard(ud):
+    st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
+    return [
+        [Button.inline(f"وضعیت سلف: {st}", b"t_status")],
+        [Button.inline("⏰ تنظیمات ساعت پروفایل", b"menu_time"), Button.inline("🎭 اکشن‌های فیک", b"menu_actions")],
+        [Button.inline("❌ حذف اکانت", b"del")]
+    ]
+
+# ساخت کیبورد منوی ساعت پروفایل
+def get_time_menu_keyboard(ud):
+    nt = "✅ ساعت نام" if ud["name_time"] else "❌ ساعت نام"
+    bt = "✅ ساعت بیو" if ud["bio_time"] else "❌ ساعت بیو"
+    current_font_name = FONT_NAMES.get(ud["font_id"], "بولد")
+    return [
+        [Button.inline(nt, b"t_name_time"), Button.inline(bt, b"t_bio_time")],
+        [Button.inline(f"⚙️ فونت ساعت: {current_font_name}", b"menu_fonts")],
+        [Button.inline("🔙 بازگشت به منوی اصلی", b"back_to_main")]
+    ]
+
+# ساخت کیبورد لیست فونت‌ها با تیک هوشمند
+def get_fonts_menu_keyboard(current_font_id):
+    btns = []
+    # چیدمان دکمه‌ها به صورت دو تایی برای زیبایی منو
+    row = []
+    for f_id, f_name in FONT_NAMES.items():
+        display_name = f"🔹 {f_name}"
+        if f_id == current_font_id:
+            display_name = f"✅ {f_name}"
+        row.append(Button.inline(display_name, f"setfont_{f_id}".encode()))
+        if len(row) == 2:
+            btns.append(row)
+            row = []
+    if row:
+        btns.append(row)
+    btns.append([Button.inline("🔙 بازگشت به تنظیمات ساعت", b"menu_time")])
+    return btns
+
+# ساخت کیبورد اکشن‌ها با تیک هوشمند
+def get_actions_menu_keyboard(current_action):
+    btns = []
+    row = []
+    for act_key, (act_name, _) in ACTIONS.items():
+        display_name = f"⚪️ {act_name}"
+        if act_key == current_action:
+            display_name = f"🟢 {act_name} "
+        row.append(Button.inline(display_name, f"setact_{act_key}".encode()))
+        if len(row) == 2:
+            btns.append(row)
+            row = []
+    if row:
+        btns.append(row)
+    btns.append([Button.inline("🔙 بازگشت به منوی اصلی", b"back_to_main")])
+    return btns
+
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     user_id = event.sender_id
@@ -157,25 +282,22 @@ async def start_handler(event):
         return
 
     if user_id not in user_data:
-        user_data[user_id] = {"session": None, "font_id": 1, "status": False, "task": None, "step": "menu"}
+        # ساخت مقادیر پیش‌فرض درخواستی شما (ساعت نام فعال، ساعت بیو غیرفعال، فونت بولد=1)
+        user_data[user_id] = {
+            "session": None, "font_id": 1, "status": False, "name_time": True, 
+            "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "menu"
+        }
         
     ud = user_data[user_id]
     
     if ud["session"] is None:
         btns = [
-            [Button.inline("• ساخت خودکار ‹پیشنهادی‹ ", b"start_gen_fast")],
-            [Button.inline("• ارسال سشن آماده", b"send_ready_session")]
+            [Button.inline("📱 ساخت خودکار سلف با شماره تلفن", b"start_gen_fast")],
+            [Button.inline("✍️ ارسال سشن آماده متنی", b"send_ready_session")]
         ]
-        await event.respond("⚡️ به ربات نوا سلف منیجر خوش آمدید!\nلطفاً یکی از روش‌های زیر را انتخاب کنید:", buttons=btns)
+        await event.respond("⚡️ به ربات مدیریت نواسلف خوش آمدید!\nلطفاً یکی از روش‌های زیر را انتخاب کنید:", buttons=btns)
     else:
-        st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
-        ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
-        btns = [
-            [Button.inline(f"وضعیت سلف: {st}", b"t_status")],
-            [Button.inline(f"فونت ساعت: {ft}", b"t_font")],
-            [Button.inline("❌ حذف اکانت", b"del")]
-        ]
-        await event.respond("🎛 پنل مدیریت سلف‌بات شما:", buttons=btns)
+        await event.respond("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(ud))
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -193,7 +315,7 @@ async def callback_handler(event):
 
     elif data == b"start_gen_fast":
         generator_data[user_id] = {"step": "get_phone", "phone": None, "phone_code_hash": None, "code_buffer": ""}
-        await event.edit("🔗 **نوا سلف منیجر**\nلطفاً **شماره تلفن** اکانت خود را به صورت انگلیسی بدون صفر و فاصله همراه با کد کشور بفرستید:\n(مثال: `+980123456789`)")
+        await event.edit("📞 **مرحله اول:**\nلطفاً **شماره تلفن** اکانت خود را همراه با کد کشور بفرستید:\n(مثال: `+989123456789`)")
         return
 
     if user_id in generator_data and generator_data[user_id]["step"] == "get_code":
@@ -203,10 +325,10 @@ async def callback_handler(event):
             if action.isdigit():
                 if len(gd["code_buffer"]) < 5:
                     gd["code_buffer"] += action
-                await event.edit("📩 **نوا سلف منیجر**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
+                await event.edit("📩 **مرحله دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
             elif action == "clear":
                 gd["code_buffer"] = ""
-                await event.edit("📩 **نوا سلف منیجر**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
+                await event.edit("📩 **مرحله دوم:**\nکد دریافتی از تلگرام را از روی کیپد زیر وارد کنید:", buttons=get_keyboard_layout(gd["code_buffer"]))
             elif action == "submit":
                 if len(gd["code_buffer"]) < 5:
                     await event.answer("⚠️ لطفاً کد ۵ رقمی را کامل وارد کنید!", alert=True)
@@ -220,9 +342,47 @@ async def callback_handler(event):
         
     ud = user_data[user_id]
         
-    if data == b"t_status":
+    # --- ناوبری منوها ---
+    if data == b"back_to_main":
+        await event.edit("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(ud))
+        return
+        
+    elif data == b"menu_time":
+        await event.edit("⏰ **تنظیمات ساعت پروفایل**\nدر این بخش می‌توانید نمایش زمان در نام یا بیوگرافی را مدیریت کنید:", buttons=get_time_menu_keyboard(ud))
+        return
+        
+    elif data == b"menu_fonts":
+        await event.edit("🔤 **فونت ساعت**\nلطفاً یکی از فونت‌های زیر را برای نمایش ساعت انتخاب کنید:", buttons=get_fonts_menu_keyboard(ud["font_id"]))
+        return
+        
+    elif data == b"menu_actions":
+        await event.edit("🎭 **منوی اکشن‌های فیک**\nبا انتخاب هر مورد، وضعیت شما به طور مداوم برای دیگران نمایش داده می‌شود:", buttons=get_actions_menu_keyboard(ud["active_action"]))
+        return
+
+    # --- تنظیمات اکشن‌ها و فونت‌ها از کال‌بک دکمه‌ها ---
+    elif data.startswith(b"setfont_"):
+        target_font = int(data.decode().split("_")[1])
+        ud["font_id"] = target_font
+        save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
+        await event.edit("🔤 **فونت ساعت**\nلطفاً یکی از فونت‌های زیر را برای نمایش ساعت انتخاب کنید:", buttons=get_fonts_menu_keyboard(ud["font_id"]))
+        return
+
+    elif data.startswith(b"setact_"):
+        target_action = data.decode().split("_")[1]
+        # سوئیچ کردن وضعیت دکمه: اگر دوباره روش کلیک شد غیرفعال بشه
+        if ud["active_action"] == target_action:
+            ud["active_action"] = "none"
+        else:
+            ud["active_action"] = target_action
+            
+        save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
+        await event.edit("🎭 **منوی اکشن‌های فیک**\nبا انتخاب هر مورد، وضعیت شما به طور مداوم برای دیگران نمایش داده می‌شود:", buttons=get_actions_menu_keyboard(ud["active_action"]))
+        return
+
+    # --- کنترل‌های وضعیت اصلی، نام و بیو ---
+    elif data == b"t_status":
         ud["status"] = not ud["status"]
-        save_user(user_id, ud["session"], ud["font_id"], ud["status"])
+        save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
         
         if ud["status"]:
             try:
@@ -231,28 +391,36 @@ async def callback_handler(event):
                 active_clients[user_id] = client
                 loop = asyncio.get_event_loop()
                 ud["task"] = loop.create_task(self_bot_worker(user_id, client))
+                ud["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
             except Exception:
                 await event.answer("خطا در روشن کردن مجدد سلف.", alert=True)
         else:
             if ud["task"]: ud["task"].cancel()
+            if ud["action_task"]: ud["action_task"].cancel()
             if user_id in active_clients: del active_clients[user_id]
+        await event.edit("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(ud))
+        return
             
-    elif data == b"t_font":
-        ud["font_id"] = (ud["font_id"] + 1) % 10
-        save_user(user_id, ud["session"], ud["font_id"], ud["status"])
+    elif data == b"t_name_time":
+        ud["name_time"] = not ud["name_time"]
+        save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
+        await event.edit("⏰ **تنظیمات ساعت پروفایل**\nدر این بخش می‌توانید نمایش زمان در نام یا بیوگرافی را مدیریت کنید:", buttons=get_time_menu_keyboard(ud))
+        return
+        
+    elif data == b"t_bio_time":
+        ud["bio_time"] = not ud["bio_time"]
+        save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
+        await event.edit("⏰ **تنظیمات ساعت پروفایل**\nدر این بخش می‌توانید نمایش زمان در نام یا بیوگرافی را مدیریت کنید:", buttons=get_time_menu_keyboard(ud))
+        return
         
     elif data == b"del":
         if ud["task"]: ud["task"].cancel()
+        if ud["action_task"]: ud["action_task"].cancel()
         if user_id in active_clients: del active_clients[user_id]
         delete_user_db(user_id)
         del user_data[user_id]
         await event.edit("🗑 اطلاعات شما کاملاً پاک شد. برای شروع مجدد /start بزنید.")
         return
-        
-    st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
-    ft = FONT_NAMES.get(ud["font_id"], "نامشخص")
-    btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-    await event.edit("🔗 پنل مدیریت نواسلف:", buttons=btns)
 
 async def process_code_signin(event, user_id, code):
     gd = generator_data[user_id]
@@ -266,21 +434,23 @@ async def process_code_signin(event, user_id, code):
         await client.sign_in(gd["phone"], code, phone_code_hash=gd["phone_code_hash"])
         session_string = client.session.save()
         
-        user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
+        # ثبت اولیه با تنظیمات پیش‌فرض درخواستی شما
+        user_data[user_id] = {
+            "session": session_string, "font_id": 1, "status": True, "name_time": True,
+            "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "managed"
+        }
         active_clients[user_id] = client
-        save_user(user_id, session_string, 1, True)
+        save_user(user_id, session_string, 1, True, True, False, "none")
         
         loop = asyncio.get_event_loop()
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
         
-        await event.respond("🎉 **اکانت با موفقیت متصل و اطلاعات در دیتابیس ذخیره شد!**\n\n⚙️ نواسلف هم‌اکنون روی اکانت شما روشن است.")
+        await event.respond("🎉 **اکانت با موفقیت متصل و در دیتابیس ابری ذخیره شد!**\n\n⚙️ نواسلف شما هم‌اکنون روشن است.")
         del generator_data[user_id]
         if user_id in active_signins: del active_signins[user_id]
         
-        st = "🟢 روشن"
-        ft = FONT_NAMES[1]
-        btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-        await event.respond("🔗 پنل مدیریت نواسلف:", buttons=btns)
+        await event.respond("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(user_data[user_id]))
         
     except SessionPasswordNeededError:
         gd["step"] = "get_password"
@@ -311,7 +481,7 @@ async def message_handler(event):
                 gd["step"] = "get_code"
                 
                 await event.respond(
-                    "📩 **قدم دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد.\n\n"
+                    "📩 **مرحله دوم:**\nکد تایید حساب برای تلگرام شما ارسال شد.\n\n"
                     "🔒 لطفاً کد ۵ رقمی را از طریق دکمه‌های زیر وارد کرده و دکمه تایید را بزنید:",
                     buttons=get_keyboard_layout("")
                 )
@@ -331,21 +501,22 @@ async def message_handler(event):
                 await client.sign_in(password=text)
                 session_string = client.session.save()
                 
-                user_data[user_id] = {"session": session_string, "font_id": 1, "status": True, "task": None, "step": "managed"}
+                user_data[user_id] = {
+                    "session": session_string, "font_id": 1, "status": True, "name_time": True,
+                    "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "managed"
+                }
                 active_clients[user_id] = client
-                save_user(user_id, session_string, 1, True)
+                save_user(user_id, session_string, 1, True, True, False, "none")
                 
                 loop = asyncio.get_event_loop()
                 user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+                user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
                 
                 await event.respond("🎉 **با رمز دو مرحله‌ای وارد شدید و اکانت متصل شد!**")
                 del generator_data[user_id]
                 if user_id in active_signins: del active_signins[user_id]
                 
-                st = "🟢 روشن"
-                ft = FONT_NAMES[1]
-                btns = [[Button.inline(f"وضعیت سلف: {st}", b"t_status")],[Button.inline(f"فونت ساعت: {ft}", b"t_font")],[Button.inline("❌ حذف اکانت", b"del")]]
-                await event.respond("🔗 پنل مدیریت نواسلف:", buttons=btns)
+                await event.respond("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(user_data[user_id]))
             except Exception as e:
                 await event.respond(f"❌ رمز عبور دو مرحله‌ای اشتباه است: {e}\nلطفاً مجدداً رمز صحیح را بفرستید:")
         return
@@ -363,15 +534,17 @@ async def message_handler(event):
             await event.respond("❌ ساختار متن ارسال شده اشتباه است.\nمطمئن شوید سشن تلتون (Telethon) است.")
             return
             
-        user_data[user_id]["session"] = clean_session
-        user_data[user_id]["step"] = "managed"
-        user_data[user_id]["status"] = True
+        user_data[user_id] = {
+            "session": clean_session, "font_id": 1, "status": True, "name_time": True,
+            "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "managed"
+        }
         active_clients[user_id] = client
-        save_user(user_id, clean_session, 1, True)
+        save_user(user_id, clean_session, 1, True, True, False, "none")
         
         loop = asyncio.get_event_loop()
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        await event.respond("✅ سلف با موفقیت ثبت، اطلاعات از دیتابیس دریافت شد!")
+        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
+        await event.respond("✅ سلف با موفقیت ثبت، اطلاعات از دیتابیس ابری زنده شد!")
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
