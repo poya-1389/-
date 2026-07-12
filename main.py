@@ -12,9 +12,13 @@ from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
-    SendMessageGamePlayAction, SendMessageChooseStickerAction
+    SendMessageGamePlayAction, SendMessageChooseStickerAction,
+    MessageEntityBold, MessageEntityItalic, MessageEntityUnderline, 
+    MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
+    MessageEntityPre, MessageEntityBlockquote
 )
 import logging
+import re
 
 # ======================== تنظیمات اولیه ========================
 API_ID = int(os.environ.get("API_ID"))
@@ -38,6 +42,7 @@ generator_data = {}
 active_signins = {}
 user_data = {}
 broadcast_data = {}
+text_mode_data = {}  # برای ذخیره حالت متن کاربران
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -74,16 +79,61 @@ FONT_NAMES = {
     13: "عربی (١٢٣)"
 }
 
-ACTIONS = {
-    'typing': ('در حال تایپ', SendMessageTypingAction()),
-    'voice': ('در حال ضبط صدا', SendMessageRecordAudioAction()),
-    'photo': ('در حال ارسال عکس', SendMessageUploadPhotoAction(0)),
-    'round': ('در حال ضبط ویدیو', SendMessageRecordRoundAction()),
-    'doc': ('در حال ارسال سند', SendMessageUploadDocumentAction(0)),
-    'video': ('در حال ارسال ویدیو', SendMessageUploadVideoAction(0)),
-    'game': ('در حال بازی', SendMessageGamePlayAction()),
-    'sticker': ('در حال انتخاب استیکر', SendMessageChooseStickerAction())
+# ======================== حالت‌های متن ========================
+TEXT_MODES = {
+    'none': ('🚫 غیرفعال', None),
+    'bold': ('⬛ بولد', MessageEntityBold),
+    'italic': ('⬜ ایتالیک', MessageEntityItalic),
+    'underline': ('⬛ زیر خط', MessageEntityUnderline),
+    'strike': ('⬜ خط خورده', MessageEntityStrike),
+    'spoiler': ('⬛ اسپویلر', MessageEntitySpoiler),
+    'code': ('⬜ تک فاصله', MessageEntityCode),
+    'pre': ('⬛ تدریجی', MessageEntityPre),
+    'blockquote': ('⬜ نقل قول', MessageEntityBlockquote)
 }
+
+# ======================== انواع تقویم ========================
+CALENDAR_TYPES = {
+    'gregorian': 'میلادی',
+    'hijri': 'قمری',
+    'jalali': 'خورشیدی'
+}
+
+# ======================== توابع کمکی تقویم ========================
+def get_jalali_date():
+    """تبدیل تاریخ میلادی به شمسی"""
+    try:
+        from jdatetime import datetime as jdatetime
+        return jdatetime.now().strftime("%Y/%m/%d")
+    except:
+        # اگر کتابخانه jdatetime نصب نبود، از تاریخ میلادی استفاده کن
+        return datetime.now().strftime("%Y/%m/%d")
+
+def get_hijri_date():
+    """تبدیل تاریخ میلادی به قمری (تقریبی)"""
+    try:
+        from hijri_converter import convert
+        greg = datetime.now()
+        hijri = convert.Gregorian(greg.year, greg.month, greg.day).to_hijri()
+        return f"{hijri.year}/{hijri.month:02d}/{hijri.day:02d}"
+    except:
+        # اگر کتابخانه hijri_converter نصب نبود، از تاریخ میلادی استفاده کن
+        return datetime.now().strftime("%Y/%m/%d")
+
+def get_gregorian_date():
+    return datetime.now().strftime("%Y/%m/%d")
+
+def get_formatted_date(calendar_type, font_id):
+    """دریافت تاریخ با تقویم و فونت مشخص"""
+    date_str = ""
+    if calendar_type == 'jalali':
+        date_str = get_jalali_date()
+    elif calendar_type == 'hijri':
+        date_str = get_hijri_date()
+    else:
+        date_str = get_gregorian_date()
+    
+    return apply_font(date_str, font_id)
 
 # ======================== مدیریت دیتابیس ========================
 def get_db_connection():
@@ -111,27 +161,36 @@ def init_db():
                     status INTEGER DEFAULT 0,
                     name_time INTEGER DEFAULT 1,
                     bio_time INTEGER DEFAULT 0,
-                    active_action TEXT DEFAULT 'none'
+                    active_action TEXT DEFAULT 'none',
+                    text_mode TEXT DEFAULT 'none',
+                    date_enabled INTEGER DEFAULT 0,
+                    calendar_type TEXT DEFAULT 'jalali',
+                    date_font_id INTEGER DEFAULT 1
                 )
             ''')
             conn.commit()
             logging.info("✅ جدول novaself_users با موفقیت ایجاد شد.")
         else:
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-                )
-            """)
-            column_exists = cursor.fetchone()[0]
+            # بررسی و اضافه کردن ستون‌های جدید
+            columns_to_add = [
+                ('text_mode', 'TEXT DEFAULT \'none\''),
+                ('date_enabled', 'INTEGER DEFAULT 0'),
+                ('calendar_type', 'TEXT DEFAULT \'jalali\''),
+                ('date_font_id', 'INTEGER DEFAULT 1'),
+                ('joined_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            ]
             
-            if not column_exists:
-                cursor.execute('''
-                    ALTER TABLE novaself_users 
-                    ADD COLUMN joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ''')
-                conn.commit()
-                logging.info("✅ ستون joined_at با موفقیت به جدول اضافه شد.")
+            for col_name, col_def in columns_to_add:
+                cursor.execute(f"""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.columns 
+                        WHERE table_name = 'novaself_users' AND column_name = '{col_name}'
+                    )
+                """)
+                if not cursor.fetchone()[0]:
+                    cursor.execute(f'ALTER TABLE novaself_users ADD COLUMN {col_name} {col_def}')
+                    conn.commit()
+                    logging.info(f"✅ ستون {col_name} با موفقیت به جدول اضافه شد.")
         
         cursor.close()
         conn.close()
@@ -143,27 +202,7 @@ def get_all_users():
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=DictCursor)
         
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-            )
-        """)
-        has_joined_at = cursor.fetchone()[0]
-        
-        if has_joined_at:
-            cursor.execute("""
-                SELECT user_id, session, font_id, status, name_time, bio_time, active_action, joined_at 
-                FROM novaself_users 
-                ORDER BY joined_at DESC
-            """)
-        else:
-            cursor.execute("""
-                SELECT user_id, session, font_id, status, name_time, bio_time, active_action
-                FROM novaself_users 
-                ORDER BY user_id DESC
-            """)
-        
+        cursor.execute("SELECT * FROM novaself_users ORDER BY joined_at DESC")
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -178,6 +217,10 @@ def get_all_users():
                 "name_time": bool(row['name_time']),
                 "bio_time": bool(row['bio_time']),
                 "active_action": row['active_action'],
+                "text_mode": row.get('text_mode', 'none'),
+                "date_enabled": bool(row.get('date_enabled', 0)),
+                "calendar_type": row.get('calendar_type', 'jalali'),
+                "date_font_id": row.get('date_font_id', 1),
                 "joined_at": row.get('joined_at', datetime.now()),
                 "step": "managed",
                 "task": None,
@@ -188,22 +231,55 @@ def get_all_users():
         logging.error(f"❌ خطا در بارگذاری کاربران: {e}")
         return {}
 
-def save_user(user_id, session, font_id, status, name_time, bio_time, active_action):
+def save_user(user_id, session, font_id, status, name_time, bio_time, active_action, 
+              text_mode='none', date_enabled=False, calendar_type='jalali', date_font_id=1):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO novaself_users (user_id, session, font_id, status, name_time, bio_time, active_action)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET 
-                session = EXCLUDED.session,
-                font_id = EXCLUDED.font_id,
-                status = EXCLUDED.status,
-                name_time = EXCLUDED.name_time,
-                bio_time = EXCLUDED.bio_time,
-                active_action = EXCLUDED.active_action
-        ''', (user_id, session, font_id, int(status), int(name_time), int(bio_time), active_action))
+        
+        # بررسی وجود ستون‌های جدید
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_name = 'novaself_users' AND column_name = 'text_mode'
+            )
+        """)
+        has_text_mode = cursor.fetchone()[0]
+        
+        if has_text_mode:
+            cursor.execute('''
+                INSERT INTO novaself_users 
+                (user_id, session, font_id, status, name_time, bio_time, active_action, 
+                 text_mode, date_enabled, calendar_type, date_font_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    session = EXCLUDED.session,
+                    font_id = EXCLUDED.font_id,
+                    status = EXCLUDED.status,
+                    name_time = EXCLUDED.name_time,
+                    bio_time = EXCLUDED.bio_time,
+                    active_action = EXCLUDED.active_action,
+                    text_mode = EXCLUDED.text_mode,
+                    date_enabled = EXCLUDED.date_enabled,
+                    calendar_type = EXCLUDED.calendar_type,
+                    date_font_id = EXCLUDED.date_font_id
+            ''', (user_id, session, font_id, int(status), int(name_time), int(bio_time), 
+                  active_action, text_mode, int(date_enabled), calendar_type, date_font_id))
+        else:
+            cursor.execute('''
+                INSERT INTO novaself_users (user_id, session, font_id, status, name_time, bio_time, active_action)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    session = EXCLUDED.session,
+                    font_id = EXCLUDED.font_id,
+                    status = EXCLUDED.status,
+                    name_time = EXCLUDED.name_time,
+                    bio_time = EXCLUDED.bio_time,
+                    active_action = EXCLUDED.active_action
+            ''', (user_id, session, font_id, int(status), int(name_time), int(bio_time), active_action))
+        
         conn.commit()
         cursor.close()
         conn.close()
@@ -251,9 +327,14 @@ def is_admin(user_id):
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
     status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
+    text_mode_name = TEXT_MODES.get(user.get("text_mode", 'none'), ('🚫 غیرفعال', None))[0]
+    date_status = "✅ فعال" if user.get("date_enabled", False) else "❌ غیرفعال"
+    
     return [
         [Button.inline(f"وضعیت سلف: {status_text}", b"toggle_status")],
-        [Button.inline("⌚ تنظیمات ساعت", b"menu_time"), Button.inline("🎭 مدیریت اکشن", b"menu_actions")],
+        [Button.inline("⌚ ساعت", b"menu_time"), Button.inline("🎭 اکشن", b"menu_actions")],
+        [Button.inline(f"📝 حالت متن: {text_mode_name}", b"menu_text_mode")],
+        [Button.inline(f"📅 تاریخ: {date_status}", b"menu_date")],
         [Button.inline("🗑️ حذف اکانت", b"delete_account")]
     ]
 
@@ -305,6 +386,63 @@ def get_actions_menu_keyboard(current_action):
     buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
     return buttons
 
+def get_text_mode_menu_keyboard(current_mode):
+    buttons = []
+    row = []
+    
+    for mode_key, (mode_name, _) in TEXT_MODES.items():
+        display = f"✅ {mode_name}" if mode_key == current_mode else f"🔹 {mode_name}"
+        row.append(Button.inline(display, f"settext_{mode_key}".encode()))
+        
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    if row:
+        buttons.append(row)
+    
+    buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
+    return buttons
+
+def get_date_menu_keyboard(user):
+    date_status = "✅ فعال" if user.get("date_enabled", False) else "❌ غیرفعال"
+    calendar_name = CALENDAR_TYPES.get(user.get("calendar_type", 'jalali'), 'خورشیدی')
+    date_font_name = FONT_NAMES.get(user.get("date_font_id", 1), "بولد")
+    
+    return [
+        [Button.inline(f"وضعیت تاریخ: {date_status}", b"toggle_date")],
+        [Button.inline(f"📅 تقویم: {calendar_name}", b"menu_calendar")],
+        [Button.inline(f"🔤 فونت تاریخ: {date_font_name}", b"menu_date_fonts")],
+        [Button.inline("🔙 بازگشت", b"back_to_main")]
+    ]
+
+def get_calendar_menu_keyboard(current_calendar):
+    buttons = []
+    for cal_key, cal_name in CALENDAR_TYPES.items():
+        display = f"✅ {cal_name}" if cal_key == current_calendar else f"🔹 {cal_name}"
+        buttons.append([Button.inline(display, f"setcal_{cal_key}".encode())])
+    
+    buttons.append([Button.inline("🔙 بازگشت به تاریخ", b"menu_date")])
+    return buttons
+
+def get_date_fonts_menu_keyboard(current_font_id):
+    buttons = []
+    row = []
+    
+    for font_id, font_name in FONT_NAMES.items():
+        display = f"✅ {font_name}" if font_id == current_font_id else f"🔹 {font_name}"
+        row.append(Button.inline(display, f"setdatefont_{font_id}".encode()))
+        
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    if row:
+        buttons.append(row)
+    
+    buttons.append([Button.inline("🔙 بازگشت به تاریخ", b"menu_date")])
+    return buttons
+
 def get_code_keyboard(current_code=""):
     display = current_code if current_code else "خالی"
     return [
@@ -333,27 +471,11 @@ def get_users_list_page(page=0, per_page=10):
         offset = page * per_page
         
         cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-            )
-        """)
-        has_joined_at = cursor.fetchone()[0]
-        
-        if has_joined_at:
-            cursor.execute("""
-                SELECT user_id, status, joined_at 
-                FROM novaself_users 
-                ORDER BY joined_at DESC 
-                LIMIT %s OFFSET %s
-            """, (per_page, offset))
-        else:
-            cursor.execute("""
-                SELECT user_id, status, NULL as joined_at
-                FROM novaself_users 
-                ORDER BY user_id DESC 
-                LIMIT %s OFFSET %s
-            """, (per_page, offset))
+            SELECT user_id, status, joined_at 
+            FROM novaself_users 
+            ORDER BY joined_at DESC 
+            LIMIT %s OFFSET %s
+        """, (per_page, offset))
         
         users = cursor.fetchall()
         cursor.close()
@@ -394,7 +516,6 @@ async def self_bot_worker(user_id, client):
     try:
         me = await client.get_me()
         first_name = me.first_name or "کاربر"
-        base_bio = "NovaSelf Bot"
         last_time = ""
         
         while True:
@@ -405,7 +526,26 @@ async def self_bot_worker(user_id, client):
             tehran_tz = pytz.timezone('Asia/Tehran')
             current_time = datetime.now(tehran_tz).strftime("%H:%M")
             
-            if current_time != last_time:
+            # ساخت بیوگرافی
+            bio_parts = []
+            
+            # اضافه کردن تاریخ اگر فعال باشد
+            if user.get("date_enabled", False):
+                date_str = get_formatted_date(
+                    user.get("calendar_type", 'jalali'),
+                    user.get("date_font_id", 1)
+                )
+                bio_parts.append(f"📅 {date_str}")
+            
+            # اضافه کردن ساعت اگر فعال باشد
+            if user["bio_time"]:
+                formatted_time = apply_font(current_time, user["font_id"])
+                bio_parts.append(f"🕐 {formatted_time}")
+            
+            bio_text = " | ".join(bio_parts) if bio_parts else ""
+            
+            # بروزرسانی نام و بیو
+            if current_time != last_time or user.get("date_enabled", False):
                 formatted_time = apply_font(current_time, user["font_id"])
                 
                 try:
@@ -414,8 +554,8 @@ async def self_bot_worker(user_id, client):
                     else:
                         await client(UpdateProfileRequest(first_name=first_name, last_name=""))
                     
-                    if user["bio_time"]:
-                        await client(UpdateProfileRequest(about=f"{base_bio} | {formatted_time}"))
+                    # بروزرسانی بیوگرافی
+                    await client(UpdateProfileRequest(about=bio_text))
                     
                     last_time = current_time
                 except FloodWaitError as e:
@@ -485,14 +625,15 @@ async def autostart_saved_users():
                 else:
                     user["status"] = False
                     save_user(user_id, user["session"], user["font_id"], False, 
-                             user["name_time"], user["bio_time"], user["active_action"])
+                             user["name_time"], user["bio_time"], user["active_action"],
+                             user.get("text_mode", "none"), user.get("date_enabled", False),
+                             user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
             except Exception as e:
                 logging.error(f"❌ خطا در راه‌اندازی خودکار کاربر {user_id}: {e}")
 
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """هندلر دستور /start - کاملاً یکسان برای همه کاربران"""
     user_id = event.sender_id
     
     if user_id in generator_data:
@@ -506,6 +647,10 @@ async def start_handler(event):
             "name_time": True,
             "bio_time": False,
             "active_action": "none",
+            "text_mode": "none",
+            "date_enabled": False,
+            "calendar_type": "jalali",
+            "date_font_id": 1,
             "task": None,
             "action_task": None,
             "step": "menu",
@@ -533,7 +678,6 @@ async def start_handler(event):
 
 @bot.on(events.NewMessage(pattern='/admin'))
 async def admin_handler(event):
-    """هندلر دستور /admin - فقط برای ادمین‌ها"""
     user_id = event.sender_id
     
     if not is_admin(user_id):
@@ -557,7 +701,6 @@ async def callback_handler(event):
     
     # ====== منوی ادمین ======
     if is_admin(user_id):
-        # پنل ادمین
         if data == b"admin_panel":
             await event.edit(
                 "👑 **پنل مدیریت NovaSelf**\n\n"
@@ -566,7 +709,6 @@ async def callback_handler(event):
             )
             return
         
-        # آمار کاربران
         if data == b"admin_stats":
             total, active = get_user_stats()
             await event.edit(
@@ -579,7 +721,6 @@ async def callback_handler(event):
             )
             return
         
-        # لیست کاربران
         if data == b"admin_users_list":
             buttons = get_users_list_page(0)
             await event.edit(
@@ -589,7 +730,6 @@ async def callback_handler(event):
             )
             return
         
-        # صفحه‌بندی لیست کاربران
         if data.startswith(b"admin_users_page_"):
             page = int(data.decode().split("_")[3])
             buttons = get_users_list_page(page)
@@ -600,7 +740,6 @@ async def callback_handler(event):
             )
             return
         
-        # مشاهده جزئیات کاربر
         if data.startswith(b"admin_view_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
@@ -609,6 +748,9 @@ async def callback_handler(event):
                 status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
                 font_name = FONT_NAMES.get(user["font_id"], "نامشخص")
                 action_name = ACTIONS.get(user["active_action"], ("هیچ",))[0] if user["active_action"] != "none" else "هیچ"
+                text_mode_name = TEXT_MODES.get(user.get("text_mode", "none"), ("غیرفعال", None))[0]
+                date_status = "✅ فعال" if user.get("date_enabled", False) else "❌ غیرفعال"
+                calendar_name = CALENDAR_TYPES.get(user.get("calendar_type", "jalali"), "خورشیدی")
                 
                 await event.edit(
                     f"👤 **جزئیات کاربر:**\n\n"
@@ -618,6 +760,8 @@ async def callback_handler(event):
                     f"⌚ نمایش در نام: {'✅' if user['name_time'] else '❌'}\n"
                     f"⌚ نمایش در بیو: {'✅' if user['bio_time'] else '❌'}\n"
                     f"🎭 اکشن: {action_name}\n"
+                    f"📝 حالت متن: {text_mode_name}\n"
+                    f"📅 تاریخ: {date_status} - {calendar_name}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
                     buttons=get_user_detail_buttons(target_id)
@@ -626,7 +770,6 @@ async def callback_handler(event):
                 await event.answer("❌ کاربر پیدا نشد!", alert=True)
             return
         
-        # تغییر وضعیت کاربر توسط ادمین
         if data.startswith(b"admin_toggle_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
@@ -654,7 +797,9 @@ async def callback_handler(event):
                         del active_clients[target_id]
                 
                 save_user(target_id, user["session"], user["font_id"], user["status"],
-                         user["name_time"], user["bio_time"], user["active_action"])
+                         user["name_time"], user["bio_time"], user["active_action"],
+                         user.get("text_mode", "none"), user.get("date_enabled", False),
+                         user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
                 
                 await event.answer("✅ وضعیت کاربر تغییر کرد!", alert=True)
                 await event.edit(
@@ -665,7 +810,6 @@ async def callback_handler(event):
                 )
             return
         
-        # حذف کاربر توسط ادمین
         if data.startswith(b"admin_delete_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
@@ -687,7 +831,6 @@ async def callback_handler(event):
                 )
             return
         
-        # ارسال پیام به کاربر خاص
         if data.startswith(b"admin_send_to_user_"):
             target_id = int(data.decode().split("_")[4])
             broadcast_data[user_id] = {
@@ -702,7 +845,6 @@ async def callback_handler(event):
             )
             return
         
-        # ارسال پیام همگانی
         if data == b"admin_broadcast":
             broadcast_data[user_id] = {
                 "type": "broadcast",
@@ -716,7 +858,6 @@ async def callback_handler(event):
             )
             return
         
-        # جستجوی کاربر
         if data == b"admin_search_user":
             broadcast_data[user_id] = {
                 "type": "search",
@@ -728,7 +869,6 @@ async def callback_handler(event):
             )
             return
         
-        # بروزرسانی همه کاربران
         if data == b"admin_refresh_all":
             await event.edit("⏳ در حال بروزرسانی اطلاعات همه کاربران...")
             
@@ -856,12 +996,116 @@ async def callback_handler(event):
         )
         return
     
+    # ====== منوی حالت متن ======
+    if data == b"menu_text_mode":
+        await event.edit(
+            "📝 **حالت متن**\n\n"
+            "با انتخاب هر گزینه، پیام‌های ارسالی شما به‌صورت خودکار به آن حالت تبدیل می‌شوند:\n\n"
+            "⬛ حالت‌های پررنگ\n"
+            "⬜ حالت‌های معمولی",
+            buttons=get_text_mode_menu_keyboard(user.get("text_mode", "none"))
+        )
+        return
+    
+    if data.startswith(b"settext_"):
+        mode_key = data.decode().split("_")[1]
+        user["text_mode"] = mode_key
+        
+        save_user(user_id, user["session"], user["font_id"], user["status"],
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 mode_key, user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+        
+        mode_name = TEXT_MODES.get(mode_key, ("غیرفعال", None))[0]
+        await event.edit(
+            "📝 **حالت متن**\n\n"
+            f"✅ حالت «{mode_name}» با موفقیت فعال شد.\n\n"
+            "از این پس پیام‌های ارسالی شما به این حالت تبدیل می‌شوند.",
+            buttons=get_text_mode_menu_keyboard(mode_key)
+        )
+        return
+    
+    # ====== منوی تاریخ ======
+    if data == b"menu_date":
+        await event.edit(
+            "📅 **تنظیمات تاریخ**\n\n"
+            "در این بخش می‌توانید نمایش تاریخ را در بیوگرافی خود تنظیم کنید:",
+            buttons=get_date_menu_keyboard(user)
+        )
+        return
+    
+    if data == b"toggle_date":
+        user["date_enabled"] = not user.get("date_enabled", False)
+        save_user(user_id, user["session"], user["font_id"], user["status"],
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user["date_enabled"],
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+        
+        await event.edit(
+            "📅 **تنظیمات تاریخ**\n\n"
+            f"✅ وضعیت تاریخ به {'فعال' if user['date_enabled'] else 'غیرفعال'} تغییر یافت.",
+            buttons=get_date_menu_keyboard(user)
+        )
+        return
+    
+    if data == b"menu_calendar":
+        await event.edit(
+            "📅 **انتخاب تقویم**\n\n"
+            "لطفاً نوع تقویم مورد نظر خود را انتخاب کنید:",
+            buttons=get_calendar_menu_keyboard(user.get("calendar_type", "jalali"))
+        )
+        return
+    
+    if data.startswith(b"setcal_"):
+        cal_key = data.decode().split("_")[1]
+        user["calendar_type"] = cal_key
+        
+        save_user(user_id, user["session"], user["font_id"], user["status"],
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 cal_key, user.get("date_font_id", 1))
+        
+        cal_name = CALENDAR_TYPES.get(cal_key, "خورشیدی")
+        await event.edit(
+            "📅 **انتخاب تقویم**\n\n"
+            f"✅ تقویم «{cal_name}» با موفقیت انتخاب شد.",
+            buttons=get_calendar_menu_keyboard(cal_key)
+        )
+        return
+    
+    if data == b"menu_date_fonts":
+        await event.edit(
+            "🔤 **انتخاب فونت تاریخ**\n\n"
+            "لطفاً یکی از فونت‌های زیر را برای نمایش تاریخ انتخاب کنید:",
+            buttons=get_date_fonts_menu_keyboard(user.get("date_font_id", 1))
+        )
+        return
+    
+    if data.startswith(b"setdatefont_"):
+        font_id = int(data.decode().split("_")[1])
+        user["date_font_id"] = font_id
+        
+        save_user(user_id, user["session"], user["font_id"], user["status"],
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), font_id)
+        
+        await event.edit(
+            "🔤 **انتخاب فونت تاریخ**\n\n"
+            f"✅ فونت «{FONT_NAMES[font_id]}» با موفقیت انتخاب شد.",
+            buttons=get_date_fonts_menu_keyboard(font_id)
+        )
+        return
+    
+    # ====== تنظیمات قبلی ======
     if data.startswith(b"setfont_"):
         font_id = int(data.decode().split("_")[1])
         user["font_id"] = font_id
         
         save_user(user_id, user["session"], font_id, user["status"], 
-                 user["name_time"], user["bio_time"], user["active_action"])
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         await event.edit(
             "🔤 **انتخاب فونت ساعت**\n\n"
@@ -879,7 +1123,9 @@ async def callback_handler(event):
             user["active_action"] = action_key
         
         save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         await event.edit(
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
@@ -891,7 +1137,9 @@ async def callback_handler(event):
     if data == b"toggle_status":
         user["status"] = not user["status"]
         save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         if user["status"]:
             try:
@@ -927,7 +1175,9 @@ async def callback_handler(event):
     if data == b"toggle_name_time":
         user["name_time"] = not user["name_time"]
         save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         await event.edit(
             "⌚ **تنظیمات ساعت**\n\n"
@@ -939,7 +1189,9 @@ async def callback_handler(event):
     if data == b"toggle_bio_time":
         user["bio_time"] = not user["bio_time"]
         save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user.get("text_mode", "none"), user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
         
         await event.edit(
             "⌚ **تنظیمات ساعت**\n\n"
@@ -986,6 +1238,10 @@ async def process_code_signin(event, user_id, code):
             "name_time": True,
             "bio_time": False,
             "active_action": "none",
+            "text_mode": "none",
+            "date_enabled": False,
+            "calendar_type": "jalali",
+            "date_font_id": 1,
             "task": None,
             "action_task": None,
             "step": "managed",
@@ -1038,6 +1294,10 @@ async def process_code_signin(event, user_id, code):
 async def message_handler(event):
     user_id = event.sender_id
     text = event.text.strip() if event.text else ""
+    
+    # جلوگیری از پردازش پیام‌های خود ربات
+    if event.out:
+        return
     
     # لغو عملیات
     if text == "/cancel" and user_id in broadcast_data:
@@ -1097,6 +1357,43 @@ async def message_handler(event):
                 )
             return
     
+    # ====== پردازش حالت متن ======
+    if user_id in user_data and user_data[user_id].get("session") is not None:
+        user = user_data[user_id]
+        mode = user.get("text_mode", "none")
+        
+        if mode != "none" and mode in TEXT_MODES and text and not text.startswith('/'):
+            try:
+                # ایجاد موجودیت‌های متن
+                entities = []
+                if mode == 'bold':
+                    entities.append(MessageEntityBold(0, len(text)))
+                elif mode == 'italic':
+                    entities.append(MessageEntityItalic(0, len(text)))
+                elif mode == 'underline':
+                    entities.append(MessageEntityUnderline(0, len(text)))
+                elif mode == 'strike':
+                    entities.append(MessageEntityStrike(0, len(text)))
+                elif mode == 'spoiler':
+                    entities.append(MessageEntitySpoiler(0, len(text)))
+                elif mode == 'code':
+                    entities.append(MessageEntityCode(0, len(text)))
+                elif mode == 'pre':
+                    entities.append(MessageEntityPre(0, len(text), language=''))
+                elif mode == 'blockquote':
+                    entities.append(MessageEntityBlockquote(0, len(text)))
+                
+                # حذف پیام اصلی کاربر و ارسال نسخه ویرایش شده
+                await event.delete()
+                await bot.send_message(
+                    event.chat_id,
+                    text,
+                    entities=entities,
+                    reply_to=event.reply_to_msg_id
+                )
+            except Exception as e:
+                logging.error(f"❌ خطا در اعمال حالت متن: {e}")
+    
     # ====== پردازش ساخت خودکار حساب ======
     if user_id in generator_data:
         generator = generator_data[user_id]
@@ -1151,6 +1448,10 @@ async def message_handler(event):
                     "name_time": True,
                     "bio_time": False,
                     "active_action": "none",
+                    "text_mode": "none",
+                    "date_enabled": False,
+                    "calendar_type": "jalali",
+                    "date_font_id": 1,
                     "task": None,
                     "action_task": None,
                     "step": "managed",
@@ -1216,6 +1517,10 @@ async def message_handler(event):
             "name_time": True,
             "bio_time": False,
             "active_action": "none",
+            "text_mode": "none",
+            "date_enabled": False,
+            "calendar_type": "jalali",
+            "date_font_id": 1,
             "task": None,
             "action_task": None,
             "step": "managed",
