@@ -2,17 +2,22 @@ import asyncio
 import os
 import pytz
 import psycopg2
+import jdatetime
+from hijridate import Gregorian
 from psycopg2.extras import DictCursor
 from datetime import datetime
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, helpers
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError, MessageNotModifiedError
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
-    SendMessageGamePlayAction, SendMessageChooseStickerAction
+    SendMessageGamePlayAction, SendMessageChooseStickerAction,
+    MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
+    MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
+    MessageEntityBlockquote
 )
 import logging
 
@@ -85,54 +90,64 @@ ACTIONS = {
     'sticker': ('در حال انتخاب استیکر', SendMessageChooseStickerAction())
 }
 
+# ======================== انواع تاریخ ========================
+DATE_TYPE_NAMES = {
+    "gregorian": "میلادی",
+    "shamsi": "شمسی",
+    "qamari": "قمری",
+}
+
+# ======================== حالت‌های متن ========================
+TEXTMODE_NAMES = {
+    1: "نقل قول",
+    2: "بولد",
+    3: "زیرخط",
+    4: "ایتالیک",
+    5: "اسپویلر",
+    6: "خط خورده",
+    7: "تدریجی",
+    8: "تک‌فاصله",
+}
+
 # ======================== مدیریت دیتابیس ========================
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
+    """ایجاد جدول و افزودن ستون‌های جدید در صورت نیاز (idempotent و امن برای ری‌استارت)."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'novaself_users'
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_users (
+                user_id BIGINT PRIMARY KEY,
+                session TEXT,
+                font_id INTEGER DEFAULT 1,
+                status INTEGER DEFAULT 0,
+                name_time INTEGER DEFAULT 1,
+                bio_time INTEGER DEFAULT 0,
+                active_action TEXT DEFAULT 'none',
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        table_exists = cursor.fetchone()[0]
-        
-        if not table_exists:
-            cursor.execute('''
-                CREATE TABLE novaself_users (
-                    user_id BIGINT PRIMARY KEY,
-                    session TEXT,
-                    font_id INTEGER DEFAULT 1,
-                    status INTEGER DEFAULT 0,
-                    name_time INTEGER DEFAULT 1,
-                    bio_time INTEGER DEFAULT 0,
-                    active_action TEXT DEFAULT 'none'
-                )
-            ''')
-            conn.commit()
-            logging.info("✅ جدول novaself_users با موفقیت ایجاد شد.")
-        else:
-            cursor.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-                )
-            """)
-            column_exists = cursor.fetchone()[0]
-            
-            if not column_exists:
-                cursor.execute('''
-                    ALTER TABLE novaself_users 
-                    ADD COLUMN joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                ''')
+        ''')
+        conn.commit()
+
+        migration_columns = [
+            ("date_enabled", "INTEGER DEFAULT 0"),
+            ("date_type", "TEXT DEFAULT 'shamsi'"),
+            ("date_font", "INTEGER DEFAULT 1"),
+            ("text_mode", "INTEGER DEFAULT 0"),
+        ]
+        for col_name, col_def in migration_columns:
+            try:
+                cursor.execute(f"ALTER TABLE novaself_users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
                 conn.commit()
-                logging.info("✅ ستون joined_at با موفقیت به جدول اضافه شد.")
-        
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"❌ خطا در افزودن ستون {col_name}: {e}")
+
+        logging.info("✅ دیتابیس با موفقیت راه‌اندازی/بروزرسانی شد.")
         cursor.close()
         conn.close()
     except Exception as e:
@@ -142,43 +157,33 @@ def get_all_users():
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=DictCursor)
-        
+
         cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-            )
+            SELECT user_id, session, font_id, status, name_time, bio_time, active_action,
+                   joined_at, date_enabled, date_type, date_font, text_mode
+            FROM novaself_users
+            ORDER BY joined_at DESC
         """)
-        has_joined_at = cursor.fetchone()[0]
-        
-        if has_joined_at:
-            cursor.execute("""
-                SELECT user_id, session, font_id, status, name_time, bio_time, active_action, joined_at 
-                FROM novaself_users 
-                ORDER BY joined_at DESC
-            """)
-        else:
-            cursor.execute("""
-                SELECT user_id, session, font_id, status, name_time, bio_time, active_action
-                FROM novaself_users 
-                ORDER BY user_id DESC
-            """)
-        
+
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        
+
         data = {}
         for row in rows:
             user_id = row['user_id']
             data[user_id] = {
                 "session": row['session'],
-                "font_id": row['font_id'],
+                "font_id": row['font_id'] if row['font_id'] is not None else 1,
                 "status": bool(row['status']),
                 "name_time": bool(row['name_time']),
                 "bio_time": bool(row['bio_time']),
-                "active_action": row['active_action'],
-                "joined_at": row.get('joined_at', datetime.now()),
+                "active_action": row['active_action'] or "none",
+                "date_enabled": bool(row['date_enabled']) if row['date_enabled'] is not None else False,
+                "date_type": row['date_type'] or "shamsi",
+                "date_font": row['date_font'] if row['date_font'] is not None else 1,
+                "text_mode": row['text_mode'] if row['text_mode'] is not None else 0,
+                "joined_at": row['joined_at'] or datetime.now(),
                 "step": "managed",
                 "task": None,
                 "action_task": None
@@ -188,22 +193,35 @@ def get_all_users():
         logging.error(f"❌ خطا در بارگذاری کاربران: {e}")
         return {}
 
-def save_user(user_id, session, font_id, status, name_time, bio_time, active_action):
+def save_user(user_id, user):
+    """ذخیره یکجای تمام تنظیمات کاربر (جلوگیری از باگ‌های ناشی از آرگومان‌های جداگانه)."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO novaself_users (user_id, session, font_id, status, name_time, bio_time, active_action)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (user_id) 
-            DO UPDATE SET 
+            INSERT INTO novaself_users
+                (user_id, session, font_id, status, name_time, bio_time, active_action,
+                 date_enabled, date_type, date_font, text_mode)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
                 session = EXCLUDED.session,
                 font_id = EXCLUDED.font_id,
                 status = EXCLUDED.status,
                 name_time = EXCLUDED.name_time,
                 bio_time = EXCLUDED.bio_time,
-                active_action = EXCLUDED.active_action
-        ''', (user_id, session, font_id, int(status), int(name_time), int(bio_time), active_action))
+                active_action = EXCLUDED.active_action,
+                date_enabled = EXCLUDED.date_enabled,
+                date_type = EXCLUDED.date_type,
+                date_font = EXCLUDED.date_font,
+                text_mode = EXCLUDED.text_mode
+        ''', (
+            user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
+            int(user.get("name_time", True)), int(user.get("bio_time", False)),
+            user.get("active_action", "none"),
+            int(user.get("date_enabled", False)), user.get("date_type", "shamsi"),
+            user.get("date_font", 1), user.get("text_mode", 0)
+        ))
         conn.commit()
         cursor.close()
         conn.close()
@@ -225,16 +243,16 @@ def get_user_stats():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("SELECT COUNT(*) FROM novaself_users")
         total_users = cursor.fetchone()[0]
-        
+
         cursor.execute("SELECT COUNT(*) FROM novaself_users WHERE status = 1")
         active_users = cursor.fetchone()[0]
-        
+
         cursor.close()
         conn.close()
-        
+
         return total_users, active_users
     except Exception as e:
         logging.error(f"❌ خطا در دریافت آمار: {e}")
@@ -248,12 +266,102 @@ def apply_font(text, font_id):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+def make_default_user(session=None, status=False, step="menu"):
+    return {
+        "session": session,
+        "font_id": 1,
+        "status": status,
+        "name_time": True,
+        "bio_time": False,
+        "active_action": "none",
+        "date_enabled": False,
+        "date_type": "shamsi",
+        "date_font": 1,
+        "text_mode": 0,
+        "task": None,
+        "action_task": None,
+        "step": step,
+        "joined_at": datetime.now()
+    }
+
+def format_date(dt, date_type):
+    """تبدیل datetime به رشته تاریخ بر اساس نوع انتخابی (میلادی/شمسی/قمری)."""
+    try:
+        if date_type == "shamsi":
+            jd = jdatetime.datetime.fromgregorian(datetime=dt)
+            return jd.strftime("%Y/%m/%d")
+        elif date_type == "qamari":
+            h = Gregorian(dt.year, dt.month, dt.day).to_hijri()
+            return f"{h.year}/{h.month:02d}/{h.day:02d}"
+        else:
+            return dt.strftime("%Y/%m/%d")
+    except Exception as e:
+        logging.error(f"⚠️ خطا در محاسبه تاریخ ({date_type}): {e}")
+        return dt.strftime("%Y/%m/%d")
+
+def make_blockquote_entity(offset, length, collapsed=False):
+    """سازگار با نسخه‌های مختلف Telethon برای نقل‌قول تدریجی (collapsed)."""
+    try:
+        return MessageEntityBlockquote(offset=offset, length=length, collapsed=collapsed)
+    except TypeError:
+        return MessageEntityBlockquote(offset=offset, length=length)
+
+def build_format_entities(text, mode):
+    """ساخت entity قالب‌بندی مناسب برای متن کامل پیام بر اساس حالت انتخابی."""
+    if not text or not mode or mode not in TEXTMODE_NAMES:
+        return None
+
+    surrogated = helpers.add_surrogate(text)
+    length = len(surrogated)
+    if length == 0:
+        return None
+    offset = 0
+
+    if mode == 1:
+        return [make_blockquote_entity(offset, length, collapsed=False)]
+    if mode == 2:
+        return [MessageEntityBold(offset, length)]
+    if mode == 3:
+        return [MessageEntityUnderline(offset, length)]
+    if mode == 4:
+        return [MessageEntityItalic(offset, length)]
+    if mode == 5:
+        return [MessageEntitySpoiler(offset, length)]
+    if mode == 6:
+        return [MessageEntityStrike(offset, length)]
+    if mode == 7:
+        return [make_blockquote_entity(offset, length, collapsed=True)]
+    if mode == 8:
+        return [MessageEntityCode(offset, length)]
+    return None
+
+async def safe_edit(event, text, buttons=None):
+    """جلوگیری از کرش شدن هندلرها به‌خاطر خطای ویرایش پیام (مثل MessageNotModified)."""
+    try:
+        await event.edit(text, buttons=buttons)
+    except MessageNotModifiedError:
+        try:
+            await event.answer()
+        except Exception:
+            pass
+    except Exception as e:
+        logging.error(f"⚠️ خطا در ویرایش پیام: {e}")
+        try:
+            await event.answer("❌ خطا در بروزرسانی پیام، دوباره تلاش کنید.", alert=True)
+        except Exception:
+            pass
+
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
     status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
     return [
         [Button.inline(f"وضعیت سلف: {status_text}", b"toggle_status")],
-        [Button.inline("⌚ تنظیمات ساعت", b"menu_time"), Button.inline("🎭 مدیریت اکشن", b"menu_actions")],
+        [
+            Button.inline("📅 تاریخ", b"menu_date"),
+            Button.inline("🎭 اکشن", b"menu_actions"),
+            Button.inline("⌚ ساعت", b"menu_time"),
+        ],
+        [Button.inline("🖊️ حالت متن", b"menu_textmode")],
         [Button.inline("🗑️ حذف اکانت", b"delete_account")]
     ]
 
@@ -261,7 +369,7 @@ def get_time_menu_keyboard(user):
     name_status = "✅ فعال" if user["name_time"] else "❌ غیرفعال"
     bio_status = "✅ فعال" if user["bio_time"] else "❌ غیرفعال"
     current_font = FONT_NAMES.get(user["font_id"], "بولد")
-    
+
     return [
         [Button.inline(f"نمایش در نام: {name_status}", b"toggle_name_time")],
         [Button.inline(f"نمایش در بیو: {bio_status}", b"toggle_bio_time")],
@@ -272,36 +380,89 @@ def get_time_menu_keyboard(user):
 def get_fonts_menu_keyboard(current_font_id):
     buttons = []
     row = []
-    
+
     for font_id, font_name in FONT_NAMES.items():
         display = f"✅ {font_name}" if font_id == current_font_id else f"🔹 {font_name}"
         row.append(Button.inline(display, f"setfont_{font_id}".encode()))
-        
+
         if len(row) == 2:
             buttons.append(row)
             row = []
-    
+
     if row:
         buttons.append(row)
-    
+
     buttons.append([Button.inline("🔙 بازگشت به ساعت", b"menu_time")])
     return buttons
 
 def get_actions_menu_keyboard(current_action):
     buttons = []
     row = []
-    
+
     for action_key, (action_name, _) in ACTIONS.items():
         display = f"🟢 {action_name}" if action_key == current_action else f"⚪ {action_name}"
         row.append(Button.inline(display, f"setact_{action_key}".encode()))
-        
+
         if len(row) == 2:
             buttons.append(row)
             row = []
-    
+
     if row:
         buttons.append(row)
-    
+
+    buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
+    return buttons
+
+def get_date_menu_keyboard(user):
+    enabled_status = "✅ فعال" if user.get("date_enabled") else "❌ غیرفعال"
+    current_type = user.get("date_type", "shamsi")
+    current_font = FONT_NAMES.get(user.get("date_font", 1), "بولد")
+
+    type_row = []
+    for type_key, type_name in DATE_TYPE_NAMES.items():
+        display = f"✅ {type_name}" if type_key == current_type else f"🔹 {type_name}"
+        type_row.append(Button.inline(display, f"setdatetype_{type_key}".encode()))
+
+    return [
+        [Button.inline(f"نمایش تاریخ در بیو: {enabled_status}", b"toggle_date_enabled")],
+        type_row,
+        [Button.inline(f"🔤 تغییر فونت تاریخ: {current_font}", b"menu_date_fonts")],
+        [Button.inline("🔙 بازگشت", b"back_to_main")]
+    ]
+
+def get_date_fonts_menu_keyboard(current_font_id):
+    buttons = []
+    row = []
+
+    for font_id, font_name in FONT_NAMES.items():
+        display = f"✅ {font_name}" if font_id == current_font_id else f"🔹 {font_name}"
+        row.append(Button.inline(display, f"setdatefont_{font_id}".encode()))
+
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([Button.inline("🔙 بازگشت به تاریخ", b"menu_date")])
+    return buttons
+
+def get_textmode_menu_keyboard(current_mode):
+    buttons = []
+    row = []
+
+    for mode_id, mode_name in TEXTMODE_NAMES.items():
+        display = f"☑️ {mode_name}" if mode_id == current_mode else f"▫️ {mode_name}"
+        row.append(Button.inline(display, f"settextmode_{mode_id}".encode()))
+
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
     buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
     return buttons
 
@@ -331,51 +492,35 @@ def get_users_list_page(page=0, per_page=10):
         conn = get_db_connection()
         cursor = conn.cursor()
         offset = page * per_page
-        
+
         cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_name = 'novaself_users' AND column_name = 'joined_at'
-            )
-        """)
-        has_joined_at = cursor.fetchone()[0]
-        
-        if has_joined_at:
-            cursor.execute("""
-                SELECT user_id, status, joined_at 
-                FROM novaself_users 
-                ORDER BY joined_at DESC 
-                LIMIT %s OFFSET %s
-            """, (per_page, offset))
-        else:
-            cursor.execute("""
-                SELECT user_id, status, NULL as joined_at
-                FROM novaself_users 
-                ORDER BY user_id DESC 
-                LIMIT %s OFFSET %s
-            """, (per_page, offset))
-        
+            SELECT user_id, status, joined_at
+            FROM novaself_users
+            ORDER BY joined_at DESC
+            LIMIT %s OFFSET %s
+        """, (per_page, offset))
+
         users = cursor.fetchall()
         cursor.close()
         conn.close()
-        
+
         buttons = []
         for user in users:
             status_icon = "🟢" if user[1] else "🔴"
             buttons.append([Button.inline(
-                f"{status_icon} کاربر {user[0]}", 
+                f"{status_icon} کاربر {user[0]}",
                 f"admin_view_user_{user[0]}".encode()
             )])
-        
+
         nav_buttons = []
         if page > 0:
             nav_buttons.append(Button.inline("⬅️ قبلی", f"admin_users_page_{page-1}".encode()))
         nav_buttons.append(Button.inline(f"📄 صفحه {page+1}", b"void"))
         nav_buttons.append(Button.inline("➡️ بعدی", f"admin_users_page_{page+1}".encode()))
         buttons.append(nav_buttons)
-        
+
         buttons.append([Button.inline("🔙 بازگشت به پنل ادمین", b"admin_panel")])
-        
+
         return buttons
     except Exception as e:
         logging.error(f"❌ خطا در دریافت لیست کاربران: {e}")
@@ -389,49 +534,144 @@ def get_user_detail_buttons(user_id):
         [Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
     ]
 
+# ======================== هندلر قالب‌بندی خودکار متن (حالت متن) ========================
+def make_text_mode_handler(user_id):
+    async def handler(event):
+        try:
+            user = user_data.get(user_id)
+            if not user or not user.get("status"):
+                return
+
+            mode = user.get("text_mode", 0)
+            if not mode:
+                return
+
+            text = event.raw_text
+            if not text or not text.strip():
+                return
+
+            entities = build_format_entities(text, mode)
+            if not entities:
+                return
+
+            await asyncio.sleep(0.2)
+            await event.client.edit_message(
+                event.chat_id, event.id, text, formatting_entities=entities
+            )
+        except Exception as e:
+            logging.error(f"⚠️ خطا در قالب‌بندی خودکار متن کاربر {user_id}: {e}")
+
+    return handler
+
+# ======================== مدیریت چرخه حیات کلاینت سلف ========================
+def register_active_client(user_id, client):
+    """ثبت کلاینتِ از قبل متصل و احراز‌هویت‌شده (بدون اتصال مجدد)."""
+    active_clients[user_id] = client
+    client.add_event_handler(make_text_mode_handler(user_id), events.NewMessage(outgoing=True))
+
+    loop = asyncio.get_event_loop()
+    if user_id in user_data:
+        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
+        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
+
+async def start_self_client(user_id, session_string):
+    """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن."""
+    if not session_string:
+        return None
+    try:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None
+    except Exception as e:
+        logging.error(f"❌ خطا در اتصال کلاینت کاربر {user_id}: {e}")
+        return None
+
+    register_active_client(user_id, client)
+    return client
+
+async def stop_self_client(user_id):
+    """توقف کامل و امن کلاینت سلف یک کاربر (تسک‌ها + قطع اتصال)."""
+    user = user_data.get(user_id)
+    if user:
+        if user.get("task"):
+            user["task"].cancel()
+            user["task"] = None
+        if user.get("action_task"):
+            user["action_task"].cancel()
+            user["action_task"] = None
+
+    client = active_clients.pop(user_id, None)
+    if client:
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
+
 # ======================== توابع اصلی سلف ========================
 async def self_bot_worker(user_id, client):
     try:
         me = await client.get_me()
         first_name = me.first_name or "کاربر"
-        base_bio = "NovaSelf Bot"
-        last_time = ""
-        
+        last_signature = None
+
         while True:
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
-                
+
             user = user_data[user_id]
             tehran_tz = pytz.timezone('Asia/Tehran')
-            current_time = datetime.now(tehran_tz).strftime("%H:%M")
-            
-            if current_time != last_time:
+            now = datetime.now(tehran_tz)
+            current_time = now.strftime("%H:%M")
+            current_date_raw = format_date(now, user.get("date_type", "shamsi"))
+
+            signature = (
+                current_time, current_date_raw,
+                user["name_time"], user["bio_time"], user["font_id"],
+                user.get("date_enabled", False), user.get("date_type", "shamsi"),
+                user.get("date_font", 1)
+            )
+
+            if signature != last_signature:
                 formatted_time = apply_font(current_time, user["font_id"])
-                
+                formatted_date = apply_font(current_date_raw, user.get("date_font", 1))
+
                 try:
                     if user["name_time"]:
                         await client(UpdateProfileRequest(first_name=first_name, last_name=formatted_time))
                     else:
                         await client(UpdateProfileRequest(first_name=first_name, last_name=""))
-                    
+
+                    bio_parts = []
                     if user["bio_time"]:
-                        await client(UpdateProfileRequest(about=f"{base_bio} | {formatted_time}"))
-                    
-                    last_time = current_time
+                        bio_parts.append(formatted_time)
+                    if user.get("date_enabled"):
+                        bio_parts.append(formatted_date)
+
+                    if bio_parts:
+                        await client(UpdateProfileRequest(about=" | ".join(bio_parts)))
+
+                    last_signature = signature
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
                     logging.error(f"⚠️ خطا در بروزرسانی پروفایل کاربر {user_id}: {e}")
-            
+
             await asyncio.sleep(5)
-            
+
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         logging.error(f"❌ خطای اصلی سلف برای کاربر {user_id}: {e}")
     finally:
         try:
+            if active_clients.get(user_id) is client:
+                active_clients.pop(user_id, None)
             if client and client.is_connected():
                 await client.disconnect()
-        except:
+        except Exception:
             pass
 
 async def self_bot_action_worker(user_id, client):
@@ -439,14 +679,14 @@ async def self_bot_action_worker(user_id, client):
         while True:
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
-                
+
             user = user_data[user_id]
             action_key = user["active_action"]
-            
+
             if action_key == 'none' or action_key not in ACTIONS:
                 await asyncio.sleep(4)
                 continue
-            
+
             try:
                 async for dialog in client.iter_dialogs(limit=10):
                     if dialog.is_user or dialog.is_group:
@@ -455,65 +695,45 @@ async def self_bot_action_worker(user_id, client):
                                 peer=dialog.input_entity,
                                 action=ACTIONS[action_key][1]
                             ))
-                        except:
+                        except Exception:
                             pass
             except Exception as e:
                 logging.error(f"⚠️ خطا در نمایش اکشن کاربر {user_id}: {e}")
-            
+
             await asyncio.sleep(4)
-            
+
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
         logging.error(f"❌ خطای اکشن برای کاربر {user_id}: {e}")
 
 async def autostart_saved_users():
     await asyncio.sleep(5)
-    
+
     for user_id, user in list(user_data.items()):
         if user["status"] and user["session"]:
-            try:
-                client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
-                await client.connect()
-                
-                if await client.is_user_authorized():
-                    active_clients[user_id] = client
-                    
-                    loop = asyncio.get_event_loop()
-                    user["task"] = loop.create_task(self_bot_worker(user_id, client))
-                    user["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-                    
-                    logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
-                else:
-                    user["status"] = False
-                    save_user(user_id, user["session"], user["font_id"], False, 
-                             user["name_time"], user["bio_time"], user["active_action"])
-            except Exception as e:
-                logging.error(f"❌ خطا در راه‌اندازی خودکار کاربر {user_id}: {e}")
+            client = await start_self_client(user_id, user["session"])
+            if client:
+                logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
+            else:
+                user["status"] = False
+                save_user(user_id, user)
+                logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل نشست نامعتبر غیرفعال شد.")
 
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """هندلر دستور /start - کاملاً یکسان برای همه کاربران"""
     user_id = event.sender_id
-    
+
     if user_id in generator_data:
         return
-    
+
     if user_id not in user_data:
-        user_data[user_id] = {
-            "session": None,
-            "font_id": 1,
-            "status": False,
-            "name_time": True,
-            "bio_time": False,
-            "active_action": "none",
-            "task": None,
-            "action_task": None,
-            "step": "menu",
-            "joined_at": datetime.now()
-        }
-    
+        user_data[user_id] = make_default_user(step="menu")
+
     user = user_data[user_id]
-    
+
     if user["session"] is None:
         buttons = [
             [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
@@ -535,11 +755,11 @@ async def start_handler(event):
 async def admin_handler(event):
     """هندلر دستور /admin - فقط برای ادمین‌ها"""
     user_id = event.sender_id
-    
+
     if not is_admin(user_id):
         await event.respond("❌ شما دسترسی ادمین ندارید!")
         return
-    
+
     await event.respond(
         "👑 **پنل مدیریت NovaSelf**\n\n"
         "به پنل ادمین خوش آمدید! از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
@@ -550,26 +770,26 @@ async def admin_handler(event):
 async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
-    
+
     if data == b"void":
         await event.answer()
         return
-    
+
     # ====== منوی ادمین ======
     if is_admin(user_id):
         # پنل ادمین
         if data == b"admin_panel":
-            await event.edit(
+            await safe_edit(event,
                 "👑 **پنل مدیریت NovaSelf**\n\n"
                 "از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
                 buttons=get_admin_main_menu()
             )
             return
-        
+
         # آمار کاربران
         if data == b"admin_stats":
             total, active = get_user_stats()
-            await event.edit(
+            await safe_edit(event,
                 f"📊 **آمار کاربران:**\n\n"
                 f"👥 تعداد کل کاربران: {total}\n"
                 f"🟢 کاربران فعال: {active}\n"
@@ -578,45 +798,52 @@ async def callback_handler(event):
                 buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
             )
             return
-        
+
         # لیست کاربران
         if data == b"admin_users_list":
             buttons = get_users_list_page(0)
-            await event.edit(
+            await safe_edit(event,
                 "📋 **لیست کاربران:**\n\n"
                 "برای مشاهده جزئیات هر کاربر روی آن کلیک کنید:",
                 buttons=buttons
             )
             return
-        
+
         # صفحه‌بندی لیست کاربران
         if data.startswith(b"admin_users_page_"):
             page = int(data.decode().split("_")[3])
             buttons = get_users_list_page(page)
-            await event.edit(
+            await safe_edit(event,
                 "📋 **لیست کاربران:**\n\n"
                 "برای مشاهده جزئیات هر کاربر روی آن کلیک کنید:",
                 buttons=buttons
             )
             return
-        
+
         # مشاهده جزئیات کاربر
         if data.startswith(b"admin_view_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
                 user = user_data[target_id]
-                
+
                 status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
                 font_name = FONT_NAMES.get(user["font_id"], "نامشخص")
                 action_name = ACTIONS.get(user["active_action"], ("هیچ",))[0] if user["active_action"] != "none" else "هیچ"
-                
-                await event.edit(
+                date_text = (
+                    f"✅ {DATE_TYPE_NAMES.get(user.get('date_type', 'shamsi'), '؟')}"
+                    if user.get("date_enabled") else "❌ غیرفعال"
+                )
+                textmode_text = TEXTMODE_NAMES.get(user.get("text_mode", 0), "خاموش") if user.get("text_mode") else "خاموش"
+
+                await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
                     f"🆔 شناسه: `{target_id}`\n"
                     f"📊 وضعیت: {status_text}\n"
                     f"🔤 فونت: {font_name}\n"
                     f"⌚ نمایش در نام: {'✅' if user['name_time'] else '❌'}\n"
                     f"⌚ نمایش در بیو: {'✅' if user['bio_time'] else '❌'}\n"
+                    f"📅 تاریخ: {date_text}\n"
+                    f"🖊️ حالت متن: {textmode_text}\n"
                     f"🎭 اکشن: {action_name}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
@@ -625,68 +852,48 @@ async def callback_handler(event):
             else:
                 await event.answer("❌ کاربر پیدا نشد!", alert=True)
             return
-        
+
         # تغییر وضعیت کاربر توسط ادمین
         if data.startswith(b"admin_toggle_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
                 user = user_data[target_id]
                 user["status"] = not user["status"]
-                
+
                 if user["status"]:
-                    try:
-                        client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
-                        await client.connect()
-                        if await client.is_user_authorized():
-                            active_clients[target_id] = client
-                            loop = asyncio.get_event_loop()
-                            user["task"] = loop.create_task(self_bot_worker(target_id, client))
-                            user["action_task"] = loop.create_task(self_bot_action_worker(target_id, client))
-                    except Exception as e:
+                    client = await start_self_client(target_id, user["session"])
+                    if not client:
                         user["status"] = False
-                        await event.answer(f"❌ خطا: {str(e)[:50]}", alert=True)
+                        await event.answer("❌ خطا در راه‌اندازی (نشست نامعتبر است)", alert=True)
                 else:
-                    if user["task"]:
-                        user["task"].cancel()
-                    if user["action_task"]:
-                        user["action_task"].cancel()
-                    if target_id in active_clients:
-                        del active_clients[target_id]
-                
-                save_user(target_id, user["session"], user["font_id"], user["status"],
-                         user["name_time"], user["bio_time"], user["active_action"])
-                
+                    await stop_self_client(target_id)
+
+                save_user(target_id, user)
+
                 await event.answer("✅ وضعیت کاربر تغییر کرد!", alert=True)
-                await event.edit(
+                await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
                     f"🆔 شناسه: `{target_id}`\n"
                     f"📊 وضعیت جدید: {'🟢 فعال' if user['status'] else '🔴 غیرفعال'}",
                     buttons=get_user_detail_buttons(target_id)
                 )
             return
-        
+
         # حذف کاربر توسط ادمین
         if data.startswith(b"admin_delete_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
-                user = user_data[target_id]
-                if user["task"]:
-                    user["task"].cancel()
-                if user["action_task"]:
-                    user["action_task"].cancel()
-                if target_id in active_clients:
-                    del active_clients[target_id]
-                
+                await stop_self_client(target_id)
                 delete_user_db(target_id)
                 del user_data[target_id]
-                
+
                 await event.answer("✅ کاربر حذف شد!", alert=True)
-                await event.edit(
+                await safe_edit(event,
                     "🗑️ **کاربر با موفقیت حذف شد.**",
                     buttons=[Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
                 )
             return
-        
+
         # ارسال پیام به کاربر خاص
         if data.startswith(b"admin_send_to_user_"):
             target_id = int(data.decode().split("_")[4])
@@ -695,82 +902,67 @@ async def callback_handler(event):
                 "target_id": target_id,
                 "step": "get_message"
             }
-            await event.edit(
+            await safe_edit(event,
                 f"📨 **ارسال پیام به کاربر {target_id}**\n\n"
                 "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
                 "برای لغو عملیات، /cancel را بفرستید."
             )
             return
-        
+
         # ارسال پیام همگانی
         if data == b"admin_broadcast":
             broadcast_data[user_id] = {
                 "type": "broadcast",
                 "step": "get_message"
             }
-            await event.edit(
+            await safe_edit(event,
                 "📨 **ارسال پیام همگانی**\n\n"
                 "⚠️ این پیام برای **همه کاربران** ارسال خواهد شد!\n\n"
                 "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
                 "برای لغو عملیات، /cancel را بفرستید."
             )
             return
-        
+
         # جستجوی کاربر
         if data == b"admin_search_user":
             broadcast_data[user_id] = {
                 "type": "search",
                 "step": "get_user_id"
             }
-            await event.edit(
+            await safe_edit(event,
                 "🔍 **جستجوی کاربر**\n\n"
                 "لطفاً شناسه (ID) کاربر مورد نظر را وارد کنید:"
             )
             return
-        
+
         # بروزرسانی همه کاربران
         if data == b"admin_refresh_all":
-            await event.edit("⏳ در حال بروزرسانی اطلاعات همه کاربران...")
-            
-            for uid, user in user_data.items():
+            await safe_edit(event, "⏳ در حال بروزرسانی اطلاعات همه کاربران...")
+
+            for uid, user in list(user_data.items()):
                 if user["status"] and user["session"]:
-                    if user["task"]:
-                        user["task"].cancel()
-                    if user["action_task"]:
-                        user["action_task"].cancel()
-                    if uid in active_clients:
-                        try:
-                            await active_clients[uid].disconnect()
-                        except:
-                            pass
-                        del active_clients[uid]
-                    
-                    try:
-                        client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
-                        await client.connect()
-                        if await client.is_user_authorized():
-                            active_clients[uid] = client
-                            loop = asyncio.get_event_loop()
-                            user["task"] = loop.create_task(self_bot_worker(uid, client))
-                            user["action_task"] = loop.create_task(self_bot_action_worker(uid, client))
-                    except Exception as e:
-                        logging.error(f"❌ خطا در بروزرسانی کاربر {uid}: {e}")
-            
-            await event.edit(
+                    await stop_self_client(uid)
+                    client = await start_self_client(uid, user["session"])
+                    if not client:
+                        user["status"] = False
+                        save_user(uid, user)
+                        logging.error(f"❌ خطا در بروزرسانی کاربر {uid}")
+
+            await safe_edit(event,
                 "✅ **همه کاربران با موفقیت بروزرسانی شدند!**",
                 buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
             )
             return
-    
+
     # ====== منوی کاربر ======
     if data == b"send_ready_session":
         user_data[user_id]["step"] = "get_session"
-        await event.edit(
+        await safe_edit(event,
             "✍️ **ارسال سشن آماده**\n\n"
             "لطفاً کد نشست (Session String) خود را که از Telethon دریافت کرده‌اید، ارسال کنید:"
         )
         return
-    
+
     if data == b"start_gen_fast":
         generator_data[user_id] = {
             "step": "get_phone",
@@ -778,188 +970,233 @@ async def callback_handler(event):
             "phone_code_hash": None,
             "code_buffer": ""
         }
-        await event.edit(
+        await safe_edit(event,
             "📞 **مرحله اول: وارد کردن شماره**\n\n"
             "لطفاً شماره تلفن خود را به همراه کد کشور وارد کنید.\n"
             "مثال: `+989123456789`"
         )
         return
-    
+
     if user_id in generator_data and generator_data[user_id]["step"] == "get_code":
         generator = generator_data[user_id]
-        
+
         if data.startswith(b"k_"):
             action = data.decode().split("_")[1]
-            
+
             if action.isdigit():
                 if len(generator["code_buffer"]) < 5:
                     generator["code_buffer"] += action
-                
-                await event.edit(
+
+                await safe_edit(event,
                     "📩 **مرحله دوم: وارد کردن کد تایید**\n\n"
                     "کد ۵ رقمی ارسال شده به تلگرام خود را وارد کنید:",
                     buttons=get_code_keyboard(generator["code_buffer"])
                 )
-                
+
             elif action == "clear":
                 generator["code_buffer"] = ""
-                await event.edit(
+                await safe_edit(event,
                     "📩 **مرحله دوم: وارد کردن کد تایید**\n\n"
                     "کد ۵ رقمی ارسال شده به تلگرام خود را وارد کنید:",
                     buttons=get_code_keyboard(generator["code_buffer"])
                 )
-                
+
             elif action == "submit":
                 if len(generator["code_buffer"]) < 5:
                     await event.answer("⚠️ لطفاً کد ۵ رقمی را کامل وارد کنید!", alert=True)
                     return
-                
-                await event.edit("⏳ در حال بررسی کد و ورود به حساب...")
+
+                await safe_edit(event, "⏳ در حال بررسی کد و ورود به حساب...")
                 await process_code_signin(event, user_id, generator["code_buffer"])
-            
+
             return
-    
+
     if user_id not in user_data:
         return
-    
+
     user = user_data[user_id]
-    
+
     if data == b"back_to_main":
-        await event.edit(
+        await safe_edit(event,
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
         return
-    
+
     if data == b"menu_time":
-        await event.edit(
+        await safe_edit(event,
             "⌚ **تنظیمات ساعت**\n\n"
             "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
             buttons=get_time_menu_keyboard(user)
         )
         return
-    
+
     if data == b"menu_fonts":
-        await event.edit(
+        await safe_edit(event,
             "🔤 **انتخاب فونت ساعت**\n\n"
             "لطفاً یکی از فونت‌های زیر را برای نمایش ساعت انتخاب کنید:",
             buttons=get_fonts_menu_keyboard(user["font_id"])
         )
         return
-    
+
     if data == b"menu_actions":
-        await event.edit(
+        await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             "با انتخاب هر گزینه، وضعیت شما به‌صورت مداوم برای دیگران نمایش داده می‌شود:",
             buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
-    
+
+    if data == b"menu_date":
+        await safe_edit(event,
+            "📅 **تنظیمات تاریخ**\n\n"
+            "در این بخش می‌توانید نمایش تاریخ در بیو را مدیریت کنید:",
+            buttons=get_date_menu_keyboard(user)
+        )
+        return
+
+    if data == b"toggle_date_enabled":
+        user["date_enabled"] = not user.get("date_enabled", False)
+        save_user(user_id, user)
+        await safe_edit(event,
+            "📅 **تنظیمات تاریخ**\n\n"
+            "در این بخش می‌توانید نمایش تاریخ در بیو را مدیریت کنید:",
+            buttons=get_date_menu_keyboard(user)
+        )
+        return
+
+    if data.startswith(b"setdatetype_"):
+        date_type = data.decode().split("_", 1)[1]
+        if date_type in DATE_TYPE_NAMES:
+            user["date_type"] = date_type
+            save_user(user_id, user)
+        await safe_edit(event,
+            "📅 **تنظیمات تاریخ**\n\n"
+            f"✅ نوع تاریخ روی «{DATE_TYPE_NAMES.get(user.get('date_type'), '؟')}» تنظیم شد.",
+            buttons=get_date_menu_keyboard(user)
+        )
+        return
+
+    if data == b"menu_date_fonts":
+        await safe_edit(event,
+            "🔤 **انتخاب فونت تاریخ**\n\n"
+            "لطفاً یکی از فونت‌های زیر را برای نمایش تاریخ انتخاب کنید:",
+            buttons=get_date_fonts_menu_keyboard(user.get("date_font", 1))
+        )
+        return
+
+    if data.startswith(b"setdatefont_"):
+        font_id = int(data.decode().split("_")[1])
+        user["date_font"] = font_id
+        save_user(user_id, user)
+        await safe_edit(event,
+            "🔤 **انتخاب فونت تاریخ**\n\n"
+            f"✅ فونت «{FONT_NAMES[font_id]}» با موفقیت انتخاب شد.",
+            buttons=get_date_fonts_menu_keyboard(font_id)
+        )
+        return
+
+    if data == b"menu_textmode":
+        await safe_edit(event,
+            "🖊️ **حالت متن**\n\n"
+            "با انتخاب یکی از حالت‌های زیر، تمام پیام‌های متنی شما بلافاصله پس از ارسال "
+            "با همان قالب ویرایش می‌شوند. برای غیرفعال کردن، دوباره روی گزینه فعال بزنید.",
+            buttons=get_textmode_menu_keyboard(user.get("text_mode", 0))
+        )
+        return
+
+    if data.startswith(b"settextmode_"):
+        mode_id = int(data.decode().split("_")[1])
+        if user.get("text_mode") == mode_id:
+            user["text_mode"] = 0
+        else:
+            user["text_mode"] = mode_id
+        save_user(user_id, user)
+        await safe_edit(event,
+            "🖊️ **حالت متن**\n\n"
+            "✅ حالت متن با موفقیت بروزرسانی شد.",
+            buttons=get_textmode_menu_keyboard(user.get("text_mode", 0))
+        )
+        return
+
     if data.startswith(b"setfont_"):
         font_id = int(data.decode().split("_")[1])
         user["font_id"] = font_id
-        
-        save_user(user_id, user["session"], font_id, user["status"], 
-                 user["name_time"], user["bio_time"], user["active_action"])
-        
-        await event.edit(
+        save_user(user_id, user)
+
+        await safe_edit(event,
             "🔤 **انتخاب فونت ساعت**\n\n"
             f"✅ فونت «{FONT_NAMES[font_id]}» با موفقیت انتخاب شد.",
             buttons=get_fonts_menu_keyboard(font_id)
         )
         return
-    
+
     if data.startswith(b"setact_"):
         action_key = data.decode().split("_")[1]
-        
+
         if user["active_action"] == action_key:
             user["active_action"] = "none"
         else:
             user["active_action"] = action_key
-        
-        save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
-        
-        await event.edit(
+
+        save_user(user_id, user)
+
+        await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
             buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
-    
+
     if data == b"toggle_status":
         user["status"] = not user["status"]
-        save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
-        
+
         if user["status"]:
-            try:
-                client = TelegramClient(StringSession(user["session"]), API_ID, API_HASH)
-                await client.connect()
-                
-                if await client.is_user_authorized():
-                    active_clients[user_id] = client
-                    loop = asyncio.get_event_loop()
-                    user["task"] = loop.create_task(self_bot_worker(user_id, client))
-                    user["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-                else:
-                    user["status"] = False
-                    await event.answer("❌ نشست منقضی شده است!", alert=True)
-            except Exception as e:
+            client = await start_self_client(user_id, user["session"])
+            if not client:
                 user["status"] = False
-                await event.answer(f"❌ خطا در راه‌اندازی: {str(e)[:50]}", alert=True)
+                await event.answer("❌ نشست منقضی شده یا خطا در اتصال!", alert=True)
         else:
-            if user["task"]:
-                user["task"].cancel()
-            if user["action_task"]:
-                user["action_task"].cancel()
-            if user_id in active_clients:
-                del active_clients[user_id]
-        
-        await event.edit(
+            await stop_self_client(user_id)
+
+        save_user(user_id, user)
+
+        await safe_edit(event,
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
         return
-    
+
     if data == b"toggle_name_time":
         user["name_time"] = not user["name_time"]
-        save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
-        
-        await event.edit(
+        save_user(user_id, user)
+
+        await safe_edit(event,
             "⌚ **تنظیمات ساعت**\n\n"
             "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
             buttons=get_time_menu_keyboard(user)
         )
         return
-    
+
     if data == b"toggle_bio_time":
         user["bio_time"] = not user["bio_time"]
-        save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"])
-        
-        await event.edit(
+        save_user(user_id, user)
+
+        await safe_edit(event,
             "⌚ **تنظیمات ساعت**\n\n"
             "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
             buttons=get_time_menu_keyboard(user)
         )
         return
-    
+
     if data == b"delete_account":
-        if user["task"]:
-            user["task"].cancel()
-        if user["action_task"]:
-            user["action_task"].cancel()
-        if user_id in active_clients:
-            del active_clients[user_id]
-        
+        await stop_self_client(user_id)
         delete_user_db(user_id)
         del user_data[user_id]
-        
-        await event.edit(
+
+        await safe_edit(event,
             "🗑️ **اکانت با موفقیت حذف شد!**\n\n"
             "برای شروع مجدد، دستور /start را ارسال کنید."
         )
@@ -969,53 +1206,37 @@ async def callback_handler(event):
 async def process_code_signin(event, user_id, code):
     generator = generator_data[user_id]
     client = active_signins.get(user_id)
-    
+
     if not client:
         await event.respond("❌ نشست منقضی شده است. لطفاً مجدداً /start را بزنید.")
         del generator_data[user_id]
         return
-    
+
     try:
         await client.sign_in(generator["phone"], code, phone_code_hash=generator["phone_code_hash"])
         session_string = client.session.save()
-        
-        user_data[user_id] = {
-            "session": session_string,
-            "font_id": 1,
-            "status": True,
-            "name_time": True,
-            "bio_time": False,
-            "active_action": "none",
-            "task": None,
-            "action_task": None,
-            "step": "managed",
-            "joined_at": datetime.now()
-        }
-        
-        active_clients[user_id] = client
-        save_user(user_id, session_string, 1, True, True, False, "none")
-        
-        loop = asyncio.get_event_loop()
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-        
+
+        user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+        save_user(user_id, user_data[user_id])
+        register_active_client(user_id, client)
+
         await event.respond(
             "✅ **ورود با موفقیت انجام شد!**\n\n"
             "🔹 حساب شما به ربات متصل شد.\n"
             "🔹 اطلاعات در دیتابیس ابری ذخیره شد.\n"
             "🔹 سلف شما هم‌اکنون فعال است."
         )
-        
+
         del generator_data[user_id]
         if user_id in active_signins:
             del active_signins[user_id]
-        
+
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user_data[user_id])
         )
-        
+
     except SessionPasswordNeededError:
         generator["step"] = "get_password"
         await event.respond(
@@ -1038,7 +1259,7 @@ async def process_code_signin(event, user_id, code):
 async def message_handler(event):
     user_id = event.sender_id
     text = event.text.strip() if event.text else ""
-    
+
     # لغو عملیات
     if text == "/cancel" and user_id in broadcast_data:
         del broadcast_data[user_id]
@@ -1046,11 +1267,11 @@ async def message_handler(event):
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
         return
-    
+
     # ====== پردازش پیام همگانی ======
     if user_id in broadcast_data and is_admin(user_id):
         broadcast = broadcast_data[user_id]
-        
+
         if broadcast.get("type") == "search" and broadcast.get("step") == "get_user_id":
             try:
                 target_id = int(text)
@@ -1065,11 +1286,11 @@ async def message_handler(event):
             except ValueError:
                 await event.respond("❌ شناسه معتبر نیست. لطفاً یک عدد وارد کنید.")
             return
-        
+
         if broadcast.get("step") == "get_message":
             broadcast["message"] = text
             broadcast["step"] = "confirm"
-            
+
             if broadcast["type"] == "single":
                 target_id = broadcast["target_id"]
                 await event.respond(
@@ -1096,25 +1317,25 @@ async def message_handler(event):
                     ]
                 )
             return
-    
+
     # ====== پردازش ساخت خودکار حساب ======
     if user_id in generator_data:
         generator = generator_data[user_id]
-        
+
         if generator["step"] == "get_phone":
             generator["phone"] = text
-            
+
             await event.respond("⏳ در حال اتصال به سرورهای تلگرام...")
-            
+
             try:
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
                 await client.connect()
-                
+
                 send_code_result = await client.send_code_request(generator["phone"])
                 active_signins[user_id] = client
                 generator["phone_code_hash"] = send_code_result.phone_code_hash
                 generator["step"] = "get_code"
-                
+
                 await event.respond(
                     "📩 **کد تایید ارسال شد!**\n\n"
                     "یک کد ۵ رقمی به تلگرام شما ارسال شده است.\n"
@@ -1129,50 +1350,34 @@ async def message_handler(event):
                 if user_id in active_signins:
                     del active_signins[user_id]
                 del generator_data[user_id]
-            
+
             return
-        
+
         if generator["step"] == "get_password":
             client = active_signins.get(user_id)
-            
+
             if not client:
                 await event.respond("❌ نشست منقضی شده است. لطفاً مجدداً /start را بزنید.")
                 del generator_data[user_id]
                 return
-            
+
             try:
                 await client.sign_in(password=text)
                 session_string = client.session.save()
-                
-                user_data[user_id] = {
-                    "session": session_string,
-                    "font_id": 1,
-                    "status": True,
-                    "name_time": True,
-                    "bio_time": False,
-                    "active_action": "none",
-                    "task": None,
-                    "action_task": None,
-                    "step": "managed",
-                    "joined_at": datetime.now()
-                }
-                
-                active_clients[user_id] = client
-                save_user(user_id, session_string, 1, True, True, False, "none")
-                
-                loop = asyncio.get_event_loop()
-                user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-                user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-                
+
+                user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+                save_user(user_id, user_data[user_id])
+                register_active_client(user_id, client)
+
                 await event.respond(
                     "✅ **ورود با رمز دو مرحله‌ای موفقیت‌آمیز بود!**\n\n"
                     "حساب شما با موفقیت به ربات متصل شد."
                 )
-                
+
                 del generator_data[user_id]
                 if user_id in active_signins:
                     del active_signins[user_id]
-                
+
                 await event.respond(
                     "🔗 **پنل مدیریت NovaSelf**\n"
                     "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
@@ -1183,17 +1388,17 @@ async def message_handler(event):
                     f"❌ **رمز دو مرحله‌ای اشتباه است:**\n\n`{str(e)}`\n\n"
                     "لطفاً مجدداً رمز صحیح را وارد کنید:"
                 )
-            
+
             return
-    
+
     # ====== دریافت سشن آماده ======
     if user_id in user_data and user_data[user_id].get("step") == "get_session":
         clean_session = text.replace("\n", "").replace("\r", "").replace(" ", "")
-        
+
         try:
             client = TelegramClient(StringSession(clean_session), API_ID, API_HASH)
             await client.connect()
-            
+
             if not await client.is_user_authorized():
                 await event.respond(
                     "❌ **سشن نامعتبر است!**\n\n"
@@ -1208,32 +1413,16 @@ async def message_handler(event):
                 "مطمئن شوید که سشن Telethon معتبر ارسال کرده‌اید."
             )
             return
-        
-        user_data[user_id] = {
-            "session": clean_session,
-            "font_id": 1,
-            "status": True,
-            "name_time": True,
-            "bio_time": False,
-            "active_action": "none",
-            "task": None,
-            "action_task": None,
-            "step": "managed",
-            "joined_at": datetime.now()
-        }
-        
-        active_clients[user_id] = client
-        save_user(user_id, clean_session, 1, True, True, False, "none")
-        
-        loop = asyncio.get_event_loop()
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-        
+
+        user_data[user_id] = make_default_user(session=clean_session, status=True, step="managed")
+        save_user(user_id, user_data[user_id])
+        register_active_client(user_id, client)
+
         await event.respond(
             "✅ **سشن با موفقیت ثبت شد!**\n\n"
             "سلف شما هم‌اکنون فعال است و اطلاعات در دیتابیس ابری ذخیره شد."
         )
-        
+
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
@@ -1245,41 +1434,41 @@ async def message_handler(event):
 async def broadcast_callback_handler(event):
     user_id = event.sender_id
     data = event.data
-    
+
     if not is_admin(user_id):
         await event.answer("❌ شما دسترسی ادمین ندارید!", alert=True)
         return
-    
+
     if user_id not in broadcast_data:
         await event.answer("❌ عملیات فعالی وجود ندارد!", alert=True)
         return
-    
+
     broadcast = broadcast_data[user_id]
-    
+
     if data == b"broadcast_confirm":
-        await event.edit("⏳ در حال ارسال پیام...")
-        
+        await safe_edit(event, "⏳ در حال ارسال پیام...")
+
         message = broadcast["message"]
-        
+
         if broadcast["type"] == "single":
             target_id = broadcast["target_id"]
             try:
                 await bot.send_message(target_id, message)
-                await event.edit(
+                await safe_edit(event,
                     f"✅ **پیام با موفقیت به کاربر {target_id} ارسال شد!**",
                     buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
                 )
             except Exception as e:
-                await event.edit(
+                await safe_edit(event,
                     f"❌ **خطا در ارسال پیام:**\n\n`{str(e)}`",
                     buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
                 )
-        
+
         else:
             total_users = len(user_data)
             success_count = 0
             fail_count = 0
-            
+
             for uid in user_data.keys():
                 try:
                     await bot.send_message(uid, message)
@@ -1288,21 +1477,21 @@ async def broadcast_callback_handler(event):
                 except Exception as e:
                     fail_count += 1
                     logging.error(f"❌ خطا در ارسال به {uid}: {e}")
-            
-            await event.edit(
+
+            await safe_edit(event,
                 f"✅ **ارسال پیام همگانی کامل شد!**\n\n"
                 f"📨 تعداد کل: {total_users}\n"
                 f"✅ موفق: {success_count}\n"
                 f"❌ ناموفق: {fail_count}",
                 buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
             )
-        
+
         del broadcast_data[user_id]
         return
-    
+
     elif data == b"broadcast_cancel":
         del broadcast_data[user_id]
-        await event.edit(
+        await safe_edit(event,
             "❌ **ارسال پیام لغو شد.**",
             buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
         )
@@ -1311,15 +1500,16 @@ async def broadcast_callback_handler(event):
 # ======================== اجرای اصلی ========================
 if __name__ == "__main__":
     logging.info("🚀 راه‌اندازی ربات NovaSelf...")
-    
+
     init_db()
     user_data = get_all_users()
     logging.info(f"📊 تعداد کاربران بارگذاری شده: {len(user_data)}")
-    
+
     loop = asyncio.get_event_loop()
     loop.create_task(autostart_saved_users())
-    
+
     logging.info("✅ ربات با موفقیت راه‌اندازی شد!")
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
-    
+
     bot.run_until_disconnected()
+
