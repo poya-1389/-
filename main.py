@@ -7,7 +7,7 @@ from datetime import datetime
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.functions.account import UpdateProfileRequest, UpdateProfileRequest as UpdateBioRequest # جهت بیوگرافی
+from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
@@ -34,7 +34,6 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # ساخت جدول جدید با تمام ویژگی‌های درخواستی شما برای ذخیره ماندگار
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS novaself_users (
             user_id BIGINT PRIMARY KEY,
@@ -66,7 +65,7 @@ def get_all_users():
             "status": bool(row['status']),
             "name_time": bool(row['name_time']),
             "bio_time": bool(row['bio_time']),
-            "active_action": row['active_action'], # ذخیره نام اکشن فعال یا 'none'
+            "active_action": row['active_action'],
             "step": "managed",
             "task": None,
             "action_task": None
@@ -133,7 +132,7 @@ def apply_font(t_str, font_id):
     f_dict = FONTS.get(font_id, FONTS[0])
     return "".join(f_dict.get(c, c) for c in t_str)
 
-# وورکر فرستادن وضعیت‌های فیک اکشن به صورت مداوم
+# اصلاح متد و هدف ارسال اکشن فیک به مخاطبان و چت‌های اخیر
 async def self_bot_action_worker(user_id, client):
     try:
         while True:
@@ -145,8 +144,13 @@ async def self_bot_action_worker(user_id, client):
                 await asyncio.sleep(4)
                 continue
             
-            # ارسال سیگنال اکشن به یک چت فیک یا کلی (خود کاربر)
-            await client(SetTypingActionRequest(peer='me', action=ACTIONS[act][1]))
+            try:
+                # گرفتن آخرین گفت‌وگوها برای اعمال وضعیت روی آن‌ها تا بقیه واقعاً ببینند
+                async for dialog in client.iter_dialogs(limit=10):
+                    if dialog.is_user or dialog.is_group:
+                        await client(SetTypingRequest(peer=dialog.input_entity, action=ACTIONS[act][1]))
+            except Exception:
+                pass
             await asyncio.sleep(4)
     except Exception:
         pass
@@ -156,8 +160,6 @@ async def self_bot_worker(user_id, client):
     try:
         me = await client.get_me()
         f_name = me.first_name or "User"
-        # گرفتن بیوگرافی اولیه جهت آپدیت تایم روی آن
-        full_user = await client.get_me()
         base_bio = "NovaSelf Bot"
         
         while True:
@@ -170,13 +172,11 @@ async def self_bot_worker(user_id, client):
             if curr_time != last_time:
                 f_time = apply_font(curr_time, ud["font_id"])
                 
-                # تنظیم ساعت روی نام
                 if ud["name_time"]:
                     await client(UpdateProfileRequest(first_name=f_name, last_name=f_time))
                 else:
                     await client(UpdateProfileRequest(first_name=f_name, last_name=""))
                 
-                # تنظیم ساعت روی بیو
                 if ud["bio_time"]:
                     await client(UpdateProfileRequest(about=f"{base_bio} | {f_time}"))
                 
@@ -220,16 +220,15 @@ def get_keyboard_layout(current_code=""):
     ]
     return btns
 
-# ساخت کیبورد منوی اصلی
+# اسم دکمه‌ها خلاصه و به «ساعت» و «اکشن» تغییر پیدا کرد
 def get_main_menu_keyboard(ud):
     st = "🟢 روشن" if ud["status"] else "🔴 خاموش"
     return [
         [Button.inline(f"وضعیت سلف: {st}", b"t_status")],
-        [Button.inline("⏰ تنظیمات ساعت پروفایل", b"menu_time"), Button.inline("🎭 اکشن‌های فیک", b"menu_actions")],
+        [Button.inline("ساعت", b"menu_time"), Button.inline("اکشن", b"menu_actions")],
         [Button.inline("❌ حذف اکانت", b"del")]
     ]
 
-# ساخت کیبورد منوی ساعت پروفایل
 def get_time_menu_keyboard(ud):
     nt = "✅ ساعت نام" if ud["name_time"] else "❌ ساعت نام"
     bt = "✅ ساعت بیو" if ud["bio_time"] else "❌ ساعت بیو"
@@ -240,10 +239,8 @@ def get_time_menu_keyboard(ud):
         [Button.inline("🔙 بازگشت به منوی اصلی", b"back_to_main")]
     ]
 
-# ساخت کیبورد لیست فونت‌ها با تیک هوشمند
 def get_fonts_menu_keyboard(current_font_id):
     btns = []
-    # چیدمان دکمه‌ها به صورت دو تایی برای زیبایی منو
     row = []
     for f_id, f_name in FONT_NAMES.items():
         display_name = f"🔹 {f_name}"
@@ -258,7 +255,6 @@ def get_fonts_menu_keyboard(current_font_id):
     btns.append([Button.inline("🔙 بازگشت به تنظیمات ساعت", b"menu_time")])
     return btns
 
-# ساخت کیبورد اکشن‌ها با تیک هوشمند
 def get_actions_menu_keyboard(current_action):
     btns = []
     row = []
@@ -282,7 +278,6 @@ async def start_handler(event):
         return
 
     if user_id not in user_data:
-        # ساخت مقادیر پیش‌فرض درخواستی شما (ساعت نام فعال، ساعت بیو غیرفعال، فونت بولد=1)
         user_data[user_id] = {
             "session": None, "font_id": 1, "status": False, "name_time": True, 
             "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "menu"
@@ -342,7 +337,6 @@ async def callback_handler(event):
         
     ud = user_data[user_id]
         
-    # --- ناوبری منوها ---
     if data == b"back_to_main":
         await event.edit("🔗 پنل مدیریت نواسلف:", buttons=get_main_menu_keyboard(ud))
         return
@@ -359,7 +353,6 @@ async def callback_handler(event):
         await event.edit("🎭 **منوی اکشن‌های فیک**\nبا انتخاب هر مورد، وضعیت شما به طور مداوم برای دیگران نمایش داده می‌شود:", buttons=get_actions_menu_keyboard(ud["active_action"]))
         return
 
-    # --- تنظیمات اکشن‌ها و فونت‌ها از کال‌بک دکمه‌ها ---
     elif data.startswith(b"setfont_"):
         target_font = int(data.decode().split("_")[1])
         ud["font_id"] = target_font
@@ -369,7 +362,6 @@ async def callback_handler(event):
 
     elif data.startswith(b"setact_"):
         target_action = data.decode().split("_")[1]
-        # سوئیچ کردن وضعیت دکمه: اگر دوباره روش کلیک شد غیرفعال بشه
         if ud["active_action"] == target_action:
             ud["active_action"] = "none"
         else:
@@ -379,7 +371,6 @@ async def callback_handler(event):
         await event.edit("🎭 **منوی اکشن‌های فیک**\nبا انتخاب هر مورد، وضعیت شما به طور مداوم برای دیگران نمایش داده می‌شود:", buttons=get_actions_menu_keyboard(ud["active_action"]))
         return
 
-    # --- کنترل‌های وضعیت اصلی، نام و بیو ---
     elif data == b"t_status":
         ud["status"] = not ud["status"]
         save_user(user_id, ud["session"], ud["font_id"], ud["status"], ud["name_time"], ud["bio_time"], ud["active_action"])
@@ -434,7 +425,6 @@ async def process_code_signin(event, user_id, code):
         await client.sign_in(gd["phone"], code, phone_code_hash=gd["phone_code_hash"])
         session_string = client.session.save()
         
-        # ثبت اولیه با تنظیمات پیش‌فرض درخواستی شما
         user_data[user_id] = {
             "session": session_string, "font_id": 1, "status": True, "name_time": True,
             "bio_time": False, "active_action": "none", "task": None, "action_task": None, "step": "managed"
