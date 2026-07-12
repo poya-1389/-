@@ -89,9 +89,8 @@ ACTIONS = {
     'sticker': ('استیکر', SendMessageChooseStickerAction())
 }
 
-# ======================== حالت‌های متن ========================
+# ======================== حالت‌های متن (بدون گزینه غیرفعال) ========================
 TEXT_MODES = {
-    'none': ('غیرفعال', None),
     'bold': ('بولد', MessageEntityBold),
     'italic': ('ایتالیک', MessageEntityItalic),
     'underline': ('زیر خط', MessageEntityUnderline),
@@ -480,11 +479,11 @@ async def self_bot_worker(user_id, client):
                     user.get("calendar_type", 'jalali'),
                     user.get("date_font_id", 1)
                 )
-                bio_parts.append(f"📅 {date_str}")
+                bio_parts.append(date_str)
             
             if user["bio_time"]:
                 formatted_time = apply_font(current_time, user["font_id"])
-                bio_parts.append(f"🕐 {formatted_time}")
+                bio_parts.append(formatted_time)
             
             bio_text = " | ".join(bio_parts) if bio_parts else ""
             
@@ -686,7 +685,7 @@ async def callback_handler(event):
                 status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
                 font_name = FONT_NAMES.get(user["font_id"], "نامشخص")
                 action_name = ACTIONS.get(user["active_action"], ("هیچ",))[0] if user["active_action"] != "none" else "هیچ"
-                text_mode_name = TEXT_MODES.get(user.get("text_mode", "none"), ("غیرفعال", None))[0]
+                text_mode_name = TEXT_MODES.get(user.get("text_mode", "none"), ("غیرفعال", None))[0] if user.get("text_mode") != "none" else "غیرفعال"
                 date_status = "✅ فعال" if user.get("date_enabled", False) else "❌ غیرفعال"
                 calendar_name = CALENDAR_TYPES.get(user.get("calendar_type", "jalali"), "خورشیدی")
                 
@@ -935,11 +934,50 @@ async def callback_handler(event):
         return
     
     if data == b"menu_text_mode":
-        await event.edit(
-            "📝 **حالت متن**\n\n"
-            "با انتخاب هر گزینه، پیام‌های ارسالی شما به‌صورت خودکار به آن حالت تبدیل می‌شوند:",
-            buttons=get_text_mode_menu_keyboard(user.get("text_mode", "none"))
-        )
+        current_mode = user.get("text_mode", "none")
+        if current_mode == "none":
+            await event.edit(
+                "📝 **حالت متن**\n\n"
+                "هیچ حالتی فعال نیست. برای فعال‌سازی یکی از گزینه‌های زیر را انتخاب کنید:",
+                buttons=get_text_mode_menu_keyboard(None)
+            )
+        else:
+            await event.edit(
+                "📝 **حالت متن**\n\n"
+                f"حالت فعلی: {TEXT_MODES.get(current_mode, ('نامشخص', None))[0]}\n\n"
+                "برای تغییر یا غیرفعال‌سازی، روی گزینه مورد نظر کلیک کنید:",
+                buttons=get_text_mode_menu_keyboard(current_mode)
+            )
+        return
+    
+    if data.startswith(b"settext_"):
+        mode_key = data.decode().split("_")[1]
+        
+        # اگر همان حالت قبلی انتخاب شده، غیرفعال کن
+        if user.get("text_mode") == mode_key:
+            user["text_mode"] = "none"
+            status_text = "غیرفعال"
+        else:
+            user["text_mode"] = mode_key
+            status_text = TEXT_MODES.get(mode_key, ("نامشخص", None))[0]
+        
+        save_user(user_id, user["session"], user["font_id"], user["status"],
+                 user["name_time"], user["bio_time"], user["active_action"],
+                 user["text_mode"], user.get("date_enabled", False),
+                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
+        
+        if user["text_mode"] == "none":
+            await event.edit(
+                "📝 **حالت متن**\n\n"
+                "✅ حالت متن با موفقیت غیرفعال شد.",
+                buttons=get_text_mode_menu_keyboard(None)
+            )
+        else:
+            await event.edit(
+                "📝 **حالت متن**\n\n"
+                f"✅ حالت «{status_text}» با موفقیت فعال شد.",
+                buttons=get_text_mode_menu_keyboard(user["text_mode"])
+            )
         return
     
     if data == b"menu_date":
@@ -951,23 +989,6 @@ async def callback_handler(event):
         return
     
     # ====== تنظیمات ======
-    if data.startswith(b"settext_"):
-        mode_key = data.decode().split("_")[1]
-        user["text_mode"] = mode_key
-        
-        save_user(user_id, user["session"], user["font_id"], user["status"],
-                 user["name_time"], user["bio_time"], user["active_action"],
-                 mode_key, user.get("date_enabled", False),
-                 user.get("calendar_type", "jalali"), user.get("date_font_id", 1))
-        
-        mode_name = TEXT_MODES.get(mode_key, ("غیرفعال", None))[0]
-        await event.edit(
-            "📝 **حالت متن**\n\n"
-            f"✅ حالت «{mode_name}» با موفقیت فعال شد.",
-            buttons=get_text_mode_menu_keyboard(mode_key)
-        )
-        return
-    
     if data == b"toggle_date":
         user["date_enabled"] = not user.get("date_enabled", False)
         save_user(user_id, user["session"], user["font_id"], user["status"],
@@ -1295,6 +1316,7 @@ async def message_handler(event):
         
         if mode != "none" and mode in TEXT_MODES and text and not text.startswith('/'):
             try:
+                # ایجاد لیست موجودیت‌ها
                 entities = []
                 if mode == 'bold':
                     entities.append(MessageEntityBold(0, len(text)))
@@ -1313,15 +1335,23 @@ async def message_handler(event):
                 elif mode == 'blockquote':
                     entities.append(MessageEntityBlockquote(0, len(text)))
                 
+                # حذف پیام اصلی
                 await event.delete()
+                
+                # ارسال پیام با فرمت جدید - استفاده از parameter صحیح
                 await bot.send_message(
                     event.chat_id,
                     text,
-                    entities=entities,
+                    formatting_entities=entities,
                     reply_to=event.reply_to_msg_id
                 )
             except Exception as e:
                 logging.error(f"❌ خطا در اعمال حالت متن: {e}")
+                # اگر خطا بود، پیام رو دوباره بفرست
+                try:
+                    await bot.send_message(event.chat_id, text)
+                except:
+                    pass
     
     # ====== پردازش ساخت خودکار حساب ======
     if user_id in generator_data:
