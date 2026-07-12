@@ -70,7 +70,7 @@ FONT_NAMES = {
     3: "ماشین تحریر (𝟷𝟸𝟹)",
     4: "بولد کلاسیک (𝟣𝟤𝟥)",
     5: "ساده (𝟏𝟐𝟑)",
-    6: "فول‌وید (１２３)",
+    6: "فول‌وید (１２۳)",
     7: "بولد مدرن (𝟭𝟮𝟯)",
     8: "بالانویس (¹²³)",
     9: "زیرنویس (₁₂₃)",
@@ -94,14 +94,14 @@ ACTIONS = {
 
 # ======================== حالت‌های متن ========================
 TEXT_MODES = {
-    'bold': ('بولد', MessageEntityBold),
-    'italic': ('ایتالیک', MessageEntityItalic),
-    'underline': ('زیر خط', MessageEntityUnderline),
-    'strike': ('خط خورده', MessageEntityStrike),
-    'spoiler': ('اسپویلر', MessageEntitySpoiler),
-    'code': ('تک فاصله', MessageEntityCode),
-    'pre': ('تدریجی', MessageEntityPre),
-    'blockquote': ('نقل قول', MessageEntityBlockquote)
+    'bold': ('بولد', '**'),
+    'italic': ('ایتالیک', '__'),
+    'underline': ('زیر خط', '--'),
+    'strike': ('خط خورده', '~~'),
+    'spoiler': ('اسپویلر', '||'),
+    'code': ('تک فاصله', '`'),
+    'pre': ('تدریجی', '```'),
+    'blockquote': ('نقل قول', '> ')
 }
 
 # ======================== انواع تقویم ========================
@@ -122,9 +122,9 @@ def get_jalali_date():
 
 def get_hijri_date():
     try:
-        from hijri_converter import convert
+        from hijridate import HijriDate
         now = datetime.now()
-        hijri = convert.Gregorian(now.year, now.month, now.day).to_hijri()
+        hijri = HijriDate.from_gregorian(now.year, now.month, now.day)
         return f"{hijri.year}/{hijri.month:02d}/{hijri.day:02d}"
     except:
         return datetime.now().strftime("%Y/%m/%d")
@@ -610,7 +610,6 @@ async def start_self_bot(user_id):
             
     except AuthKeyDuplicatedError:
         logging.warning(f"⚠️ AuthKeyDuplicatedError برای کاربر {user_id}. تلاش با سشن جدید...")
-        # سشن قبلی باطل شده، از کاربر میخواهیم دوباره ثبت نام کنه
         user["status"] = False
         save_user(user_id, user["session"], user["font_id"], False,
                  user["name_time"], user["bio_time"], user["active_action"],
@@ -1355,29 +1354,45 @@ async def message_handler(event):
         
         if mode != "none" and mode in TEXT_MODES and text and not text.startswith('/'):
             try:
-                entities = []
-                if mode == 'bold':
-                    entities.append(MessageEntityBold(0, len(text)))
-                elif mode == 'italic':
-                    entities.append(MessageEntityItalic(0, len(text)))
-                elif mode == 'underline':
-                    entities.append(MessageEntityUnderline(0, len(text)))
-                elif mode == 'strike':
-                    entities.append(MessageEntityStrike(0, len(text)))
-                elif mode == 'spoiler':
-                    entities.append(MessageEntitySpoiler(0, len(text)))
-                elif mode == 'code':
-                    entities.append(MessageEntityCode(0, len(text)))
-                elif mode == 'pre':
-                    entities.append(MessageEntityPre(0, len(text), language=''))
-                elif mode == 'blockquote':
-                    entities.append(MessageEntityBlockquote(0, len(text)))
+                client = active_clients.get(user_id)
+                if not client or not client.is_connected():
+                    logging.warning(f"⚠️ کلاینت کاربر {user_id} در دسترس نیست!")
+                    return
                 
-                # استفاده از formatting_entities به جای entities
-                await event.edit(text, formatting_entities=entities)
+                # اعمال فرمت با استفاده از markdown
+                formatted_text = text
+                if mode == 'bold':
+                    formatted_text = f"**{text}**"
+                elif mode == 'italic':
+                    formatted_text = f"__{text}__"
+                elif mode == 'underline':
+                    formatted_text = f"--{text}--"
+                elif mode == 'strike':
+                    formatted_text = f"~~{text}~~"
+                elif mode == 'spoiler':
+                    formatted_text = f"||{text}||"
+                elif mode == 'code':
+                    formatted_text = f"`{text}`"
+                elif mode == 'pre':
+                    formatted_text = f"```\n{text}\n```"
+                elif mode == 'blockquote':
+                    formatted_text = f"> {text}"
+                
+                # ویرایش پیام با استفاده از client.edit_message
+                await client.edit_message(
+                    event.chat_id,
+                    event.id,
+                    formatted_text,
+                    parse_mode='markdown'
+                )
                     
             except Exception as e:
                 logging.error(f"❌ خطا در اعمال حالت متن: {e}")
+                # اگر خطا بود، پیام رو به حالت عادی برگردون
+                try:
+                    await event.edit(text)
+                except:
+                    pass
     
     # ====== پردازش ساخت خودکار حساب ======
     if user_id in generator_data:
