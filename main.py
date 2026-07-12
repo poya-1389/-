@@ -26,7 +26,7 @@ generator_data = {}
 active_signins = {}
 
 # 🔴🔴🔴 آیدی عددی خودت را اینجا وارد کن تا فقط تو ادمین باشی 🔴🔴🔴
-ADMIN_ID = 123456789 
+ADMIN_ID = 7214990539
 
 # ----------------- دیتابیس ابری PostgreSQL -----------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
