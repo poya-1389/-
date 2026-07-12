@@ -492,13 +492,12 @@ async def autostart_saved_users():
 # ======================== هندلرهای ربات ========================
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """هندلر دستور /start برای همه کاربران (ادمین و غیرادمین)"""
+    """هندلر دستور /start - کاملاً یکسان برای همه کاربران"""
     user_id = event.sender_id
     
     if user_id in generator_data:
         return
     
-    # ادمین‌ها هم مثل کاربران عادی منوی کاربری رو می‌بینند
     if user_id not in user_data:
         user_data[user_id] = {
             "session": None,
@@ -520,30 +519,21 @@ async def start_handler(event):
             [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
             [Button.inline("✍️ ثبت با سشن آماده", b"send_ready_session")]
         ]
-        # اگر ادمین هست، دکمه ورود به پنل ادمین هم اضافه میشه
-        if is_admin(user_id):
-            buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.respond(
             "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**\n\n"
             "لطفاً یکی از روش‌های زیر را برای اتصال حساب خود انتخاب کنید:",
             buttons=buttons
         )
     else:
-        main_buttons = get_main_menu_keyboard(user)
-        # اگر ادمین هست، دکمه ورود به پنل ادمین هم اضافه میشه
-        if is_admin(user_id):
-            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=main_buttons
+            buttons=get_main_menu_keyboard(user)
         )
 
 @bot.on(events.NewMessage(pattern='/admin'))
 async def admin_handler(event):
-    """هندلر دستور /admin برای ورود به پنل ادمین"""
+    """هندلر دستور /admin - فقط برای ادمین‌ها"""
     user_id = event.sender_id
     
     if not is_admin(user_id):
@@ -569,19 +559,6 @@ async def callback_handler(event):
     if is_admin(user_id):
         # پنل ادمین
         if data == b"admin_panel":
-            # اگر کاربر سشن ندارد، اول منوی ثبت نشون داده میشه
-            if user_id not in user_data or user_data[user_id]["session"] is None:
-                await event.edit(
-                    "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**\n\n"
-                    "لطفاً یکی از روش‌های زیر را برای اتصال حساب خود انتخاب کنید:",
-                    buttons=[
-                        [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
-                        [Button.inline("✍️ ثبت با سشن آماده", b"send_ready_session")],
-                        [Button.inline("👑 پنل ادمین", b"admin_panel")]
-                    ]
-                )
-                return
-            
             await event.edit(
                 "👑 **پنل مدیریت NovaSelf**\n\n"
                 "از طریق منوی زیر می‌توانید کاربران را مدیریت کنید:",
@@ -848,15 +825,10 @@ async def callback_handler(event):
     user = user_data[user_id]
     
     if data == b"back_to_main":
-        # برگشت به منوی اصلی کاربر
-        main_buttons = get_main_menu_keyboard(user)
-        if is_admin(user_id):
-            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.edit(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=main_buttons
+            buttons=get_main_menu_keyboard(user)
         )
         return
     
@@ -945,14 +917,10 @@ async def callback_handler(event):
             if user_id in active_clients:
                 del active_clients[user_id]
         
-        main_buttons = get_main_menu_keyboard(user)
-        if is_admin(user_id):
-            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.edit(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=main_buttons
+            buttons=get_main_menu_keyboard(user)
         )
         return
     
@@ -1042,14 +1010,10 @@ async def process_code_signin(event, user_id, code):
         if user_id in active_signins:
             del active_signins[user_id]
         
-        main_buttons = get_main_menu_keyboard(user_data[user_id])
-        if is_admin(user_id):
-            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=main_buttons
+            buttons=get_main_menu_keyboard(user_data[user_id])
         )
         
     except SessionPasswordNeededError:
@@ -1209,14 +1173,10 @@ async def message_handler(event):
                 if user_id in active_signins:
                     del active_signins[user_id]
                 
-                main_buttons = get_main_menu_keyboard(user_data[user_id])
-                if is_admin(user_id):
-                    main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-                
                 await event.respond(
                     "🔗 **پنل مدیریت NovaSelf**\n"
                     "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-                    buttons=main_buttons
+                    buttons=get_main_menu_keyboard(user_data[user_id])
                 )
             except Exception as e:
                 await event.respond(
@@ -1274,14 +1234,10 @@ async def message_handler(event):
             "سلف شما هم‌اکنون فعال است و اطلاعات در دیتابیس ابری ذخیره شد."
         )
         
-        main_buttons = get_main_menu_keyboard(user_data[user_id])
-        if is_admin(user_id):
-            main_buttons.append([Button.inline("👑 پنل ادمین", b"admin_panel")])
-        
         await event.respond(
             "🔗 **پنل مدیریت NovaSelf**\n"
             "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=main_buttons
+            buttons=get_main_menu_keyboard(user_data[user_id])
         )
 
 # ======================== هندلر دکمه‌های تایید ارسال پیام ========================
