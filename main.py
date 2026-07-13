@@ -8,16 +8,18 @@ from psycopg2.extras import DictCursor
 from datetime import datetime
 from telethon import TelegramClient, events, Button, helpers
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError, MessageNotModifiedError
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError, MessageNotModifiedError, RPCError
+)
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.messages import SetTypingRequest
+from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
     SendMessageGamePlayAction, SendMessageChooseStickerAction,
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
-    MessageEntityBlockquote
+    MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName
 )
 import logging
 
@@ -43,6 +45,11 @@ generator_data = {}
 active_signins = {}
 user_data = {}
 broadcast_data = {}
+secretary_state = {}   # {user_id: {peer_id: {"replied": bool, "task": Task}}}
+_auto_sent_marks = set()  # {(user_id, chat_id, message_id)} پیام‌هایی که خودمان خودکار فرستادیم (نباید توسط حالت متن ادیت شوند)
+
+TAG_ADMIN_TRIGGERS = {".تگ_ادمین", ".تگادمین", ".tagadmins"}
+TAG_MEMBERS_TRIGGERS = {".تگ_اعضا", ".تگاعضا", ".tagall"}
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -138,6 +145,9 @@ def init_db():
             ("date_type", "TEXT DEFAULT 'shamsi'"),
             ("date_font", "INTEGER DEFAULT 1"),
             ("text_mode", "INTEGER DEFAULT 0"),
+            ("secretary_enabled", "INTEGER DEFAULT 0"),
+            ("secretary_text", "TEXT DEFAULT 'مشغولم، بعداً پاسخ می‌دهم ✅'"),
+            ("secretary_delay", "INTEGER DEFAULT 60"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -160,7 +170,8 @@ def get_all_users():
 
         cursor.execute("""
             SELECT user_id, session, font_id, status, name_time, bio_time, active_action,
-                   joined_at, date_enabled, date_type, date_font, text_mode
+                   joined_at, date_enabled, date_type, date_font, text_mode,
+                   secretary_enabled, secretary_text, secretary_delay
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -183,6 +194,9 @@ def get_all_users():
                 "date_type": row['date_type'] or "shamsi",
                 "date_font": row['date_font'] if row['date_font'] is not None else 1,
                 "text_mode": row['text_mode'] if row['text_mode'] is not None else 0,
+                "secretary_enabled": bool(row['secretary_enabled']) if row['secretary_enabled'] is not None else False,
+                "secretary_text": row['secretary_text'] or "مشغولم، بعداً پاسخ می‌دهم ✅",
+                "secretary_delay": row['secretary_delay'] if row['secretary_delay'] is not None else 60,
                 "joined_at": row['joined_at'] or datetime.now(),
                 "step": "managed",
                 "task": None,
@@ -201,8 +215,9 @@ def save_user(user_id, user):
         cursor.execute('''
             INSERT INTO novaself_users
                 (user_id, session, font_id, status, name_time, bio_time, active_action,
-                 date_enabled, date_type, date_font, text_mode)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 date_enabled, date_type, date_font, text_mode,
+                 secretary_enabled, secretary_text, secretary_delay)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -214,13 +229,18 @@ def save_user(user_id, user):
                 date_enabled = EXCLUDED.date_enabled,
                 date_type = EXCLUDED.date_type,
                 date_font = EXCLUDED.date_font,
-                text_mode = EXCLUDED.text_mode
+                text_mode = EXCLUDED.text_mode,
+                secretary_enabled = EXCLUDED.secretary_enabled,
+                secretary_text = EXCLUDED.secretary_text,
+                secretary_delay = EXCLUDED.secretary_delay
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
             user.get("active_action", "none"),
             int(user.get("date_enabled", False)), user.get("date_type", "shamsi"),
-            user.get("date_font", 1), user.get("text_mode", 0)
+            user.get("date_font", 1), user.get("text_mode", 0),
+            int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
+            user.get("secretary_delay", 60)
         ))
         conn.commit()
         cursor.close()
@@ -278,6 +298,9 @@ def make_default_user(session=None, status=False, step="menu"):
         "date_type": "shamsi",
         "date_font": 1,
         "text_mode": 0,
+        "secretary_enabled": False,
+        "secretary_text": "مشغولم، بعداً پاسخ می‌دهم ✅",
+        "secretary_delay": 60,
         "task": None,
         "action_task": None,
         "step": step,
@@ -336,20 +359,25 @@ def build_format_entities(text, mode):
     return None
 
 async def safe_edit(event, text, buttons=None):
-    """جلوگیری از کرش شدن هندلرها به‌خاطر خطای ویرایش پیام (مثل MessageNotModified)."""
+    """
+    ویرایش امن پیام + پاسخ فوری به Callback (برای جلوگیری از تأخیر/اسپینر روی دکمه‌ها).
+    جلوگیری از کرش شدن هندلرها به‌خاطر خطای ویرایش پیام (مثل MessageNotModified).
+    """
     try:
         await event.edit(text, buttons=buttons)
     except MessageNotModifiedError:
-        try:
-            await event.answer()
-        except Exception:
-            pass
+        pass
     except Exception as e:
         logging.error(f"⚠️ خطا در ویرایش پیام: {e}")
         try:
             await event.answer("❌ خطا در بروزرسانی پیام، دوباره تلاش کنید.", alert=True)
+            return
         except Exception:
             pass
+    try:
+        await event.answer()
+    except Exception:
+        pass
 
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
@@ -361,7 +389,11 @@ def get_main_menu_keyboard(user):
             Button.inline("🎭 اکشن", b"menu_actions"),
             Button.inline("⌚ ساعت", b"menu_time"),
         ],
-        [Button.inline("🖊️ حالت متن", b"menu_textmode")],
+        [
+            Button.inline("🖊️ حالت متن", b"menu_textmode"),
+            Button.inline("🏷️ تگ", b"menu_tag"),
+        ],
+        [Button.inline("🧑‍💼 منشی", b"menu_secretary")],
         [Button.inline("🗑️ حذف اکانت", b"delete_account")]
     ]
 
@@ -382,7 +414,7 @@ def get_fonts_menu_keyboard(current_font_id):
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        display = f"✅ {font_name}" if font_id == current_font_id else f"🔹 {font_name}"
+        display = f"✅ {font_name}" if font_id == current_font_id else f"▫️ {font_name}"
         row.append(Button.inline(display, f"setfont_{font_id}".encode()))
 
         if len(row) == 2:
@@ -420,7 +452,7 @@ def get_date_menu_keyboard(user):
 
     type_row = []
     for type_key, type_name in DATE_TYPE_NAMES.items():
-        display = f"✅ {type_name}" if type_key == current_type else f"🔹 {type_name}"
+        display = f"✅ {type_name}" if type_key == current_type else f"▫️ {type_name}"
         type_row.append(Button.inline(display, f"setdatetype_{type_key}".encode()))
 
     return [
@@ -435,7 +467,7 @@ def get_date_fonts_menu_keyboard(current_font_id):
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        display = f"✅ {font_name}" if font_id == current_font_id else f"🔹 {font_name}"
+        display = f"✅ {font_name}" if font_id == current_font_id else f"▫️ {font_name}"
         row.append(Button.inline(display, f"setdatefont_{font_id}".encode()))
 
         if len(row) == 2:
@@ -465,6 +497,47 @@ def get_textmode_menu_keyboard(current_mode):
 
     buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
     return buttons
+
+def get_tag_menu_text():
+    return (
+        "🏷️ **قابلیت تگ**\n\n"
+        "این قابلیت با ارسال یکی از دستورات زیر (توسط خودتان) داخل هر گروه فعال می‌شود:\n\n"
+        "▫️ `.تگ_ادمین` — منشن تمام ادمین‌های همان گروه.\n"
+        "▫️ `.تگ_اعضا` — منشن تمام اعضای همان گروه.\n\n"
+        "نکات:\n"
+        "▫️ فقط داخل گروه/سوپرگروه کار می‌کند و در چت خصوصی غیرفعال است.\n"
+        "▫️ اگر دستور را روی پیامی ریپلای کنید، خروجی هم روی همان پیام ریپلای می‌شود.\n"
+        "▫️ در گروه‌های بزرگ، پیام‌ها به چند بخش تقسیم می‌شوند تا محدودیت تلگرام رعایت شود."
+    )
+
+def get_tag_menu_keyboard():
+    return [[Button.inline("🔙 بازگشت", b"back_to_main")]]
+
+def get_secretary_menu_text(user):
+    status = "🟢 فعال" if user.get("secretary_enabled") else "🔴 غیرفعال"
+    delay = user.get("secretary_delay", 60)
+    text_preview = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
+    return (
+        "🧑‍💼 **منشی**\n\n"
+        f"وضعیت: {status}\n"
+        f"⏱️ تأخیر پاسخ: {delay} ثانیه\n"
+        f"📝 متن فعلی:\n{text_preview}\n\n"
+        "وقتی روشن باشد، به اولین پیام خصوصی هر شخص (که هنوز پاسخ منشی نگرفته) "
+        "بعد از تأخیر تعیین‌شده، این متن ارسال می‌شود؛ تا وقتی طرف پیام تازه‌ای ندهد، دوباره ارسال نمی‌شود."
+    )
+
+def get_secretary_menu_keyboard(user):
+    on = user.get("secretary_enabled", False)
+    delay = user.get("secretary_delay", 60)
+    return [
+        [
+            Button.inline("☑️ روشن" if on else "▫️ روشن", b"secretary_on"),
+            Button.inline("▫️ خاموش" if on else "☑️ خاموش", b"secretary_off"),
+        ],
+        [Button.inline("📝 تنظیم متن", b"secretary_set_text")],
+        [Button.inline(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time")],
+        [Button.inline("🔙 بازگشت", b"back_to_main")]
+    ]
 
 def get_code_keyboard(current_code=""):
     display = current_code if current_code else "خالی"
@@ -534,40 +607,233 @@ def get_user_detail_buttons(user_id):
         [Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
     ]
 
-# ======================== هندلر قالب‌بندی خودکار متن (حالت متن) ========================
-def make_text_mode_handler(user_id):
+# ======================== کمکی: پیام‌های خودکار (نباید توسط حالت متن دوباره ادیت شوند) ========================
+def _mark_auto_sent(user_id, chat_id, message_id):
+    _auto_sent_marks.add((user_id, chat_id, message_id))
+
+def _pop_auto_sent(user_id, chat_id, message_id):
+    key = (user_id, chat_id, message_id)
+    if key in _auto_sent_marks:
+        _auto_sent_marks.discard(key)
+        return True
+    return False
+
+# ======================== قابلیت تگ ========================
+async def _gather_chat_admins(event):
+    """دریافت لیست ادمین‌های چت؛ سازگار با سوپرگروه/کانال و گروه‌های قدیمی."""
+    admins = []
+    try:
+        chat = await event.get_chat()
+        async for u in event.client.iter_participants(chat, filter=ChannelParticipantsAdmins()):
+            if not u.bot and not u.deleted:
+                admins.append(u)
+        return admins
+    except Exception:
+        pass
+
+    try:
+        full = await event.client(GetFullChatRequest(event.chat_id))
+        admin_ids = {
+            p.user_id for p in full.full_chat.participants.participants
+            if p.__class__.__name__ in ("ChatParticipantAdmin", "ChatParticipantCreator")
+        }
+        for u in full.users:
+            if u.id in admin_ids and not u.bot and not u.deleted:
+                admins.append(u)
+    except Exception as e:
+        logging.error(f"⚠️ خطا در دریافت ادمین‌های چت: {e}")
+
+    return admins
+
+async def _send_mentions(event, users_list, header, user_id):
+    """ساخت و ارسال پیام‌های منشن‌دار به‌صورت تکه‌تکه (رعایت محدودیت تلگرام + مدیریت FloodWait)."""
+    if not users_list:
+        return
+
+    chunk_size = 25
+    reply_to = event.reply_to_msg_id if event.is_reply else None
+
+    for i in range(0, len(users_list), chunk_size):
+        chunk = users_list[i:i + chunk_size]
+        body = (header + "\n") if i == 0 else ""
+        entities = []
+        cursor = len(helpers.add_surrogate(body))
+
+        for u in chunk:
+            name = (u.first_name or "کاربر").strip() or "کاربر"
+            mention_text = name + " "
+            surrogated_piece = helpers.add_surrogate(mention_text)
+            try:
+                input_user = await event.client.get_input_entity(u)
+                entities.append(InputMessageEntityMentionName(
+                    offset=cursor, length=len(surrogated_piece.rstrip()), user_id=input_user
+                ))
+            except Exception:
+                pass
+            body += mention_text
+            cursor += len(surrogated_piece)
+
+        for attempt in range(3):
+            try:
+                sent = await event.client.send_message(
+                    event.chat_id, body, formatting_entities=entities,
+                    reply_to=reply_to if i == 0 else None
+                )
+                _mark_auto_sent(user_id, sent.chat_id, sent.id)
+                break
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+            except RPCError as e:
+                logging.error(f"⚠️ خطا در ارسال پیام تگ: {e}")
+                break
+            except Exception as e:
+                logging.error(f"⚠️ خطای غیرمنتظره در ارسال تگ: {e}")
+                break
+
+        await asyncio.sleep(1.5)
+
+async def handle_tag_admins(event, user_id):
+    try:
+        admins = await _gather_chat_admins(event)
+        if not admins:
+            await event.reply("❌ ادمینی برای منشن پیدا نشد یا دسترسی کافی برای دریافت لیست ادمین‌ها وجود ندارد.")
+            return
+        await _send_mentions(event, admins, "🔔 **تگ ادمین‌ها:**", user_id)
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        logging.error(f"⚠️ خطا در تگ ادمین (کاربر {user_id}): {e}")
+
+async def handle_tag_members(event, user_id):
+    try:
+        chat = await event.get_chat()
+        members = []
+        try:
+            async for u in event.client.iter_participants(chat, limit=1000):
+                if not u.bot and not u.deleted:
+                    members.append(u)
+        except (RPCError, Exception) as e:
+            logging.error(f"⚠️ خطا در دریافت اعضای گروه: {e}")
+            await event.reply("❌ دریافت لیست اعضا با خطا مواجه شد (ممکن است دسترسی کافی نباشد یا گروه محدودیت داشته باشد).")
+            return
+
+        if not members:
+            await event.reply("❌ عضوی برای منشن پیدا نشد.")
+            return
+
+        await _send_mentions(event, members, "🔔 **تگ اعضا:**", user_id)
+    except Exception as e:
+        logging.error(f"⚠️ خطا در تگ اعضا (کاربر {user_id}): {e}")
+
+# ======================== هندلر یکپارچه پیام‌های خروجی (حالت متن + دستورات تگ) ========================
+def make_outgoing_handler(user_id):
     async def handler(event):
         try:
+            if _pop_auto_sent(user_id, event.chat_id, event.id):
+                return
+
             user = user_data.get(user_id)
             if not user or not user.get("status"):
                 return
 
+            raw_text = event.raw_text
+            text_stripped = raw_text.strip() if raw_text else ""
+
+            # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
+            if text_stripped and not event.is_private:
+                lowered = text_stripped.lower()
+                if lowered in TAG_ADMIN_TRIGGERS:
+                    await handle_tag_admins(event, user_id)
+                    return
+                if lowered in TAG_MEMBERS_TRIGGERS:
+                    await handle_tag_members(event, user_id)
+                    return
+
+            # --- حالت متن ---
             mode = user.get("text_mode", 0)
-            if not mode:
+            if not mode or not text_stripped:
                 return
 
-            text = event.raw_text
-            if not text or not text.strip():
-                return
-
-            entities = build_format_entities(text, mode)
+            entities = build_format_entities(raw_text, mode)
             if not entities:
                 return
 
             await asyncio.sleep(0.2)
             await event.client.edit_message(
-                event.chat_id, event.id, text, formatting_entities=entities
+                event.chat_id, event.id, raw_text, formatting_entities=entities
             )
         except Exception as e:
-            logging.error(f"⚠️ خطا در قالب‌بندی خودکار متن کاربر {user_id}: {e}")
+            logging.error(f"⚠️ خطا در پردازش پیام خروجی کاربر {user_id}: {e}")
 
     return handler
+
+# ======================== قابلیت منشی (پاسخ‌گوی خودکار) ========================
+def make_secretary_incoming_handler(user_id):
+    async def handler(event):
+        try:
+            if not event.is_private:
+                return
+
+            user = user_data.get(user_id)
+            if not user or not user.get("status") or not user.get("secretary_enabled"):
+                return
+
+            peer_id = event.sender_id
+            if not peer_id:
+                return
+
+            state = secretary_state.setdefault(user_id, {})
+            peer_state = state.get(peer_id)
+
+            # اگر تسک تأخیریِ فعالی برای این نفر در جریان است، تسک تازه‌ای نساز (جلوگیری از Task اضافی)
+            if peer_state and peer_state.get("task") and not peer_state["task"].done() and not peer_state.get("replied"):
+                return
+
+            delay = max(1, int(user.get("secretary_delay", 60)))
+            reply_text = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
+
+            async def _delayed_reply():
+                try:
+                    await asyncio.sleep(delay)
+                    cur_user = user_data.get(user_id)
+                    if not cur_user or not cur_user.get("status") or not cur_user.get("secretary_enabled"):
+                        return
+                    client = active_clients.get(user_id)
+                    if not client:
+                        return
+                    sent = await client.send_message(peer_id, cur_user.get("secretary_text") or reply_text)
+                    _mark_auto_sent(user_id, sent.chat_id, sent.id)
+                    if user_id in secretary_state and peer_id in secretary_state[user_id]:
+                        secretary_state[user_id][peer_id]["replied"] = True
+                except asyncio.CancelledError:
+                    pass
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds)
+                except Exception as e:
+                    logging.error(f"⚠️ خطا در ارسال پیام منشی کاربر {user_id}: {e}")
+
+            task = asyncio.get_event_loop().create_task(_delayed_reply())
+            state[peer_id] = {"replied": False, "task": task}
+        except Exception as e:
+            logging.error(f"⚠️ خطای منشی کاربر {user_id}: {e}")
+
+    return handler
+
+def _cleanup_secretary_state(user_id):
+    """لغو تسک‌های در انتظار منشی و آزادسازی حافظه (جلوگیری از Memory Leak)."""
+    peer_states = secretary_state.pop(user_id, None)
+    if peer_states:
+        for st in peer_states.values():
+            t = st.get("task")
+            if t and not t.done():
+                t.cancel()
 
 # ======================== مدیریت چرخه حیات کلاینت سلف ========================
 def register_active_client(user_id, client):
     """ثبت کلاینتِ از قبل متصل و احراز‌هویت‌شده (بدون اتصال مجدد)."""
     active_clients[user_id] = client
-    client.add_event_handler(make_text_mode_handler(user_id), events.NewMessage(outgoing=True))
+    client.add_event_handler(make_outgoing_handler(user_id), events.NewMessage(outgoing=True))
+    client.add_event_handler(make_secretary_incoming_handler(user_id), events.NewMessage(incoming=True))
 
     loop = asyncio.get_event_loop()
     if user_id in user_data:
@@ -592,7 +858,7 @@ async def start_self_client(user_id, session_string):
     return client
 
 async def stop_self_client(user_id):
-    """توقف کامل و امن کلاینت سلف یک کاربر (تسک‌ها + قطع اتصال)."""
+    """توقف کامل و امن کلاینت سلف یک کاربر (تسک‌ها + قطع اتصال + پاکسازی وضعیت منشی)."""
     user = user_data.get(user_id)
     if user:
         if user.get("task"):
@@ -601,6 +867,8 @@ async def stop_self_client(user_id):
         if user.get("action_task"):
             user["action_task"].cancel()
             user["action_task"] = None
+
+    _cleanup_secretary_state(user_id)
 
     client = active_clients.pop(user_id, None)
     if client:
@@ -834,6 +1102,10 @@ async def callback_handler(event):
                     if user.get("date_enabled") else "❌ غیرفعال"
                 )
                 textmode_text = TEXTMODE_NAMES.get(user.get("text_mode", 0), "خاموش") if user.get("text_mode") else "خاموش"
+                secretary_text = (
+                    f"✅ فعال ({user.get('secretary_delay', 60)} ثانیه)"
+                    if user.get("secretary_enabled") else "❌ غیرفعال"
+                )
 
                 await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
@@ -844,6 +1116,7 @@ async def callback_handler(event):
                     f"⌚ نمایش در بیو: {'✅' if user['bio_time'] else '❌'}\n"
                     f"📅 تاریخ: {date_text}\n"
                     f"🖊️ حالت متن: {textmode_text}\n"
+                    f"🧑‍💼 منشی: {secretary_text}\n"
                     f"🎭 اکشن: {action_name}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
@@ -1202,6 +1475,45 @@ async def callback_handler(event):
         )
         return
 
+    if data == b"menu_tag":
+        await safe_edit(event, get_tag_menu_text(), buttons=get_tag_menu_keyboard())
+        return
+
+    if data == b"menu_secretary":
+        await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
+        return
+
+    if data == b"secretary_on":
+        user["secretary_enabled"] = True
+        save_user(user_id, user)
+        await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
+        return
+
+    if data == b"secretary_off":
+        user["secretary_enabled"] = False
+        save_user(user_id, user)
+        await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
+        return
+
+    if data == b"secretary_set_text":
+        user["step"] = "secretary_get_text"
+        await safe_edit(event,
+            "📝 متن موردنظر خود را ارسال کنید.\n\n"
+            "این متن جایگزین پیام پیش‌فرض منشی می‌شود."
+        )
+        return
+
+    if data == b"secretary_set_time":
+        user["step"] = "secretary_get_time"
+        await safe_edit(event,
+            "⏱️ لطفاً زمان تأخیر پاسخ منشی را بر حسب **ثانیه** ارسال کنید.\n\n"
+            "نمونه:\n"
+            "▫️ ۱ دقیقه = 60\n"
+            "▫️ ۵ دقیقه = 300\n"
+            "▫️ ۱۰ دقیقه = 600"
+        )
+        return
+
 # ======================== پردازش ورود با کد ========================
 async def process_code_signin(event, user_id, code):
     generator = generator_data[user_id]
@@ -1222,9 +1534,9 @@ async def process_code_signin(event, user_id, code):
 
         await event.respond(
             "✅ **ورود با موفقیت انجام شد!**\n\n"
-            "🔹 حساب شما به ربات متصل شد.\n"
-            "🔹 اطلاعات در دیتابیس ابری ذخیره شد.\n"
-            "🔹 سلف شما هم‌اکنون فعال است."
+            "▫️ حساب شما به ربات متصل شد.\n"
+            "▫️ اطلاعات در دیتابیس ابری ذخیره شد.\n"
+            "▫️ سلف شما هم‌اکنون فعال است."
         )
 
         del generator_data[user_id]
@@ -1392,6 +1704,41 @@ async def message_handler(event):
             return
 
     # ====== دریافت سشن آماده ======
+    # ====== تنظیم متن منشی ======
+    if user_id in user_data and user_data[user_id].get("step") == "secretary_get_text":
+        new_text = text if text else "مشغولم، بعداً پاسخ می‌دهم ✅"
+        user_data[user_id]["secretary_text"] = new_text
+        user_data[user_id]["step"] = "managed"
+        save_user(user_id, user_data[user_id])
+
+        await event.respond("✅ متن منشی با موفقیت ذخیره شد.")
+        await event.respond(
+            get_secretary_menu_text(user_data[user_id]),
+            buttons=get_secretary_menu_keyboard(user_data[user_id])
+        )
+        return
+
+    # ====== تنظیم تایم منشی ======
+    if user_id in user_data and user_data[user_id].get("step") == "secretary_get_time":
+        try:
+            seconds = int(text)
+            if seconds < 1 or seconds > 86400:
+                raise ValueError
+        except (ValueError, TypeError):
+            await event.respond("❌ لطفاً یک عدد معتبر (بین 1 تا 86400) بر حسب ثانیه ارسال کنید.")
+            return
+
+        user_data[user_id]["secretary_delay"] = seconds
+        user_data[user_id]["step"] = "managed"
+        save_user(user_id, user_data[user_id])
+
+        await event.respond(f"✅ زمان تأخیر منشی روی {seconds} ثانیه تنظیم شد.")
+        await event.respond(
+            get_secretary_menu_text(user_data[user_id]),
+            buttons=get_secretary_menu_keyboard(user_data[user_id])
+        )
+        return
+
     if user_id in user_data and user_data[user_id].get("step") == "get_session":
         clean_session = text.replace("\n", "").replace("\r", "").replace(" ", "")
 
@@ -1512,4 +1859,3 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
-
