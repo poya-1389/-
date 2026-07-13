@@ -5,7 +5,7 @@ import psycopg2
 import jdatetime
 from hijridate import Gregorian
 from psycopg2.extras import DictCursor
-from datetime import datetime
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events, Button, helpers
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -39,6 +39,12 @@ if not ADMIN_IDS:
 bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# ======================== تنظیمات سیستم الماس ========================
+DIAMOND_RATE_PER_HOUR = 5       # مصرف الماس به ازای هر ساعت روشن بودن سلف
+DIAMOND_PRICE_TOMAN = 20        # قیمت هر الماس به تومان
+BILLING_INTERVAL_SECONDS = 60   # فاصله زمانی محاسبه و کسر الماس
+SUPPORT_USERNAME = "@SayPouYa"
+
 # ======================== دیکشنری‌های عمومی ========================
 active_clients = {}
 generator_data = {}
@@ -47,6 +53,8 @@ user_data = {}
 broadcast_data = {}
 secretary_state = {}   # {user_id: {peer_id: {"replied": bool, "task": Task}}}
 _auto_sent_marks = set()  # {(user_id, chat_id, message_id)} پیام‌هایی که خودمان خودکار فرستادیم (نباید توسط حالت متن ادیت شوند)
+transfer_data = {}     # {user_id: {"target_id":..., "amount":...}} وضعیت موقت انتقال الماس
+admin_action_data = {} # {admin_id: {"type":..., "target_id":..., "step":...}} وضعیت موقت عملیات مدیریتی روی الماس/رفرال
 
 TAG_ADMIN_TRIGGERS = {".تگ_ادمین", ".تگادمین", ".tagadmins"}
 TAG_MEMBERS_TRIGGERS = {".تگ_اعضا", ".تگاعضا", ".tagall"}
@@ -148,6 +156,10 @@ def init_db():
             ("secretary_enabled", "INTEGER DEFAULT 0"),
             ("secretary_text", "TEXT DEFAULT 'مشغولم، بعداً پاسخ می‌دهم ✅'"),
             ("secretary_delay", "INTEGER DEFAULT 60"),
+            ("diamonds", "DOUBLE PRECISION DEFAULT 0"),
+            ("referral_count", "INTEGER DEFAULT 0"),
+            ("username", "TEXT"),
+            ("last_charge_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -156,6 +168,18 @@ def init_db():
             except Exception as e:
                 conn.rollback()
                 logging.error(f"❌ خطا در افزودن ستون {col_name}: {e}")
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_admin_logs (
+                id SERIAL PRIMARY KEY,
+                admin_id BIGINT,
+                target_id BIGINT,
+                action TEXT,
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
 
         logging.info("✅ دیتابیس با موفقیت راه‌اندازی/بروزرسانی شد.")
         cursor.close()
@@ -171,7 +195,8 @@ def get_all_users():
         cursor.execute("""
             SELECT user_id, session, font_id, status, name_time, bio_time, active_action,
                    joined_at, date_enabled, date_type, date_font, text_mode,
-                   secretary_enabled, secretary_text, secretary_delay
+                   secretary_enabled, secretary_text, secretary_delay,
+                   diamonds, referral_count, username, last_charge_at
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -197,10 +222,15 @@ def get_all_users():
                 "secretary_enabled": bool(row['secretary_enabled']) if row['secretary_enabled'] is not None else False,
                 "secretary_text": row['secretary_text'] or "مشغولم، بعداً پاسخ می‌دهم ✅",
                 "secretary_delay": row['secretary_delay'] if row['secretary_delay'] is not None else 60,
+                "diamonds": float(row['diamonds']) if row['diamonds'] is not None else 0.0,
+                "referral_count": row['referral_count'] if row['referral_count'] is not None else 0,
+                "username": row['username'],
+                "last_charge_at": row['last_charge_at'] or datetime.now(),
                 "joined_at": row['joined_at'] or datetime.now(),
                 "step": "managed",
                 "task": None,
-                "action_task": None
+                "action_task": None,
+                "billing_task": None
             }
         return data
     except Exception as e:
@@ -208,7 +238,13 @@ def get_all_users():
         return {}
 
 def save_user(user_id, user):
-    """ذخیره یکجای تمام تنظیمات کاربر (جلوگیری از باگ‌های ناشی از آرگومان‌های جداگانه)."""
+    """
+    ذخیره تنظیمات عمومی کاربر (نه فیلدهای اقتصادی).
+    diamonds / referral_count / last_charge_at عمداً اینجا آپدیت نمی‌شوند چون به‌صورت
+    اتمیک توسط charge_diamonds_db / transfer_diamonds_db / admin_adjust_diamonds مدیریت
+    می‌شوند؛ آپدیت آن‌ها از این تابع می‌تواند مقدار تازه‌ی دیتابیس را با مقدار قدیمیِ
+    حافظه بازنویسی کند و باعث ناسازگاری/از دست رفتن موجودی شود.
+    """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -216,8 +252,9 @@ def save_user(user_id, user):
             INSERT INTO novaself_users
                 (user_id, session, font_id, status, name_time, bio_time, active_action,
                  date_enabled, date_type, date_font, text_mode,
-                 secretary_enabled, secretary_text, secretary_delay)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 secretary_enabled, secretary_text, secretary_delay,
+                 diamonds, referral_count, username, last_charge_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -240,13 +277,29 @@ def save_user(user_id, user):
             int(user.get("date_enabled", False)), user.get("date_type", "shamsi"),
             user.get("date_font", 1), user.get("text_mode", 0),
             int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
-            user.get("secretary_delay", 60)
+            user.get("secretary_delay", 60),
+            user.get("diamonds", 0), user.get("referral_count", 0), user.get("username"),
+            user.get("last_charge_at", datetime.now())
         ))
         conn.commit()
         cursor.close()
         conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
+
+def update_username_db(user_id, username):
+    """بروزرسانی مستقل نام‌کاربری (بدون تداخل با فیلدهای اقتصادی)."""
+    if not username:
+        return
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_users SET username = %s WHERE user_id = %s", (username, user_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"❌ خطا در بروزرسانی نام‌کاربری {user_id}: {e}")
 
 def delete_user_db(user_id):
     try:
@@ -278,6 +331,243 @@ def get_user_stats():
         logging.error(f"❌ خطا در دریافت آمار: {e}")
         return 0, 0
 
+def log_admin_action(admin_id, target_id, action, details=""):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_admin_logs (admin_id, target_id, action, details) VALUES (%s, %s, %s, %s)",
+            (admin_id, target_id, action, details)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"❌ خطا در ثبت لاگ مدیریتی: {e}")
+
+def get_recent_admin_logs(limit=15):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT admin_id, target_id, action, details, created_at "
+            "FROM novaself_admin_logs ORDER BY created_at DESC LIMIT %s",
+            (limit,)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت لاگ‌های مدیریتی: {e}")
+        return []
+
+# ======================== سیستم اقتصادی الماس (اتمیک و امن در برابر Race Condition) ========================
+def charge_diamonds_db(user_id, cost):
+    """
+    کسر اتمیک الماس (برای بیلینگِ روشن‌بودن سلف).
+    خروجی: (success: bool, new_balance: float یا None در صورت خطا)
+    success=False یعنی موجودی برای این هزینه کافی نبود (و موجودی صفر شده است).
+    """
+    if cost <= 0:
+        return True, None
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT diamonds FROM novaself_users WHERE user_id = %s FOR UPDATE", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, None
+
+        current = float(row[0] or 0)
+        if current <= 0:
+            conn.rollback()
+            return False, 0.0
+
+        new_balance = current - cost
+        insufficient = new_balance < 0
+        if insufficient:
+            new_balance = 0.0
+
+        cursor.execute(
+            "UPDATE novaself_users SET diamonds = %s, last_charge_at = %s WHERE user_id = %s",
+            (new_balance, datetime.now(), user_id)
+        )
+        conn.commit()
+        return (not insufficient), new_balance
+    except Exception as e:
+        logging.error(f"❌ خطا در کسر الماس کاربر {user_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False, None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def transfer_diamonds_db(sender_id, receiver_id, amount):
+    """
+    انتقال اتمیک الماس بین دو کاربر (با قفل ردیف به ترتیب ثابت برای جلوگیری از Deadlock).
+    خروجی: (success: bool, message: str, sender_balance, receiver_balance)
+    """
+    if sender_id == receiver_id:
+        return False, "❌ انتقال به خودتان امکان‌پذیر نیست.", None, None
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return False, "❌ مقدار وارد شده معتبر نیست.", None, None
+    if amount <= 0:
+        return False, "❌ مقدار انتقال باید بیشتر از صفر باشد.", None, None
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        ids_sorted = sorted([sender_id, receiver_id])
+        cursor.execute(
+            "SELECT user_id, diamonds FROM novaself_users WHERE user_id IN (%s, %s) ORDER BY user_id FOR UPDATE",
+            (ids_sorted[0], ids_sorted[1])
+        )
+        rows = {r[0]: float(r[1] or 0) for r in cursor.fetchall()}
+
+        if sender_id not in rows:
+            conn.rollback()
+            return False, "❌ حساب فرستنده پیدا نشد.", None, None
+        if receiver_id not in rows:
+            conn.rollback()
+            return False, "❌ کاربر گیرنده در سیستم ثبت‌نام نکرده است.", None, None
+
+        sender_balance = rows[sender_id]
+        if sender_balance < amount:
+            conn.rollback()
+            return False, "❌ موجودی شما کافی نیست.", None, None
+
+        new_sender = sender_balance - amount
+        new_receiver = rows[receiver_id] + amount
+
+        cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_sender, sender_id))
+        cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_receiver, receiver_id))
+        conn.commit()
+        return True, "✅ انتقال با موفقیت انجام شد.", new_sender, new_receiver
+    except Exception as e:
+        logging.error(f"❌ خطا در انتقال الماس بین {sender_id} و {receiver_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False, "❌ خطای دیتابیس در حین انتقال رخ داد.", None, None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def admin_adjust_diamonds_db(target_id, amount):
+    """
+    افزایش/کاهش دستی موجودی الماس توسط ادمین (amount می‌تواند منفی باشد).
+    خروجی: (success: bool, new_balance: float یا None)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT diamonds FROM novaself_users WHERE user_id = %s FOR UPDATE", (target_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, None
+
+        current = float(row[0] or 0)
+        new_balance = max(current + float(amount), 0.0)
+
+        cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_balance, target_id))
+        conn.commit()
+        return True, new_balance
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر موجودی الماس کاربر {target_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False, None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def admin_set_referral_db(target_id, new_count):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE novaself_users SET referral_count = %s WHERE user_id = %s RETURNING referral_count",
+            (max(int(new_count), 0), target_id)
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return (row is not None), (row[0] if row else None)
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر تعداد رفرال کاربر {target_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False, None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def get_live_balance_db(user_id):
+    """خواندن لحظه‌ای موجودی از دیتابیس (برای صفحه حساب کاربری)."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT diamonds, referral_count, username FROM novaself_users WHERE user_id = %s",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "diamonds": float(row[0] or 0),
+            "referral_count": row[1] or 0,
+            "username": row[2]
+        }
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن موجودی لحظه‌ای کاربر {user_id}: {e}")
+        return None
+
+def format_diamonds(value):
+    value = float(value or 0)
+    if value == int(value):
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
+
+def format_toman(diamonds):
+    toman = float(diamonds or 0) * DIAMOND_PRICE_TOMAN
+    return f"{toman:,.0f}"
+
 # ======================== توابع کمکی ========================
 def apply_font(text, font_id):
     font_dict = FONTS.get(font_id, FONTS[0])
@@ -301,8 +591,13 @@ def make_default_user(session=None, status=False, step="menu"):
         "secretary_enabled": False,
         "secretary_text": "مشغولم، بعداً پاسخ می‌دهم ✅",
         "secretary_delay": 60,
+        "diamonds": 0.0,
+        "referral_count": 0,
+        "username": None,
+        "last_charge_at": datetime.now(),
         "task": None,
         "action_task": None,
+        "billing_task": None,
         "step": step,
         "joined_at": datetime.now()
     }
@@ -394,7 +689,7 @@ def get_main_menu_keyboard(user):
             Button.inline("🏷️ تگ", b"menu_tag"),
         ],
         [Button.inline("🧑‍💼 منشی", b"menu_secretary")],
-        [Button.inline("🗑️ حذف اکانت", b"delete_account")]
+        [Button.inline("👤 حساب کاربری", b"menu_account")]
     ]
 
 def get_time_menu_keyboard(user):
@@ -539,6 +834,44 @@ def get_secretary_menu_keyboard(user):
         [Button.inline("🔙 بازگشت", b"back_to_main")]
     ]
 
+def get_account_text(user_id, user):
+    username = user.get("username")
+    username_display = f"@{username}" if username else "ثبت نشده"
+    diamonds = format_diamonds(user.get("diamonds", 0))
+    toman = format_toman(user.get("diamonds", 0))
+
+    return (
+        "👤 **حساب کاربری**\n\n"
+        f"💡 نام کاربری: {username_display}\n"
+        f"🆔 آیدی عددی: `{user_id}`\n"
+        f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
+        f"💎 موجودی الماس: {diamonds}\n"
+        f"💰 معادل تومانی: {toman} تومان\n\n"
+        "--------------------"
+    )
+
+def get_account_keyboard():
+    return [
+        [Button.inline("💎 خرید الماس", b"account_buy_diamond"), Button.inline("💸 انتقال الماس", b"account_transfer_start")],
+        [Button.inline("🗑 حذف حساب کاربری", b"account_delete_confirm")],
+        [Button.inline("🔙 بازگشت", b"back_to_main")]
+    ]
+
+def get_account_delete_warning_keyboard():
+    return [
+        [Button.inline("❌ لغو عملیات", b"menu_account")],
+        [Button.inline("✅ تایید و حذف حساب کاربری", b"account_delete_final")]
+    ]
+
+def get_transfer_cancel_keyboard():
+    return [[Button.inline("❌ لغو", b"transfer_cancel")]]
+
+def get_transfer_confirm_keyboard():
+    return [
+        [Button.inline("✅ تایید انتقال", b"transfer_confirm_execute")],
+        [Button.inline("❌ لغو", b"transfer_cancel")]
+    ]
+
 def get_code_keyboard(current_code=""):
     display = current_code if current_code else "خالی"
     return [
@@ -557,6 +890,7 @@ def get_admin_main_menu():
         [Button.inline("📋 لیست کاربران", b"admin_users_list")],
         [Button.inline("📨 ارسال پیام همگانی", b"admin_broadcast")],
         [Button.inline("🔍 جستجوی کاربر", b"admin_search_user")],
+        [Button.inline("📜 لاگ‌های مدیریتی اخیر", b"admin_logs")],
         [Button.inline("🔄 بروزرسانی همه کاربران", b"admin_refresh_all")]
     ]
 
@@ -602,6 +936,11 @@ def get_users_list_page(page=0, per_page=10):
 def get_user_detail_buttons(user_id):
     return [
         [Button.inline("🔄 تغییر وضعیت", f"admin_toggle_user_{user_id}".encode())],
+        [
+            Button.inline("➕ افزایش الماس", f"admin_add_diamond_{user_id}".encode()),
+            Button.inline("➖ کاهش الماس", f"admin_sub_diamond_{user_id}".encode()),
+        ],
+        [Button.inline("👥 تغییر تعداد رفرال", f"admin_set_referral_{user_id}".encode())],
         [Button.inline("❌ حذف کاربر", f"admin_delete_user_{user_id}".encode())],
         [Button.inline("📨 ارسال پیام به این کاربر", f"admin_send_to_user_{user_id}".encode())],
         [Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
@@ -782,6 +1121,14 @@ def make_secretary_incoming_handler(user_id):
             if not peer_id:
                 return
 
+            # رفع باگ: منشی نباید به ربات‌های تلگرامی پاسخ بدهد (فقط پیوی کاربران واقعی)
+            try:
+                sender = await event.get_sender()
+                if sender is None or getattr(sender, "bot", False):
+                    return
+            except Exception:
+                return
+
             state = secretary_state.setdefault(user_id, {})
             peer_state = state.get(peer_id)
 
@@ -839,6 +1186,7 @@ def register_active_client(user_id, client):
     if user_id in user_data:
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
         user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
+        user_data[user_id]["billing_task"] = loop.create_task(diamond_billing_worker(user_id, client))
 
 async def start_self_client(user_id, session_string):
     """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن."""
@@ -858,15 +1206,21 @@ async def start_self_client(user_id, session_string):
     return client
 
 async def stop_self_client(user_id):
-    """توقف کامل و امن کلاینت سلف یک کاربر (تسک‌ها + قطع اتصال + پاکسازی وضعیت منشی)."""
+    """
+    توقف کامل و امن کلاینت سلف یک کاربر (تسک‌ها + قطع اتصال + پاکسازی وضعیت منشی).
+    این تابع ممکن است از داخل خودِ یکی از تسک‌ها (مثلاً diamond_billing_worker هنگام اتمام
+    موجودی) صدا زده شود؛ برای جلوگیری از خودکنسل‌کردنِ تسکِ در حال اجرا، تسک جاری را
+    از لیست کنسل‌شدنی مستثنی می‌کنیم.
+    """
     user = user_data.get(user_id)
+    current = asyncio.current_task()
+
     if user:
-        if user.get("task"):
-            user["task"].cancel()
-            user["task"] = None
-        if user.get("action_task"):
-            user["action_task"].cancel()
-            user["action_task"] = None
+        for key in ("task", "action_task", "billing_task"):
+            t = user.get(key)
+            if t and t is not current:
+                t.cancel()
+            user[key] = None
 
     _cleanup_secretary_state(user_id)
 
@@ -884,6 +1238,10 @@ async def self_bot_worker(user_id, client):
         me = await client.get_me()
         first_name = me.first_name or "کاربر"
         last_signature = None
+
+        if user_id in user_data and user_data[user_id].get("username") != me.username:
+            user_data[user_id]["username"] = me.username
+            update_username_db(user_id, me.username)
 
         while True:
             if user_id not in user_data or not user_data[user_id]["status"]:
@@ -975,11 +1333,70 @@ async def self_bot_action_worker(user_id, client):
     except Exception as e:
         logging.error(f"❌ خطای اکشن برای کاربر {user_id}: {e}")
 
+async def diamond_billing_worker(user_id, client):
+    """
+    هر BILLING_INTERVAL_SECONDS ثانیه، به نسبت مدت‌زمان سپری‌شده الماس کسر می‌کند
+    (نرخ: DIAMOND_RATE_PER_HOUR الماس به ازای هر ساعت روشن بودن سلف).
+    اگر موجودی تمام شود، سلف به‌صورت خودکار خاموش و به کاربر اطلاع داده می‌شود.
+    """
+    try:
+        last_charge = datetime.now(pytz.UTC)
+
+        while True:
+            if user_id not in user_data or not user_data[user_id]["status"]:
+                break
+
+            await asyncio.sleep(BILLING_INTERVAL_SECONDS)
+
+            if user_id not in user_data or not user_data[user_id]["status"]:
+                break
+
+            now = datetime.now(pytz.UTC)
+            elapsed_hours = (now - last_charge).total_seconds() / 3600
+            last_charge = now
+
+            cost = elapsed_hours * DIAMOND_RATE_PER_HOUR
+            if cost <= 0:
+                continue
+
+            success, new_balance = charge_diamonds_db(user_id, cost)
+
+            if user_id in user_data and new_balance is not None:
+                user_data[user_id]["diamonds"] = new_balance
+
+            if not success:
+                if user_id in user_data:
+                    user_data[user_id]["status"] = False
+                    save_user(user_id, user_data[user_id])
+
+                await stop_self_client(user_id)
+
+                try:
+                    await bot.send_message(
+                        user_id,
+                        "⛔ **موجودی الماس شما به پایان رسید و سلف شما به‌صورت خودکار متوقف شد.**\n\n"
+                        "برای فعال‌سازی مجدد، ابتدا از بخش «👤 حساب کاربری» موجودی خود را افزایش دهید."
+                    )
+                except Exception:
+                    pass
+                break
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logging.error(f"⚠️ خطای بیلینگ الماس کاربر {user_id}: {e}")
+
 async def autostart_saved_users():
     await asyncio.sleep(5)
 
     for user_id, user in list(user_data.items()):
         if user["status"] and user["session"]:
+            if float(user.get("diamonds", 0)) <= 0:
+                user["status"] = False
+                save_user(user_id, user)
+                logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل موجودی صفر الماس غیرفعال ماند.")
+                continue
+
             client = await start_self_client(user_id, user["session"])
             if client:
                 logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
@@ -1106,11 +1523,15 @@ async def callback_handler(event):
                     f"✅ فعال ({user.get('secretary_delay', 60)} ثانیه)"
                     if user.get("secretary_enabled") else "❌ غیرفعال"
                 )
+                username_display = f"@{user.get('username')}" if user.get("username") else "ثبت نشده"
 
                 await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
                     f"🆔 شناسه: `{target_id}`\n"
+                    f"💡 یوزرنیم: {username_display}\n"
                     f"📊 وضعیت: {status_text}\n"
+                    f"💎 موجودی الماس: {format_diamonds(user.get('diamonds', 0))} ({format_toman(user.get('diamonds', 0))} تومان)\n"
+                    f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
                     f"🔤 فونت: {font_name}\n"
                     f"⌚ نمایش در نام: {'✅' if user['name_time'] else '❌'}\n"
                     f"⌚ نمایش در بیو: {'✅' if user['bio_time'] else '❌'}\n"
@@ -1134,16 +1555,23 @@ async def callback_handler(event):
                 user["status"] = not user["status"]
 
                 if user["status"]:
-                    client = await start_self_client(target_id, user["session"])
-                    if not client:
+                    if float(user.get("diamonds", 0)) <= 0:
                         user["status"] = False
-                        await event.answer("❌ خطا در راه‌اندازی (نشست نامعتبر است)", alert=True)
+                        await event.answer("💎 موجودی الماس این کاربر کافی نیست.", alert=True)
+                    else:
+                        client = await start_self_client(target_id, user["session"])
+                        if not client:
+                            user["status"] = False
+                            await event.answer("❌ خطا در راه‌اندازی (نشست نامعتبر است)", alert=True)
+                        else:
+                            await event.answer("✅ وضعیت کاربر تغییر کرد!", alert=True)
                 else:
                     await stop_self_client(target_id)
+                    await event.answer("✅ وضعیت کاربر تغییر کرد!", alert=True)
 
                 save_user(target_id, user)
+                log_admin_action(user_id, target_id, "toggle_status", f"new_status={user['status']}")
 
-                await event.answer("✅ وضعیت کاربر تغییر کرد!", alert=True)
                 await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
                     f"🆔 شناسه: `{target_id}`\n"
@@ -1159,6 +1587,7 @@ async def callback_handler(event):
                 await stop_self_client(target_id)
                 delete_user_db(target_id)
                 del user_data[target_id]
+                log_admin_action(user_id, target_id, "delete_user", "")
 
                 await event.answer("✅ کاربر حذف شد!", alert=True)
                 await safe_edit(event,
@@ -1205,6 +1634,50 @@ async def callback_handler(event):
             await safe_edit(event,
                 "🔍 **جستجوی کاربر**\n\n"
                 "لطفاً شناسه (ID) کاربر مورد نظر را وارد کنید:"
+            )
+            return
+
+        # نمایش لاگ‌های مدیریتی اخیر
+        if data == b"admin_logs":
+            logs = get_recent_admin_logs(15)
+            if not logs:
+                log_text = "📜 **لاگ مدیریتی**\n\nهنوز هیچ عملیاتی ثبت نشده است."
+            else:
+                lines = ["📜 **۱۵ عملیات مدیریتی اخیر:**\n"]
+                for admin_id_l, target_id_l, action_l, details_l, created_at_l in logs:
+                    ts = created_at_l.strftime("%Y-%m-%d %H:%M") if created_at_l else "؟"
+                    lines.append(f"▫️ [{ts}] ادمین {admin_id_l} ← کاربر {target_id_l} | {action_l} {details_l}")
+                log_text = "\n".join(lines)
+            await safe_edit(event, log_text, buttons=[Button.inline("🔙 بازگشت", b"admin_panel")])
+            return
+
+        # افزایش الماس
+        if data.startswith(b"admin_add_diamond_"):
+            target_id = int(data.decode().split("_")[3])
+            admin_action_data[user_id] = {"type": "add_diamond", "target_id": target_id, "step": "get_amount"}
+            await safe_edit(event,
+                f"➕ **افزایش الماس کاربر {target_id}**\n\n"
+                "لطفاً مقدار الماس موردنظر برای افزایش را وارد کنید (عدد مثبت):"
+            )
+            return
+
+        # کاهش الماس
+        if data.startswith(b"admin_sub_diamond_"):
+            target_id = int(data.decode().split("_")[3])
+            admin_action_data[user_id] = {"type": "sub_diamond", "target_id": target_id, "step": "get_amount"}
+            await safe_edit(event,
+                f"➖ **کاهش الماس کاربر {target_id}**\n\n"
+                "لطفاً مقدار الماس موردنظر برای کاهش را وارد کنید (عدد مثبت):"
+            )
+            return
+
+        # تغییر تعداد رفرال
+        if data.startswith(b"admin_set_referral_"):
+            target_id = int(data.decode().split("_")[3])
+            admin_action_data[user_id] = {"type": "set_referral", "target_id": target_id, "step": "get_amount"}
+            await safe_edit(event,
+                f"👥 **تغییر تعداد رفرال کاربر {target_id}**\n\n"
+                "لطفاً تعداد رفرال جدید را وارد کنید (عدد صفر یا مثبت):"
             )
             return
 
@@ -1426,10 +1899,17 @@ async def callback_handler(event):
         user["status"] = not user["status"]
 
         if user["status"]:
-            client = await start_self_client(user_id, user["session"])
-            if not client:
+            if float(user.get("diamonds", 0)) <= 0:
                 user["status"] = False
-                await event.answer("❌ نشست منقضی شده یا خطا در اتصال!", alert=True)
+                await event.answer(
+                    "💎 موجودی الماس شما کافی نیست.\n\nابتدا از بخش «حساب کاربری» موجودی خود را افزایش دهید.",
+                    alert=True
+                )
+            else:
+                client = await start_self_client(user_id, user["session"])
+                if not client:
+                    user["status"] = False
+                    await event.answer("❌ نشست منقضی شده یا خطا در اتصال!", alert=True)
         else:
             await stop_self_client(user_id)
 
@@ -1464,15 +1944,90 @@ async def callback_handler(event):
         )
         return
 
-    if data == b"delete_account":
+    if data == b"menu_account":
+        await safe_edit(event, get_account_text(user_id, user), buttons=get_account_keyboard())
+        return
+
+    if data == b"account_buy_diamond":
+        await safe_edit(event,
+            "💎 **خرید الماس**\n\n"
+            "در حال حاضر درگاه پرداخت فعال نیست.\n\n"
+            f"جهت خرید الماس با {SUPPORT_USERNAME} در تماس باشید.",
+            buttons=[[Button.inline("🔙 بازگشت", b"menu_account")]]
+        )
+        return
+
+    if data == b"account_delete_confirm":
+        await safe_edit(event,
+            "⚠️ **هشدار**\n\n"
+            "با حذف حساب کاربری، تمام اطلاعات شما شامل تنظیمات، سشن، داده‌های ذخیره‌شده و "
+            "سایر اطلاعات (از جمله موجودی الماس و رفرال) به‌صورت دائمی از دیتابیس حذف خواهند شد.\n\n"
+            "این عملیات غیرقابل بازگشت است.",
+            buttons=get_account_delete_warning_keyboard()
+        )
+        return
+
+    if data == b"account_delete_final":
         await stop_self_client(user_id)
         delete_user_db(user_id)
         del user_data[user_id]
+        transfer_data.pop(user_id, None)
 
         await safe_edit(event,
-            "🗑️ **اکانت با موفقیت حذف شد!**\n\n"
+            "🗑️ **حساب کاربری با موفقیت و به‌صورت کامل حذف شد.**\n\n"
             "برای شروع مجدد، دستور /start را ارسال کنید."
         )
+        return
+
+    if data == b"account_transfer_start":
+        transfer_data[user_id] = {}
+        user["step"] = "transfer_get_target"
+        await safe_edit(event,
+            "💸 **انتقال الماس**\n\n"
+            "لطفاً آیدی عددی کاربر مقصد را ارسال کنید:",
+            buttons=get_transfer_cancel_keyboard()
+        )
+        return
+
+    if data == b"transfer_cancel":
+        transfer_data.pop(user_id, None)
+        user["step"] = "managed"
+        await safe_edit(event, get_account_text(user_id, user), buttons=get_account_keyboard())
+        return
+
+    if data == b"transfer_confirm_execute":
+        pending = transfer_data.get(user_id)
+        if not pending or "target_id" not in pending or "amount" not in pending:
+            await event.answer("❌ اطلاعات انتقال یافت نشد، دوباره تلاش کنید.", alert=True)
+            return
+
+        target_id = pending["target_id"]
+        amount = pending["amount"]
+
+        success, message, sender_balance, receiver_balance = transfer_diamonds_db(user_id, target_id, amount)
+
+        if success:
+            if user_id in user_data:
+                user_data[user_id]["diamonds"] = sender_balance
+            if target_id in user_data:
+                user_data[target_id]["diamonds"] = receiver_balance
+
+            transfer_data.pop(user_id, None)
+            user["step"] = "managed"
+
+            await safe_edit(event,
+                "✅ **انتقال با موفقیت انجام شد.**\n\n"
+                f"💎 مقدار انتقالی: {format_diamonds(amount)}\n"
+                f"💰 موجودی جدید شما: {format_diamonds(sender_balance)}",
+                buttons=[[Button.inline("🔙 بازگشت به حساب کاربری", b"menu_account")]]
+            )
+        else:
+            await safe_edit(event,
+                f"{message}",
+                buttons=[[Button.inline("🔙 بازگشت به حساب کاربری", b"menu_account")]]
+            )
+            transfer_data.pop(user_id, None)
+            user["step"] = "managed"
         return
 
     if data == b"menu_tag":
@@ -1573,11 +2128,83 @@ async def message_handler(event):
     text = event.text.strip() if event.text else ""
 
     # لغو عملیات
-    if text == "/cancel" and user_id in broadcast_data:
-        del broadcast_data[user_id]
+    _pending_steps = {
+        "transfer_get_target", "transfer_get_amount", "transfer_confirm",
+        "secretary_get_text", "secretary_get_time"
+    }
+    _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
+
+    if text == "/cancel" and (user_id in broadcast_data or user_id in admin_action_data or _has_pending_step):
+        broadcast_data.pop(user_id, None)
+        admin_action_data.pop(user_id, None)
+        transfer_data.pop(user_id, None)
+        if user_id in user_data:
+            user_data[user_id]["step"] = "managed"
         await event.respond("❌ عملیات لغو شد.")
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
+        return
+
+    # ====== پردازش عملیات مدیریتی الماس/رفرال ======
+    if user_id in admin_action_data and is_admin(user_id):
+        action = admin_action_data[user_id]
+        target_id = action["target_id"]
+
+        try:
+            amount = float(text)
+        except (TypeError, ValueError):
+            await event.respond("❌ لطفاً یک عدد معتبر ارسال کنید.")
+            return
+
+        if action["type"] in ("add_diamond", "sub_diamond"):
+            if amount <= 0:
+                await event.respond("❌ مقدار باید بیشتر از صفر باشد.")
+                return
+
+            signed_amount = amount if action["type"] == "add_diamond" else -amount
+            success, new_balance = admin_adjust_diamonds_db(target_id, signed_amount)
+
+            if not success:
+                await event.respond("❌ کاربر پیدا نشد یا خطایی در دیتابیس رخ داد.")
+                del admin_action_data[user_id]
+                return
+
+            if target_id in user_data:
+                user_data[target_id]["diamonds"] = new_balance
+
+            action_label = "افزایش" if action["type"] == "add_diamond" else "کاهش"
+            log_admin_action(user_id, target_id, f"{action_label} الماس", f"مقدار: {amount}")
+
+            await event.respond(
+                f"✅ موجودی الماس کاربر {target_id} با موفقیت {action_label} یافت.\n"
+                f"💎 موجودی جدید: {format_diamonds(new_balance)}"
+            )
+
+        elif action["type"] == "set_referral":
+            if amount < 0:
+                await event.respond("❌ تعداد رفرال نمی‌تواند منفی باشد.")
+                return
+
+            success, new_count = admin_set_referral_db(target_id, int(amount))
+            if not success:
+                await event.respond("❌ کاربر پیدا نشد یا خطایی در دیتابیس رخ داد.")
+                del admin_action_data[user_id]
+                return
+
+            if target_id in user_data:
+                user_data[target_id]["referral_count"] = new_count
+
+            log_admin_action(user_id, target_id, "تغییر تعداد رفرال", f"مقدار جدید: {new_count}")
+
+            await event.respond(f"✅ تعداد رفرال کاربر {target_id} به {new_count} تغییر یافت.")
+
+        del admin_action_data[user_id]
+
+        if target_id in user_data:
+            await event.respond(
+                "👤 برای مشاهده جزئیات بروزرسانی‌شده:",
+                buttons=get_user_detail_buttons(target_id)
+            )
         return
 
     # ====== پردازش پیام همگانی ======
@@ -1736,6 +2363,78 @@ async def message_handler(event):
         await event.respond(
             get_secretary_menu_text(user_data[user_id]),
             buttons=get_secretary_menu_keyboard(user_data[user_id])
+        )
+        return
+
+    # ====== انتقال الماس: مرحله اول (آیدی مقصد) ======
+    if user_id in user_data and user_data[user_id].get("step") == "transfer_get_target":
+        try:
+            target_id = int(text)
+        except ValueError:
+            await event.respond("❌ آیدی عددی معتبر نیست. لطفاً فقط عدد ارسال کنید.", buttons=get_transfer_cancel_keyboard())
+            return
+
+        if target_id == user_id:
+            await event.respond("❌ انتقال به خودتان امکان‌پذیر نیست.", buttons=get_transfer_cancel_keyboard())
+            return
+
+        if target_id not in user_data or not user_data[target_id].get("session"):
+            await event.respond("❌ کاربری با این آیدی در سیستم ثبت‌نام نکرده است.", buttons=get_transfer_cancel_keyboard())
+            return
+
+        transfer_data[user_id] = {"target_id": target_id}
+        user_data[user_id]["step"] = "transfer_get_amount"
+
+        await event.respond(
+            f"✅ کاربر مقصد یافت شد: `{target_id}`\n\n"
+            "💎 حالا مقدار الماس موردنظر برای انتقال را وارد کنید:",
+            buttons=get_transfer_cancel_keyboard()
+        )
+        return
+
+    # ====== انتقال الماس: مرحله دوم (مقدار) ======
+    if user_id in user_data and user_data[user_id].get("step") == "transfer_get_amount":
+        pending = transfer_data.get(user_id)
+        if not pending or "target_id" not in pending:
+            user_data[user_id]["step"] = "managed"
+            await event.respond("❌ عملیات منقضی شده. دوباره از منوی حساب کاربری اقدام کنید.")
+            return
+
+        try:
+            amount = float(text)
+        except ValueError:
+            await event.respond("❌ لطفاً فقط عدد ارسال کنید.", buttons=get_transfer_cancel_keyboard())
+            return
+
+        if amount <= 0:
+            await event.respond("❌ مقدار انتقال باید بیشتر از صفر باشد.", buttons=get_transfer_cancel_keyboard())
+            return
+
+        current_balance = user_data[user_id].get("diamonds", 0)
+        if current_balance < amount:
+            await event.respond(
+                f"❌ موجودی شما کافی نیست.\n💎 موجودی فعلی: {format_diamonds(current_balance)}",
+                buttons=get_transfer_cancel_keyboard()
+            )
+            return
+
+        target_id = pending["target_id"]
+        transfer_data[user_id]["amount"] = amount
+        user_data[user_id]["step"] = "transfer_confirm"
+
+        new_sender_balance = current_balance - amount
+        target_balance = user_data.get(target_id, {}).get("diamonds", 0)
+        new_receiver_balance = target_balance + amount
+
+        await event.respond(
+            "🧾 **تایید انتقال الماس**\n\n"
+            f"👤 فرستنده: `{user_id}`\n"
+            f"👤 گیرنده: `{target_id}`\n\n"
+            f"💎 تعداد الماس: {format_diamonds(amount)}\n\n"
+            f"موجودی فعلی شما: {format_diamonds(current_balance)}\n"
+            f"موجودی شما پس از انتقال: {format_diamonds(new_sender_balance)}\n\n"
+            "آیا از انجام این انتقال مطمئن هستید؟",
+            buttons=get_transfer_confirm_keyboard()
         )
         return
 
