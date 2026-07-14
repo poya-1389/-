@@ -2543,6 +2543,61 @@ async def broadcast_callback_handler(event):
         )
         return
 
+# ======================== API برای Mini App ========================
+from aiohttp import web
+import aiohttp_cors
+
+async def get_user_data(request):
+    """API برای خواندن اطلاعات کاربر توسط Mini App"""
+    try:
+        user_id = int(request.query.get('user_id', 0))
+        if user_id == 0:
+            return web.json_response({"error": "user_id is required"}, status=400)
+
+        user = user_data.get(user_id)
+        if not user:
+            return web.json_response({"error": "user not found"}, status=404)
+
+        return web.json_response({
+            "user_id": user_id,
+            "status": bool(user.get("status", False)),
+            "diamonds": float(user.get("diamonds", 0)),
+            "referral_count": int(user.get("referral_count", 0)),
+            "font_id": int(user.get("font_id", 1)),
+            "name_time": bool(user.get("name_time", True)),
+            "bio_time": bool(user.get("bio_time", False)),
+            "date_enabled": bool(user.get("date_enabled", False)),
+            "date_type": user.get("date_type", "shamsi"),
+            "active_action": user.get("active_action", "none"),
+            "secretary_enabled": bool(user.get("secretary_enabled", False)),
+            "username": user.get("username")
+        })
+    except Exception as e:
+        logging.error(f"API Error: {e}")
+        return web.json_response({"error": "internal server error"}, status=500)
+
+# راه‌اندازی وب سرور
+async def start_miniapp_api():
+    app = web.Application()
+    app.router.add_get('/api/user', get_user_data)
+
+    # فعال کردن CORS برای Mini App
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*"
+        )
+    })
+    for route in list(app.router.routes()):
+        cors.add(route)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logging.info("🌐 Mini App API روی پورت 8080 فعال شد ✅")
+
 # ======================== اجرای اصلی ========================
 if __name__ == "__main__":
     logging.info("🚀 راه‌اندازی ربات NovaSelf...")
