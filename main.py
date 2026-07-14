@@ -2542,21 +2542,6 @@ async def broadcast_callback_handler(event):
             buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
         )
         return
-# ا
-
-from webapp_api import create_webapp_app, run_webapp_server
-
-# بعد از خط: user_data = get_all_users()
-webapp_app = create_webapp_app(
-    bot_token=BOT_TOKEN,
-    user_data=user_data,
-    save_user=save_user,
-    start_self_client=start_self_client,
-    stop_self_client=stop_self_client,
-    format_diamonds=format_diamonds,
-    allowed_origin="https://poya-1389.github.io/Novasite/",
-)
-loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=8080))
 
 # ======================== اجرای اصلی ========================
 if __name__ == "__main__":
