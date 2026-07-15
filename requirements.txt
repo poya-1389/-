@@ -4,4 +4,3 @@ psycopg2-binary
 jdatetime
 hijridate
 aiohttp
-aiohttp-cors
