@@ -22,6 +22,7 @@ from telethon.tl.types import (
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName
 )
 import logging
+from webapp_api import create_webapp_app, run_webapp_server
 
 # ======================== تنظیمات اولیه ========================
 API_ID = int(os.environ.get("API_ID"))
@@ -29,6 +30,8 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_IDS", "").split(",") if id.strip()]
+MINIAPP_ORIGIN = os.environ.get("MINIAPP_ORIGIN", "*")  # آدرس گیت‌هاب‌پیجز، مثل: https://username.github.io
+PORT = int(os.environ.get("PORT", 8080))  # ریلوی این متغیر رو خودش ست می‌کنه
 
 if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
     raise ValueError("تمامی متغیرهای محیطی باید تنظیم شوند!")
@@ -2553,6 +2556,17 @@ if __name__ == "__main__":
 
     loop = asyncio.get_event_loop()
     loop.create_task(autostart_saved_users())
+
+    webapp_app = create_webapp_app(
+        bot_token=BOT_TOKEN,
+        user_data=user_data,
+        save_user=save_user,
+        start_self_client=start_self_client,
+        stop_self_client=stop_self_client,
+        format_diamonds=format_diamonds,
+        allowed_origin=MINIAPP_ORIGIN,
+    )
+    loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
 
     logging.info("✅ ربات با موفقیت راه‌اندازی شد!")
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
