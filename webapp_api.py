@@ -78,7 +78,8 @@ def _validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = 8
 
 
 def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
-                       stop_self_client, format_diamonds, allowed_origin="*"):
+                       stop_self_client, format_diamonds, diamond_rate_per_hour=5,
+                       allowed_origin="*"):
     """
     این تابع را از main.py صدا بزن و خروجی‌اش را با run_webapp_server اجرا کن.
     توجه: user_data باید همان دیکشنری سراسری main.py باشد (پاس دادن با رفرنس)
@@ -143,24 +144,35 @@ def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
         save_user(user_id, user)
         return web.json_response({"ok": True, **_serialize_user(user)})
 
+    def _format_expiry(diamonds_val):
+        if diamonds_val <= 0 or not diamond_rate_per_hour:
+            return "منقضی شده"
+        total_hours = diamonds_val / diamond_rate_per_hour
+        days = int(total_hours // 24)
+        hours = int(total_hours % 24)
+        if days > 0:
+            return f"{days} روز و {hours} ساعت"
+        return f"{hours} ساعت"
+
     def _serialize_user(user):
+        diamonds_val = float(user.get("diamonds", 0) or 0)
         return {
-            "user": {
-                "status": bool(user.get("status")),
-                "font_id": user.get("font_id", 1),
-                "text_mode": user.get("text_mode", 0),
-                "date_enabled": bool(user.get("date_enabled")),
-                "date_type": user.get("date_type", "shamsi"),
-                "date_font": user.get("date_font", 1),
-                "name_time": bool(user.get("name_time")),
-                "bio_time": bool(user.get("bio_time")),
-                "secretary_enabled": bool(user.get("secretary_enabled")),
-                "secretary_text": user.get("secretary_text", ""),
-                "secretary_delay": user.get("secretary_delay", 60),
-                "diamonds_formatted": format_diamonds(user.get("diamonds", 0)),
-                "referral_count": user.get("referral_count", 0),
-                "joined_at": str(user.get("joined_at", "") or ""),
-            }
+            "status": bool(user.get("status")),
+            "font_id": user.get("font_id", 1),
+            "text_mode": user.get("text_mode", 0),
+            "date_enabled": bool(user.get("date_enabled")),
+            "date_type": user.get("date_type", "shamsi"),
+            "date_font": user.get("date_font", 1),
+            "name_time": bool(user.get("name_time")),
+            "bio_time": bool(user.get("bio_time")),
+            "secretary_enabled": bool(user.get("secretary_enabled")),
+            "secretary_text": user.get("secretary_text", ""),
+            "secretary_delay": user.get("secretary_delay", 60),
+            "diamonds_formatted": format_diamonds(diamonds_val),
+            "diamonds_rounded": round(diamonds_val),
+            "expiry_text": _format_expiry(diamonds_val),
+            "referral_count": user.get("referral_count", 0),
+            "joined_at": str(user.get("joined_at", "") or ""),
         }
 
     @web.middleware
