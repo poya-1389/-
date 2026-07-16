@@ -571,6 +571,17 @@ def format_toman(diamonds):
     toman = float(diamonds or 0) * DIAMOND_PRICE_TOMAN
     return f"{toman:,.0f}"
 
+def format_expiry(diamonds):
+    diamonds = float(diamonds or 0)
+    if diamonds <= 0 or not DIAMOND_RATE_PER_HOUR:
+        return "منقضی شده"
+    total_hours = diamonds / DIAMOND_RATE_PER_HOUR
+    days = int(total_hours // 24)
+    hours = int(total_hours % 24)
+    if days > 0:
+        return f"{days} روز و {hours} ساعت"
+    return f"{hours} ساعت"
+
 # ======================== توابع کمکی ========================
 def apply_font(text, font_id):
     font_dict = FONTS.get(font_id, FONTS[0])
@@ -680,8 +691,9 @@ async def safe_edit(event, text, buttons=None):
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
     status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
+    expiry_text = format_expiry(user.get("diamonds", 0))
     return [
-        [Button.inline(f"وضعیت سلف: {status_text}", b"toggle_status")],
+        [Button.inline(f"وضعیت سلف: {status_text}  |  ⏳ {expiry_text}", b"toggle_status")],
         [
             Button.inline("📅 تاریخ", b"menu_date"),
             Button.inline("🎭 اکشن", b"menu_actions"),
@@ -842,6 +854,7 @@ def get_account_text(user_id, user):
     username_display = f"@{username}" if username else "ثبت نشده"
     diamonds = format_diamonds(user.get("diamonds", 0))
     toman = format_toman(user.get("diamonds", 0))
+    expiry = format_expiry(user.get("diamonds", 0))
 
     return (
         "👤 **حساب کاربری**\n\n"
@@ -849,7 +862,8 @@ def get_account_text(user_id, user):
         f"🆔 آیدی عددی: `{user_id}`\n"
         f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
         f"💎 موجودی الماس: {diamonds}\n"
-        f"💰 معادل تومانی: {toman} تومان\n\n"
+        f"💰 معادل تومانی: {toman} تومان\n"
+        f"⏳ انقضای تخمینی: {expiry}\n\n"
         "--------------------"
     )
 
@@ -2564,6 +2578,7 @@ if __name__ == "__main__":
         start_self_client=start_self_client,
         stop_self_client=stop_self_client,
         format_diamonds=format_diamonds,
+        diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
         allowed_origin=MINIAPP_ORIGIN,
     )
     loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
@@ -2572,3 +2587,4 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
+
