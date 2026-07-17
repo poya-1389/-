@@ -23,6 +23,11 @@ from telethon.tl.types import (
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
+from nova_utils import (
+    status_icon, toggle_label, build_clock_preview, build_date_preview,
+    build_sender_receipt, build_receiver_receipt, ClickDebouncer, safe_call,
+    log_diamond_transfer, log_self_toggle, log_settings_change, log_internal_error,
+)
 
 # ======================== تنظیمات اولیه ========================
 API_ID = int(os.environ.get("API_ID"))
@@ -58,9 +63,10 @@ secretary_state = {}   # {user_id: {peer_id: {"replied": bool, "task": Task}}}
 _auto_sent_marks = set()  # {(user_id, chat_id, message_id)} پیام‌هایی که خودمان خودکار فرستادیم (نباید توسط حالت متن ادیت شوند)
 transfer_data = {}     # {user_id: {"target_id":..., "amount":...}} وضعیت موقت انتقال الماس
 admin_action_data = {} # {admin_id: {"type":..., "target_id":..., "step":...}} وضعیت موقت عملیات مدیریتی روی الماس/رفرال
+click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پردازش کلیک تکراری روی دکمه‌ها
 
-TAG_ADMIN_TRIGGERS = {".تگ_ادمین", ".تگادمین", ".tagadmins"}
-TAG_MEMBERS_TRIGGERS = {".تگ_اعضا", ".تگاعضا", ".tagall"}
+TAG_ADMIN_TRIGGERS = {".تگ ادمین", ".تگادمین", ".tagadmins"}
+TAG_MEMBERS_TRIGGERS = {".تگ اعضا", ".تگاعضا", ".tagall"}
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -690,10 +696,10 @@ async def safe_edit(event, text, buttons=None):
 
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
-    status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
+    status_text = status_icon(user["status"])
     expiry_text = format_expiry(user.get("diamonds", 0))
     return [
-        [Button.inline(f"وضعیت سلف: {status_text}  |  ⏳ {expiry_text}", b"toggle_status")],
+        [Button.inline(f"وضعیت سلف ({status_text})  |  ⏳ {expiry_text}", b"toggle_status")],
         [
             Button.inline("📅 تاریخ", b"menu_date"),
             Button.inline("🎭 اکشن", b"menu_actions"),
@@ -703,29 +709,45 @@ def get_main_menu_keyboard(user):
             Button.inline("🖊️ حالت متن", b"menu_textmode"),
             Button.inline("🏷️ تگ", b"menu_tag"),
         ],
-        [Button.inline("🧑‍💼 منشی", b"menu_secretary")],
+        [Button.inline("🧑‍💼 منشی پیوی", b"menu_secretary")],
         [Button.inline("👤 حساب کاربری", b"menu_account")]
     ]
 
 def get_time_menu_keyboard(user):
-    name_status = "✅ فعال" if user["name_time"] else "❌ غیرفعال"
-    bio_status = "✅ فعال" if user["bio_time"] else "❌ غیرفعال"
-    current_font = FONT_NAMES.get(user["font_id"], "بولد")
-
+    name_status = status_icon(user["name_time"])
+    bio_status = status_icon(user["bio_time"])
     return [
-        [Button.inline(f"نمایش در نام: {name_status}", b"toggle_name_time")],
-        [Button.inline(f"نمایش در بیو: {bio_status}", b"toggle_bio_time")],
-        [Button.inline(f"🔤 تغییر فونت: {current_font}", b"menu_fonts")],
+        [Button.inline(f"ساعت نام ({name_status})", b"toggle_name_time")],
+        [Button.inline(f"ساعت بیو ({bio_status})", b"toggle_bio_time")],
+        [Button.inline("فونت ساعت", b"menu_fonts")],
         [Button.inline("🔙 بازگشت", b"back_to_main")]
     ]
+
+def get_time_menu_text(user):
+    font_name = FONT_NAMES.get(user["font_id"], "بولد")
+    preview = build_clock_preview(apply_font, user["font_id"])
+    return (
+        "⌚ **تنظیمات ساعت**\n\n"
+        f"فونت ساعت: {font_name}\n\n"
+        f"{preview}"
+    )
+
+def get_fonts_menu_text(user):
+    font_name = FONT_NAMES.get(user["font_id"], "بولد")
+    preview = build_clock_preview(apply_font, user["font_id"])
+    return (
+        "🔤 **انتخاب فونت ساعت**\n\n"
+        f"فونت ساعت: {font_name}\n\n"
+        f"{preview}"
+    )
 
 def get_fonts_menu_keyboard(current_font_id):
     buttons = []
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        display = f"✅ {font_name}" if font_id == current_font_id else f"▫️ {font_name}"
-        row.append(Button.inline(display, f"setfont_{font_id}".encode()))
+        mark = status_icon(font_id == current_font_id)
+        row.append(Button.inline(f"{mark} {font_name}", f"setfont_{font_id}".encode()))
 
         if len(row) == 2:
             buttons.append(row)
@@ -742,8 +764,8 @@ def get_actions_menu_keyboard(current_action):
     row = []
 
     for action_key, (action_name, _) in ACTIONS.items():
-        display = f"🟢 {action_name}" if action_key == current_action else f"⚪ {action_name}"
-        row.append(Button.inline(display, f"setact_{action_key}".encode()))
+        mark = status_icon(action_key == current_action)
+        row.append(Button.inline(f"{mark} {action_name}", f"setact_{action_key}".encode()))
 
         if len(row) == 2:
             buttons.append(row)
@@ -756,29 +778,35 @@ def get_actions_menu_keyboard(current_action):
     return buttons
 
 def get_date_menu_keyboard(user):
-    enabled_status = "✅ فعال" if user.get("date_enabled") else "❌ غیرفعال"
+    enabled_status = status_icon(user.get("date_enabled"))
     current_type = user.get("date_type", "shamsi")
-    current_font = FONT_NAMES.get(user.get("date_font", 1), "بولد")
 
     type_row = []
     for type_key, type_name in DATE_TYPE_NAMES.items():
-        display = f"✅ {type_name}" if type_key == current_type else f"▫️ {type_name}"
-        type_row.append(Button.inline(display, f"setdatetype_{type_key}".encode()))
+        mark = status_icon(type_key == current_type)
+        type_row.append(Button.inline(f"{mark} {type_name}", f"setdatetype_{type_key}".encode()))
 
     return [
-        [Button.inline(f"نمایش تاریخ در بیو: {enabled_status}", b"toggle_date_enabled")],
+        [Button.inline(f"تاریخ بیو ({enabled_status})", b"toggle_date_enabled")],
         type_row,
-        [Button.inline(f"🔤 تغییر فونت تاریخ: {current_font}", b"menu_date_fonts")],
+        [Button.inline("فونت تاریخ", b"menu_date_fonts")],
         [Button.inline("🔙 بازگشت", b"back_to_main")]
     ]
+
+def get_date_menu_text(user):
+    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"))
+    return (
+        "📅 **تنظیمات تاریخ**\n\n"
+        f"{preview}"
+    )
 
 def get_date_fonts_menu_keyboard(current_font_id):
     buttons = []
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        display = f"✅ {font_name}" if font_id == current_font_id else f"▫️ {font_name}"
-        row.append(Button.inline(display, f"setdatefont_{font_id}".encode()))
+        mark = status_icon(font_id == current_font_id)
+        row.append(Button.inline(f"{mark} {font_name}", f"setdatefont_{font_id}".encode()))
 
         if len(row) == 2:
             buttons.append(row)
@@ -790,13 +818,22 @@ def get_date_fonts_menu_keyboard(current_font_id):
     buttons.append([Button.inline("🔙 بازگشت به تاریخ", b"menu_date")])
     return buttons
 
+def get_date_fonts_menu_text(user):
+    font_name = FONT_NAMES.get(user.get("date_font", 1), "بولد")
+    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"))
+    return (
+        "🔤 **انتخاب فونت تاریخ**\n\n"
+        f"فونت تاریخ: {font_name}\n\n"
+        f"{preview}"
+    )
+
 def get_textmode_menu_keyboard(current_mode):
     buttons = []
     row = []
 
     for mode_id, mode_name in TEXTMODE_NAMES.items():
-        display = f"☑️ {mode_name}" if mode_id == current_mode else f"▫️ {mode_name}"
-        row.append(Button.inline(display, f"settextmode_{mode_id}".encode()))
+        mark = status_icon(mode_id == current_mode)
+        row.append(Button.inline(f"{mark} {mode_name}", f"settextmode_{mode_id}".encode()))
 
         if len(row) == 2:
             buttons.append(row)
@@ -812,8 +849,8 @@ def get_tag_menu_text():
     return (
         "🏷️ **قابلیت تگ**\n\n"
         "این قابلیت با ارسال یکی از دستورات زیر (توسط خودتان) داخل هر گروه فعال می‌شود:\n\n"
-        "▫️ `.تگ_ادمین` — منشن تمام ادمین‌های همان گروه.\n"
-        "▫️ `.تگ_اعضا` — منشن تمام اعضای همان گروه.\n\n"
+        "▫️ `.تگ ادمین` — منشن تمام ادمین‌های همان گروه.\n"
+        "▫️ `.تگ اعضا` — منشن تمام اعضای همان گروه.\n\n"
         "نکات:\n"
         "▫️ فقط داخل گروه/سوپرگروه کار می‌کند و در چت خصوصی غیرفعال است.\n"
         "▫️ اگر دستور را روی پیامی ریپلای کنید، خروجی هم روی همان پیام ریپلای می‌شود.\n"
@@ -824,11 +861,11 @@ def get_tag_menu_keyboard():
     return [[Button.inline("🔙 بازگشت", b"back_to_main")]]
 
 def get_secretary_menu_text(user):
-    status = "🟢 فعال" if user.get("secretary_enabled") else "🔴 غیرفعال"
+    status = status_icon(user.get("secretary_enabled"))
     delay = user.get("secretary_delay", 60)
     text_preview = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
     return (
-        "🧑‍💼 **منشی**\n\n"
+        "🧑‍💼 **منشی پیوی**\n\n"
         f"وضعیت: {status}\n"
         f"⏱️ تأخیر پاسخ: {delay} ثانیه\n"
         f"📝 متن فعلی:\n{text_preview}\n\n"
@@ -841,8 +878,8 @@ def get_secretary_menu_keyboard(user):
     delay = user.get("secretary_delay", 60)
     return [
         [
-            Button.inline("☑️ روشن" if on else "▫️ روشن", b"secretary_on"),
-            Button.inline("▫️ خاموش" if on else "☑️ خاموش", b"secretary_off"),
+            Button.inline(f"روشن ({status_icon(on)})", b"secretary_on"),
+            Button.inline(f"خاموش ({status_icon(not on)})", b"secretary_off"),
         ],
         [Button.inline("📝 تنظیم متن", b"secretary_set_text")],
         [Button.inline(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time")],
@@ -930,9 +967,9 @@ def get_users_list_page(page=0, per_page=10):
 
         buttons = []
         for user in users:
-            status_icon = "🟢" if user[1] else "🔴"
+            mark = status_icon(user[1])
             buttons.append([Button.inline(
-                f"{status_icon} کاربر {user[0]}",
+                f"{mark} کاربر {user[0]}",
                 f"admin_view_user_{user[0]}".encode()
             )])
 
@@ -1001,8 +1038,8 @@ async def _gather_chat_admins(event):
 
     return admins
 
-async def _send_mentions(event, users_list, header, user_id):
-    """ساخت و ارسال پیام‌های منشن‌دار به‌صورت تکه‌تکه (رعایت محدودیت تلگرام + مدیریت FloodWait)."""
+async def _send_mentions(event, users_list, user_id):
+    """ساخت و ارسال پیام‌های منشن‌دار به‌صورت تکه‌تکه (فقط منشن، بدون هیچ متن اضافه) + مدیریت FloodWait."""
     if not users_list:
         return
 
@@ -1011,9 +1048,9 @@ async def _send_mentions(event, users_list, header, user_id):
 
     for i in range(0, len(users_list), chunk_size):
         chunk = users_list[i:i + chunk_size]
-        body = (header + "\n") if i == 0 else ""
+        body = ""
         entities = []
-        cursor = len(helpers.add_surrogate(body))
+        cursor = 0
 
         for u in chunk:
             name = (u.first_name or "کاربر").strip() or "کاربر"
@@ -1029,22 +1066,16 @@ async def _send_mentions(event, users_list, header, user_id):
             body += mention_text
             cursor += len(surrogated_piece)
 
-        for attempt in range(3):
-            try:
-                sent = await event.client.send_message(
-                    event.chat_id, body, formatting_entities=entities,
-                    reply_to=reply_to if i == 0 else None
-                )
-                _mark_auto_sent(user_id, sent.chat_id, sent.id)
-                break
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
-            except RPCError as e:
-                logging.error(f"⚠️ خطا در ارسال پیام تگ: {e}")
-                break
-            except Exception as e:
-                logging.error(f"⚠️ خطای غیرمنتظره در ارسال تگ: {e}")
-                break
+        try:
+            sent = await safe_call(
+                event.client.send_message, event.chat_id, body,
+                formatting_entities=entities, reply_to=reply_to if i == 0 else None
+            )
+            _mark_auto_sent(user_id, sent.chat_id, sent.id)
+        except RPCError as e:
+            logging.error(f"⚠️ خطا در ارسال پیام تگ: {e}")
+        except Exception as e:
+            logging.error(f"⚠️ خطای غیرمنتظره در ارسال تگ: {e}")
 
         await asyncio.sleep(1.5)
 
@@ -1054,7 +1085,7 @@ async def handle_tag_admins(event, user_id):
         if not admins:
             await event.reply("❌ ادمینی برای منشن پیدا نشد یا دسترسی کافی برای دریافت لیست ادمین‌ها وجود ندارد.")
             return
-        await _send_mentions(event, admins, "🔔 **تگ ادمین‌ها:**", user_id)
+        await _send_mentions(event, admins, user_id)
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -1077,7 +1108,7 @@ async def handle_tag_members(event, user_id):
             await event.reply("❌ عضوی برای منشن پیدا نشد.")
             return
 
-        await _send_mentions(event, members, "🔔 **تگ اعضا:**", user_id)
+        await _send_mentions(event, members, user_id)
     except Exception as e:
         logging.error(f"⚠️ خطا در تگ اعضا (کاربر {user_id}): {e}")
 
@@ -1438,12 +1469,10 @@ async def start_handler(event):
 
     if user["session"] is None:
         buttons = [
-            [Button.inline("📱 ثبت خودکار با شماره", b"start_gen_fast")],
-            [Button.inline("✍️ ثبت با سشن آماده", b"send_ready_session")]
+            [Button.inline("🚀 نصب Nova Self", b"start_gen_fast")]
         ]
         await event.respond(
-            "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**\n\n"
-            "لطفاً یکی از روش‌های زیر را برای اتصال حساب خود انتخاب کنید:",
+            "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**",
             buttons=buttons
         )
     else:
@@ -1475,6 +1504,10 @@ async def callback_handler(event):
 
     if data == b"void":
         await event.answer()
+        return
+
+    if not click_debouncer.should_process(user_id, data):
+        await event.answer()  # کلیک تکراری/سریع؛ بی‌صدا نادیده گرفته می‌شود
         return
 
     # ====== منوی ادمین ======
@@ -1528,17 +1561,17 @@ async def callback_handler(event):
             if target_id in user_data:
                 user = user_data[target_id]
 
-                status_text = "🟢 فعال" if user["status"] else "🔴 غیرفعال"
+                status_text = status_icon(user["status"])
                 font_name = FONT_NAMES.get(user["font_id"], "نامشخص")
                 action_name = ACTIONS.get(user["active_action"], ("هیچ",))[0] if user["active_action"] != "none" else "هیچ"
                 date_text = (
-                    f"✅ {DATE_TYPE_NAMES.get(user.get('date_type', 'shamsi'), '؟')}"
-                    if user.get("date_enabled") else "❌ غیرفعال"
+                    f"{status_icon(True)} {DATE_TYPE_NAMES.get(user.get('date_type', 'shamsi'), '؟')}"
+                    if user.get("date_enabled") else status_icon(False)
                 )
                 textmode_text = TEXTMODE_NAMES.get(user.get("text_mode", 0), "خاموش") if user.get("text_mode") else "خاموش"
                 secretary_text = (
-                    f"✅ فعال ({user.get('secretary_delay', 60)} ثانیه)"
-                    if user.get("secretary_enabled") else "❌ غیرفعال"
+                    f"{status_icon(True)} ({user.get('secretary_delay', 60)} ثانیه)"
+                    if user.get("secretary_enabled") else status_icon(False)
                 )
                 username_display = f"@{user.get('username')}" if user.get("username") else "ثبت نشده"
 
@@ -1550,11 +1583,11 @@ async def callback_handler(event):
                     f"💎 موجودی الماس: {format_diamonds(user.get('diamonds', 0))} ({format_toman(user.get('diamonds', 0))} تومان)\n"
                     f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
                     f"🔤 فونت: {font_name}\n"
-                    f"⌚ نمایش در نام: {'✅' if user['name_time'] else '❌'}\n"
-                    f"⌚ نمایش در بیو: {'✅' if user['bio_time'] else '❌'}\n"
+                    f"⌚ ساعت نام: {status_icon(user['name_time'])}\n"
+                    f"⌚ ساعت بیو: {status_icon(user['bio_time'])}\n"
                     f"📅 تاریخ: {date_text}\n"
                     f"🖊️ حالت متن: {textmode_text}\n"
-                    f"🧑‍💼 منشی: {secretary_text}\n"
+                    f"🧑‍💼 منشی پیوی: {secretary_text}\n"
                     f"🎭 اکشن: {action_name}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
@@ -1592,7 +1625,7 @@ async def callback_handler(event):
                 await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
                     f"🆔 شناسه: `{target_id}`\n"
-                    f"📊 وضعیت جدید: {'🟢 فعال' if user['status'] else '🔴 غیرفعال'}",
+                    f"📊 وضعیت جدید: {status_icon(user['status'])}",
                     buttons=get_user_detail_buttons(target_id)
                 )
             return
@@ -1718,13 +1751,6 @@ async def callback_handler(event):
             return
 
     # ====== منوی کاربر ======
-    if data == b"send_ready_session":
-        user_data[user_id]["step"] = "get_session"
-        await safe_edit(event,
-            "✍️ **ارسال سشن آماده**\n\n"
-            "لطفاً کد نشست (Session String) خود را که از Telethon دریافت کرده‌اید، ارسال کنید:"
-        )
-        return
 
     if data == b"start_gen_fast":
         generator_data[user_id] = {
@@ -1789,16 +1815,14 @@ async def callback_handler(event):
 
     if data == b"menu_time":
         await safe_edit(event,
-            "⌚ **تنظیمات ساعت**\n\n"
-            "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
+            get_time_menu_text(user),
             buttons=get_time_menu_keyboard(user)
         )
         return
 
     if data == b"menu_fonts":
         await safe_edit(event,
-            "🔤 **انتخاب فونت ساعت**\n\n"
-            "لطفاً یکی از فونت‌های زیر را برای نمایش ساعت انتخاب کنید:",
+            get_fonts_menu_text(user),
             buttons=get_fonts_menu_keyboard(user["font_id"])
         )
         return
@@ -1813,8 +1837,7 @@ async def callback_handler(event):
 
     if data == b"menu_date":
         await safe_edit(event,
-            "📅 **تنظیمات تاریخ**\n\n"
-            "در این بخش می‌توانید نمایش تاریخ در بیو را مدیریت کنید:",
+            get_date_menu_text(user),
             buttons=get_date_menu_keyboard(user)
         )
         return
@@ -1822,9 +1845,9 @@ async def callback_handler(event):
     if data == b"toggle_date_enabled":
         user["date_enabled"] = not user.get("date_enabled", False)
         save_user(user_id, user)
+        log_settings_change(user_id, "date_enabled", user["date_enabled"])
         await safe_edit(event,
-            "📅 **تنظیمات تاریخ**\n\n"
-            "در این بخش می‌توانید نمایش تاریخ در بیو را مدیریت کنید:",
+            get_date_menu_text(user),
             buttons=get_date_menu_keyboard(user)
         )
         return
@@ -1834,17 +1857,16 @@ async def callback_handler(event):
         if date_type in DATE_TYPE_NAMES:
             user["date_type"] = date_type
             save_user(user_id, user)
+            log_settings_change(user_id, "date_type", date_type)
         await safe_edit(event,
-            "📅 **تنظیمات تاریخ**\n\n"
-            f"✅ نوع تاریخ روی «{DATE_TYPE_NAMES.get(user.get('date_type'), '؟')}» تنظیم شد.",
+            get_date_menu_text(user),
             buttons=get_date_menu_keyboard(user)
         )
         return
 
     if data == b"menu_date_fonts":
         await safe_edit(event,
-            "🔤 **انتخاب فونت تاریخ**\n\n"
-            "لطفاً یکی از فونت‌های زیر را برای نمایش تاریخ انتخاب کنید:",
+            get_date_fonts_menu_text(user),
             buttons=get_date_fonts_menu_keyboard(user.get("date_font", 1))
         )
         return
@@ -1853,9 +1875,9 @@ async def callback_handler(event):
         font_id = int(data.decode().split("_")[1])
         user["date_font"] = font_id
         save_user(user_id, user)
+        log_settings_change(user_id, "date_font", font_id)
         await safe_edit(event,
-            "🔤 **انتخاب فونت تاریخ**\n\n"
-            f"✅ فونت «{FONT_NAMES[font_id]}» با موفقیت انتخاب شد.",
+            get_date_fonts_menu_text(user),
             buttons=get_date_fonts_menu_keyboard(font_id)
         )
         return
@@ -1887,10 +1909,10 @@ async def callback_handler(event):
         font_id = int(data.decode().split("_")[1])
         user["font_id"] = font_id
         save_user(user_id, user)
+        log_settings_change(user_id, "font_id", font_id)
 
         await safe_edit(event,
-            "🔤 **انتخاب فونت ساعت**\n\n"
-            f"✅ فونت «{FONT_NAMES[font_id]}» با موفقیت انتخاب شد.",
+            get_fonts_menu_text(user),
             buttons=get_fonts_menu_keyboard(font_id)
         )
         return
@@ -1931,6 +1953,7 @@ async def callback_handler(event):
             await stop_self_client(user_id)
 
         save_user(user_id, user)
+        log_self_toggle(user_id, user["status"])
 
         await safe_edit(event,
             "🔗 **پنل مدیریت NovaSelf**\n"
@@ -1942,10 +1965,10 @@ async def callback_handler(event):
     if data == b"toggle_name_time":
         user["name_time"] = not user["name_time"]
         save_user(user_id, user)
+        log_settings_change(user_id, "name_time", user["name_time"])
 
         await safe_edit(event,
-            "⌚ **تنظیمات ساعت**\n\n"
-            "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
+            get_time_menu_text(user),
             buttons=get_time_menu_keyboard(user)
         )
         return
@@ -1953,10 +1976,10 @@ async def callback_handler(event):
     if data == b"toggle_bio_time":
         user["bio_time"] = not user["bio_time"]
         save_user(user_id, user)
+        log_settings_change(user_id, "bio_time", user["bio_time"])
 
         await safe_edit(event,
-            "⌚ **تنظیمات ساعت**\n\n"
-            "در این بخش می‌توانید نحوه نمایش زمان در پروفایل خود را تنظیم کنید:",
+            get_time_menu_text(user),
             buttons=get_time_menu_keyboard(user)
         )
         return
@@ -2031,13 +2054,30 @@ async def callback_handler(event):
 
             transfer_data.pop(user_id, None)
             user["step"] = "managed"
+            log_diamond_transfer(user_id, target_id, amount)
 
+            when = datetime.now()
+            sender_username = user.get("username")
+            sender_label = f"@{sender_username}" if sender_username else f"`{user_id}`"
+            receiver_user = user_data.get(target_id, {})
+            receiver_username = receiver_user.get("username")
+            receiver_label = f"@{receiver_username}" if receiver_username else f"`{target_id}`"
+            amount_str = format_diamonds(amount)
+
+            # --- رسید فرستنده (روی همین پیام) ---
             await safe_edit(event,
-                "✅ **انتقال با موفقیت انجام شد.**\n\n"
-                f"💎 مقدار انتقالی: {format_diamonds(amount)}\n"
-                f"💰 موجودی جدید شما: {format_diamonds(sender_balance)}",
+                build_sender_receipt(receiver_label, amount_str, format_diamonds(sender_balance), when),
                 buttons=[[Button.inline("🔙 بازگشت به حساب کاربری", b"menu_account")]]
             )
+
+            # --- رسید گیرنده (پیام جداگانه به خودش، اگر قبلاً با ربات استارت زده باشد) ---
+            try:
+                await safe_call(
+                    bot.send_message, target_id,
+                    build_receiver_receipt(sender_label, amount_str, format_diamonds(receiver_balance), when)
+                )
+            except Exception as e:
+                log_internal_error("receiver_receipt_send", e)
         else:
             await safe_edit(event,
                 f"{message}",
@@ -2058,12 +2098,14 @@ async def callback_handler(event):
     if data == b"secretary_on":
         user["secretary_enabled"] = True
         save_user(user_id, user)
+        log_settings_change(user_id, "secretary_enabled", True)
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
     if data == b"secretary_off":
         user["secretary_enabled"] = False
         save_user(user_id, user)
+        log_settings_change(user_id, "secretary_enabled", False)
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
@@ -2456,41 +2498,8 @@ async def message_handler(event):
         return
 
     if user_id in user_data and user_data[user_id].get("step") == "get_session":
-        clean_session = text.replace("\n", "").replace("\r", "").replace(" ", "")
-
-        try:
-            client = TelegramClient(StringSession(clean_session), API_ID, API_HASH)
-            await client.connect()
-
-            if not await client.is_user_authorized():
-                await event.respond(
-                    "❌ **سشن نامعتبر است!**\n\n"
-                    "سشن ارسال شده منقضی شده یا معتبر نیست.\n"
-                    "لطفاً مجدداً تلاش کنید."
-                )
-                await client.disconnect()
-                return
-        except Exception as e:
-            await event.respond(
-                f"❌ **خطا در سشن:**\n\n`{str(e)}`\n\n"
-                "مطمئن شوید که سشن Telethon معتبر ارسال کرده‌اید."
-            )
-            return
-
-        user_data[user_id] = make_default_user(session=clean_session, status=True, step="managed")
-        save_user(user_id, user_data[user_id])
-        register_active_client(user_id, client)
-
-        await event.respond(
-            "✅ **سشن با موفقیت ثبت شد!**\n\n"
-            "سلف شما هم‌اکنون فعال است و اطلاعات در دیتابیس ابری ذخیره شد."
-        )
-
-        await event.respond(
-            "🔗 **پنل مدیریت NovaSelf**\n"
-            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user_data[user_id])
-        )
+        # روش قدیمی «ثبت با سشن آماده» به‌طور کامل حذف شده است.
+        return
 
 # ======================== هندلر دکمه‌های تایید ارسال پیام ========================
 @bot.on(events.CallbackQuery)
@@ -2587,4 +2596,3 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
-
