@@ -27,6 +27,7 @@ from nova_utils import (
     status_icon, toggle_label, build_clock_preview, build_date_preview,
     build_sender_receipt, build_receiver_receipt, ClickDebouncer, safe_call,
     log_diamond_transfer, log_self_toggle, log_settings_change, log_internal_error,
+    styled_button, toggle_button, STYLE_ON, STYLE_OFF, STYLE_INFO,
 )
 
 # ======================== تنظیمات اولیه ========================
@@ -186,6 +187,28 @@ def init_db():
                 action TEXT,
                 details TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_gift_codes (
+                code TEXT PRIMARY KEY,
+                diamonds DOUBLE PRECISION NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                expires_at TIMESTAMP,
+                created_by BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_gift_code_uses (
+                code TEXT REFERENCES novaself_gift_codes(code) ON DELETE CASCADE,
+                user_id BIGINT,
+                used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (code, user_id)
             )
         ''')
         conn.commit()
@@ -481,6 +504,118 @@ def transfer_diamonds_db(sender_id, receiver_id, amount):
         except Exception:
             pass
 
+def create_gift_code_db(code, diamonds, expires_at, created_by):
+    """ساخت یک کد هدیه‌ی جدید توسط ادمین. خروجی: (success, error_message یا None)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_gift_codes (code, diamonds, is_active, expires_at, created_by) "
+            "VALUES (%s, %s, 1, %s, %s)",
+            (code, diamonds, expires_at, created_by)
+        )
+        conn.commit()
+        return True, None
+    except psycopg2.errors.UniqueViolation:
+        if conn:
+            conn.rollback()
+        return False, "این کد از قبل وجود دارد."
+    except Exception as e:
+        logging.error(f"❌ خطا در ساخت کد هدیه {code}: {e}")
+        if conn:
+            conn.rollback()
+        return False, "خطای دیتابیس رخ داد."
+    finally:
+        if conn:
+            conn.close()
+
+def set_gift_code_active_db(code, is_active):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_gift_codes SET is_active = %s WHERE code = %s", (int(is_active), code))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر وضعیت کد هدیه {code}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def list_gift_codes_db(limit=20):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(
+            "SELECT code, diamonds, is_active, expires_at, created_at FROM novaself_gift_codes "
+            "ORDER BY created_at DESC LIMIT %s", (limit,)
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت لیست کدهای هدیه: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def redeem_gift_code_db(code, user_id):
+    """
+    اعتبارسنجی و مصرف اتمیک کد هدیه برای یک کاربر.
+    خروجی: (success: bool, message: str, new_balance یا None)
+    شرط‌ها: وجود کد، فعال بودن، منقضی نشدن، و عدم استفاده‌ی قبلی همین کاربر
+    (با قفل ردیف کد + کلید یکتای (code, user_id) در جدول مصرف، برای جلوگیری از Race Condition).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+
+        cursor.execute("SELECT * FROM novaself_gift_codes WHERE code = %s FOR UPDATE", (code,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, "❌ چنین کدی وجود ندارد.", None
+        if not row["is_active"]:
+            conn.rollback()
+            return False, "❌ این کد غیرفعال شده است.", None
+        if row["expires_at"] and row["expires_at"] < datetime.now():
+            conn.rollback()
+            return False, "❌ این کد منقضی شده است.", None
+
+        try:
+            cursor.execute(
+                "INSERT INTO novaself_gift_code_uses (code, user_id) VALUES (%s, %s)",
+                (code, user_id)
+            )
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            return False, "❌ شما قبلاً از این کد استفاده کرده‌اید.", None
+
+        cursor.execute("SELECT diamonds FROM novaself_users WHERE user_id = %s FOR UPDATE", (user_id,))
+        user_row = cursor.fetchone()
+        if not user_row:
+            conn.rollback()
+            return False, "❌ حساب کاربری شما پیدا نشد.", None
+
+        new_balance = float(user_row["diamonds"] or 0) + float(row["diamonds"])
+        cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_balance, user_id))
+        conn.commit()
+        return True, f"✅ کد هدیه با موفقیت اعمال شد! {format_diamonds(row['diamonds'])} الماس به حساب شما اضافه شد.", new_balance
+    except Exception as e:
+        logging.error(f"❌ خطا در مصرف کد هدیه {code} برای کاربر {user_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False, "❌ خطای دیتابیس رخ داد.", None
+    finally:
+        if conn:
+            conn.close()
+
 def admin_adjust_diamonds_db(target_id, amount):
     """
     افزایش/کاهش دستی موجودی الماس توسط ادمین (amount می‌تواند منفی باشد).
@@ -696,31 +831,28 @@ async def safe_edit(event, text, buttons=None):
 
 # ======================== منوهای کاربر ========================
 def get_main_menu_keyboard(user):
-    status_text = status_icon(user["status"])
     expiry_text = format_expiry(user.get("diamonds", 0))
     return [
-        [Button.inline(f"وضعیت سلف ({status_text})  |  ⏳ {expiry_text}", b"toggle_status")],
+        [toggle_button(f"وضعیت سلف  |  ⏳ {expiry_text}", user["status"], b"toggle_status")],
+        [styled_button("👤 حساب کاربری", b"menu_account", style=STYLE_INFO)],
         [
-            Button.inline("📅 تاریخ", b"menu_date"),
-            Button.inline("🎭 اکشن", b"menu_actions"),
-            Button.inline("⌚ ساعت", b"menu_time"),
+            styled_button("📅 تاریخ", b"menu_date", style=STYLE_INFO),
+            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
+            styled_button("⌚ ساعت", b"menu_time", style=STYLE_INFO),
         ],
         [
-            Button.inline("🖊️ حالت متن", b"menu_textmode"),
-            Button.inline("🏷️ تگ", b"menu_tag"),
+            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
+            styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
         ],
-        [Button.inline("🧑‍💼 منشی پیوی", b"menu_secretary")],
-        [Button.inline("👤 حساب کاربری", b"menu_account")]
+        [styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO)],
     ]
 
 def get_time_menu_keyboard(user):
-    name_status = status_icon(user["name_time"])
-    bio_status = status_icon(user["bio_time"])
     return [
-        [Button.inline(f"ساعت نام ({name_status})", b"toggle_name_time")],
-        [Button.inline(f"ساعت بیو ({bio_status})", b"toggle_bio_time")],
-        [Button.inline("فونت ساعت", b"menu_fonts")],
-        [Button.inline("🔙 بازگشت", b"back_to_main")]
+        [toggle_button("ساعت نام", user["name_time"], b"toggle_name_time")],
+        [toggle_button("ساعت بیو", user["bio_time"], b"toggle_bio_time")],
+        [styled_button("فونت ساعت", b"menu_fonts", style=STYLE_INFO)],
+        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
     ]
 
 def get_time_menu_text(user):
@@ -746,8 +878,9 @@ def get_fonts_menu_keyboard(current_font_id):
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        mark = status_icon(font_id == current_font_id)
-        row.append(Button.inline(f"{mark} {font_name}", f"setfont_{font_id}".encode()))
+        selected = (font_id == current_font_id)
+        row.append(styled_button(f"{status_icon(selected)} {font_name}", f"setfont_{font_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
 
         if len(row) == 2:
             buttons.append(row)
@@ -756,7 +889,7 @@ def get_fonts_menu_keyboard(current_font_id):
     if row:
         buttons.append(row)
 
-    buttons.append([Button.inline("🔙 بازگشت به ساعت", b"menu_time")])
+    buttons.append([styled_button("🔙 بازگشت به ساعت", b"menu_time", style=STYLE_INFO)])
     return buttons
 
 def get_actions_menu_keyboard(current_action):
@@ -764,8 +897,9 @@ def get_actions_menu_keyboard(current_action):
     row = []
 
     for action_key, (action_name, _) in ACTIONS.items():
-        mark = status_icon(action_key == current_action)
-        row.append(Button.inline(f"{mark} {action_name}", f"setact_{action_key}".encode()))
+        selected = (action_key == current_action)
+        row.append(styled_button(f"{status_icon(selected)} {action_name}", f"setact_{action_key}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
 
         if len(row) == 2:
             buttons.append(row)
@@ -774,23 +908,23 @@ def get_actions_menu_keyboard(current_action):
     if row:
         buttons.append(row)
 
-    buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
+    buttons.append([styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)])
     return buttons
 
 def get_date_menu_keyboard(user):
-    enabled_status = status_icon(user.get("date_enabled"))
     current_type = user.get("date_type", "shamsi")
 
     type_row = []
     for type_key, type_name in DATE_TYPE_NAMES.items():
-        mark = status_icon(type_key == current_type)
-        type_row.append(Button.inline(f"{mark} {type_name}", f"setdatetype_{type_key}".encode()))
+        selected = (type_key == current_type)
+        type_row.append(styled_button(f"{status_icon(selected)} {type_name}", f"setdatetype_{type_key}".encode(),
+                                       style=STYLE_ON if selected else STYLE_OFF))
 
     return [
-        [Button.inline(f"تاریخ بیو ({enabled_status})", b"toggle_date_enabled")],
+        [toggle_button("تاریخ بیو", user.get("date_enabled"), b"toggle_date_enabled")],
         type_row,
-        [Button.inline("فونت تاریخ", b"menu_date_fonts")],
-        [Button.inline("🔙 بازگشت", b"back_to_main")]
+        [styled_button("فونت تاریخ", b"menu_date_fonts", style=STYLE_INFO)],
+        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
     ]
 
 def get_date_menu_text(user):
@@ -805,8 +939,9 @@ def get_date_fonts_menu_keyboard(current_font_id):
     row = []
 
     for font_id, font_name in FONT_NAMES.items():
-        mark = status_icon(font_id == current_font_id)
-        row.append(Button.inline(f"{mark} {font_name}", f"setdatefont_{font_id}".encode()))
+        selected = (font_id == current_font_id)
+        row.append(styled_button(f"{status_icon(selected)} {font_name}", f"setdatefont_{font_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
 
         if len(row) == 2:
             buttons.append(row)
@@ -815,7 +950,7 @@ def get_date_fonts_menu_keyboard(current_font_id):
     if row:
         buttons.append(row)
 
-    buttons.append([Button.inline("🔙 بازگشت به تاریخ", b"menu_date")])
+    buttons.append([styled_button("🔙 بازگشت به تاریخ", b"menu_date", style=STYLE_INFO)])
     return buttons
 
 def get_date_fonts_menu_text(user):
@@ -832,8 +967,9 @@ def get_textmode_menu_keyboard(current_mode):
     row = []
 
     for mode_id, mode_name in TEXTMODE_NAMES.items():
-        mark = status_icon(mode_id == current_mode)
-        row.append(Button.inline(f"{mark} {mode_name}", f"settextmode_{mode_id}".encode()))
+        selected = (mode_id == current_mode)
+        row.append(styled_button(f"{status_icon(selected)} {mode_name}", f"settextmode_{mode_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
 
         if len(row) == 2:
             buttons.append(row)
@@ -842,7 +978,7 @@ def get_textmode_menu_keyboard(current_mode):
     if row:
         buttons.append(row)
 
-    buttons.append([Button.inline("🔙 بازگشت", b"back_to_main")])
+    buttons.append([styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)])
     return buttons
 
 def get_tag_menu_text():
@@ -878,12 +1014,12 @@ def get_secretary_menu_keyboard(user):
     delay = user.get("secretary_delay", 60)
     return [
         [
-            Button.inline(f"روشن ({status_icon(on)})", b"secretary_on"),
-            Button.inline(f"خاموش ({status_icon(not on)})", b"secretary_off"),
+            styled_button(f"روشن ({status_icon(on)})", b"secretary_on", style=STYLE_ON if on else STYLE_OFF),
+            styled_button(f"خاموش ({status_icon(not on)})", b"secretary_off", style=STYLE_ON if not on else STYLE_OFF),
         ],
-        [Button.inline("📝 تنظیم متن", b"secretary_set_text")],
-        [Button.inline(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time")],
-        [Button.inline("🔙 بازگشت", b"back_to_main")]
+        [styled_button("📝 تنظیم متن", b"secretary_set_text", style=STYLE_INFO)],
+        [styled_button(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time", style=STYLE_INFO)],
+        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
     ]
 
 def get_account_text(user_id, user):
@@ -906,24 +1042,29 @@ def get_account_text(user_id, user):
 
 def get_account_keyboard():
     return [
-        [Button.inline("💎 خرید الماس", b"account_buy_diamond"), Button.inline("💸 انتقال الماس", b"account_transfer_start")],
-        [Button.inline("🗑 حذف حساب کاربری", b"account_delete_confirm")],
-        [Button.inline("🔙 بازگشت", b"back_to_main")]
+        [
+            styled_button("💎 خرید الماس", b"account_buy_diamond", style=STYLE_ON),
+            styled_button("💸 انتقال الماس", b"account_transfer_start", style=STYLE_INFO),
+        ],
+        [styled_button("🎁 کد هدیه", b"account_giftcode_start", style=STYLE_ON)],
+        [styled_button("🔄 بازیابی نشست", b"account_recover_session", style=STYLE_INFO)],
+        [styled_button("🗑 حذف حساب کاربری", b"account_delete_confirm", style=STYLE_OFF)],
+        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
     ]
 
 def get_account_delete_warning_keyboard():
     return [
-        [Button.inline("❌ لغو عملیات", b"menu_account")],
-        [Button.inline("✅ تایید و حذف حساب کاربری", b"account_delete_final")]
+        [styled_button("❌ لغو عملیات", b"menu_account", style=STYLE_INFO)],
+        [styled_button("✅ تایید و حذف حساب کاربری", b"account_delete_final", style=STYLE_OFF)]
     ]
 
 def get_transfer_cancel_keyboard():
-    return [[Button.inline("❌ لغو", b"transfer_cancel")]]
+    return [[styled_button("❌ لغو", b"transfer_cancel", style=STYLE_OFF)]]
 
 def get_transfer_confirm_keyboard():
     return [
-        [Button.inline("✅ تایید انتقال", b"transfer_confirm_execute")],
-        [Button.inline("❌ لغو", b"transfer_cancel")]
+        [styled_button("✅ تایید انتقال", b"transfer_confirm_execute", style=STYLE_ON)],
+        [styled_button("❌ لغو", b"transfer_cancel", style=STYLE_OFF)]
     ]
 
 def get_code_keyboard(current_code=""):
@@ -933,20 +1074,53 @@ def get_code_keyboard(current_code=""):
         [Button.inline("1", b"k_1"), Button.inline("2", b"k_2"), Button.inline("3", b"k_3")],
         [Button.inline("4", b"k_4"), Button.inline("5", b"k_5"), Button.inline("6", b"k_6")],
         [Button.inline("7", b"k_7"), Button.inline("8", b"k_8"), Button.inline("9", b"k_9")],
-        [Button.inline("❌ پاک کردن", b"k_clear"), Button.inline("0", b"k_0"), Button.inline("✅ تایید", b"k_submit")]
+        [
+            styled_button("❌ پاک کردن", b"k_clear", style=STYLE_OFF),
+            Button.inline("0", b"k_0"),
+            styled_button("✅ تایید", b"k_submit", style=STYLE_ON),
+        ]
     ]
 
 # ======================== منوهای ادمین ========================
 def get_admin_main_menu():
     total, active = get_user_stats()
     return [
-        [Button.inline(f"📊 آمار کاربران ({total} نفر)", b"admin_stats")],
-        [Button.inline("📋 لیست کاربران", b"admin_users_list")],
-        [Button.inline("📨 ارسال پیام همگانی", b"admin_broadcast")],
-        [Button.inline("🔍 جستجوی کاربر", b"admin_search_user")],
-        [Button.inline("📜 لاگ‌های مدیریتی اخیر", b"admin_logs")],
-        [Button.inline("🔄 بروزرسانی همه کاربران", b"admin_refresh_all")]
+        [styled_button(f"📊 آمار کاربران ({total} نفر)", b"admin_stats", style=STYLE_INFO)],
+        [styled_button("📋 لیست کاربران", b"admin_users_list", style=STYLE_INFO)],
+        [styled_button("📨 ارسال پیام همگانی", b"admin_broadcast", style=STYLE_INFO)],
+        [styled_button("🔍 جستجوی کاربر", b"admin_search_user", style=STYLE_INFO)],
+        [styled_button("🎁 مدیریت کدهای هدیه", b"admin_giftcodes", style=STYLE_INFO)],
+        [styled_button("📜 لاگ‌های مدیریتی اخیر", b"admin_logs", style=STYLE_INFO)],
+        [styled_button("🔄 بروزرسانی همه کاربران", b"admin_refresh_all", style=STYLE_INFO)]
     ]
+
+def get_giftcodes_admin_text():
+    codes = list_gift_codes_db()
+    if not codes:
+        return "🎁 **مدیریت کدهای هدیه**\n\nهنوز هیچ کدی ساخته نشده است."
+
+    lines = ["🎁 **مدیریت کدهای هدیه**\n"]
+    for c in codes:
+        state = status_icon(bool(c["is_active"]))
+        expiry = c["expires_at"].strftime("%Y-%m-%d") if c["expires_at"] else "بدون انقضا"
+        lines.append(f"`{c['code']}` — {format_diamonds(c['diamonds'])} 💎 — {state} — انقضا: {expiry}")
+    return "\n".join(lines)
+
+def get_giftcodes_admin_keyboard():
+    codes = list_gift_codes_db()
+    buttons = [[styled_button("➕ ساخت کد جدید", b"admin_giftcode_create", style=STYLE_ON)]]
+
+    for c in codes:
+        active = bool(c["is_active"])
+        toggle_data = f"admin_giftcode_toggle_{c['code']}".encode()
+        buttons.append([styled_button(
+            f"{c['code']} — {'غیرفعال‌سازی' if active else 'فعال‌سازی'}",
+            toggle_data,
+            style=STYLE_ON if active else STYLE_OFF
+        )])
+
+    buttons.append([styled_button("🔙 بازگشت به پنل ادمین", b"admin_panel", style=STYLE_INFO)])
+    return buttons
 
 def get_users_list_page(page=0, per_page=10):
     try:
@@ -989,16 +1163,36 @@ def get_users_list_page(page=0, per_page=10):
 
 def get_user_detail_buttons(user_id):
     return [
-        [Button.inline("🔄 تغییر وضعیت", f"admin_toggle_user_{user_id}".encode())],
+        [styled_button("🔄 تغییر وضعیت", f"admin_toggle_user_{user_id}".encode(), style=STYLE_INFO)],
         [
-            Button.inline("➕ افزایش الماس", f"admin_add_diamond_{user_id}".encode()),
-            Button.inline("➖ کاهش الماس", f"admin_sub_diamond_{user_id}".encode()),
+            styled_button("➕ افزایش الماس", f"admin_add_diamond_{user_id}".encode(), style=STYLE_ON),
+            styled_button("➖ کاهش الماس", f"admin_sub_diamond_{user_id}".encode(), style=STYLE_OFF),
         ],
-        [Button.inline("👥 تغییر تعداد رفرال", f"admin_set_referral_{user_id}".encode())],
-        [Button.inline("❌ حذف کاربر", f"admin_delete_user_{user_id}".encode())],
-        [Button.inline("📨 ارسال پیام به این کاربر", f"admin_send_to_user_{user_id}".encode())],
-        [Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
+        [styled_button("👥 تغییر تعداد رفرال", f"admin_set_referral_{user_id}".encode(), style=STYLE_INFO)],
+        [styled_button("⚙️ مدیریت قابلیت‌ها", f"admin_features_{user_id}".encode(), style=STYLE_INFO)],
+        [styled_button("❌ حذف کاربر", f"admin_delete_user_{user_id}".encode(), style=STYLE_OFF)],
+        [styled_button("📨 ارسال پیام به این کاربر", f"admin_send_to_user_{user_id}".encode(), style=STYLE_INFO)],
+        [styled_button("🔙 بازگشت به لیست", b"admin_users_list", style=STYLE_INFO)]
     ]
+
+# قابلیت‌های قابل مدیریت توسط ادمین برای هر کاربر: (کلید_در_دیتابیس، برچسب نمایشی)
+ADMIN_MANAGEABLE_FEATURES = [
+    ("name_time", "ساعت نام"),
+    ("bio_time", "ساعت بیو"),
+    ("date_enabled", "تاریخ بیو"),
+    ("secretary_enabled", "منشی پیوی"),
+]
+
+def get_user_features_text(user_id):
+    return f"⚙️ **مدیریت قابلیت‌های کاربر** `{user_id}`\n\nبا زدن هر دکمه، همان قابلیت روشن/خاموش می‌شود:"
+
+def get_user_features_keyboard(user_id, user):
+    buttons = []
+    for field, label in ADMIN_MANAGEABLE_FEATURES:
+        current = bool(user.get(field))
+        buttons.append([toggle_button(label, current, f"admin_togglefeat_{field}_{user_id}".encode())])
+    buttons.append([styled_button("🔙 بازگشت", f"admin_view_user_{user_id}".encode(), style=STYLE_INFO)])
+    return buttons
 
 # ======================== کمکی: پیام‌های خودکار (نباید توسط حالت متن دوباره ادیت شوند) ========================
 def _mark_auto_sent(user_id, chat_id, message_id):
@@ -1224,6 +1418,32 @@ def _cleanup_secretary_state(user_id):
                 t.cancel()
 
 # ======================== مدیریت چرخه حیات کلاینت سلف ========================
+async def _teardown_existing_client(user_id):
+    """
+    قبل از ساخت کلاینت جدید برای یک کاربر، اگر از قبل کلاینت/تسک‌های فعالی برایش
+    ثبت شده، اول آن‌ها را کامل و تمیز جمع می‌کند. بدون این کار، اگر یک کلاینت جدید
+    با همان Session ساخته و متصل شود درحالی‌که کلاینت قبلی هنوز زنده است، تلگرام
+    هر دو اتصال را به‌عنوان استفاده‌ی هم‌زمان از یک Session از دو IP تشخیص می‌دهد
+    و کل نشست را باطل می‌کند (دقیقاً همان چیزی که باعث Logout ناخواسته می‌شود).
+    """
+    old_client = active_clients.pop(user_id, None)
+    user = user_data.get(user_id)
+    current = asyncio.current_task()
+
+    if user:
+        for key in ("task", "action_task", "billing_task"):
+            t = user.get(key)
+            if t and t is not current and not t.done():
+                t.cancel()
+            user[key] = None
+
+    if old_client:
+        try:
+            if old_client.is_connected():
+                await old_client.disconnect()
+        except Exception as e:
+            log_internal_error("teardown_existing_client_disconnect", e)
+
 def register_active_client(user_id, client):
     """ثبت کلاینتِ از قبل متصل و احراز‌هویت‌شده (بدون اتصال مجدد)."""
     active_clients[user_id] = client
@@ -1237,9 +1457,12 @@ def register_active_client(user_id, client):
         user_data[user_id]["billing_task"] = loop.create_task(diamond_billing_worker(user_id, client))
 
 async def start_self_client(user_id, session_string):
-    """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن."""
+    """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن (بعد از جمع‌کردن ایمن کلاینت قبلی در صورت وجود)."""
     if not session_string:
         return None
+
+    await _teardown_existing_client(user_id)
+
     try:
         client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
@@ -1469,10 +1692,10 @@ async def start_handler(event):
 
     if user["session"] is None:
         buttons = [
-            [Button.inline("🚀 نصب Nova Self", b"start_gen_fast")]
+            [styled_button("✦ نصب نوا سلف", b"start_gen_fast", style=STYLE_ON)]
         ]
         await event.respond(
-            "🌟 **به ربات مدیریت NovaSelf خوش آمدید!**",
+            "• به ربات مدیریت اکانت نوا سلف خوش آمدید!",
             buttons=buttons
         )
     else:
@@ -1530,8 +1753,35 @@ async def callback_handler(event):
                 f"🟢 کاربران فعال: {active}\n"
                 f"🔴 کاربران غیرفعال: {total - active}\n\n"
                 f"🕐 آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
+                buttons=[styled_button("🔙 بازگشت", b"admin_panel", style=STYLE_INFO)]
             )
+            return
+
+        # مدیریت کدهای هدیه
+        if data == b"admin_giftcodes":
+            await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
+            return
+
+        if data == b"admin_giftcode_create":
+            admin_action_data[user_id] = {"type": "create_giftcode", "step": "get_code"}
+            await safe_edit(event,
+                "➕ **ساخت کد هدیه**\n\n"
+                "لطفاً یک کد دلخواه وارد کنید (فقط حروف/اعداد انگلیسی، بدون فاصله، حداکثر ۲۰ کاراکتر):",
+                buttons=[[styled_button("❌ لغو", b"admin_giftcodes", style=STYLE_OFF)]]
+            )
+            return
+
+        if data.startswith(b"admin_giftcode_toggle_"):
+            code = data.decode().split("admin_giftcode_toggle_", 1)[1]
+            codes = {c["code"]: c for c in list_gift_codes_db()}
+            current = codes.get(code)
+            if not current:
+                await event.answer("❌ کد پیدا نشد.", alert=True)
+                return
+            new_state = not bool(current["is_active"])
+            set_gift_code_active_db(code, new_state)
+            log_admin_action(user_id, 0, "toggle_giftcode", f"code={code} active={new_state}")
+            await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
             return
 
         # لیست کاربران
@@ -1598,7 +1848,39 @@ async def callback_handler(event):
             return
 
         # تغییر وضعیت کاربر توسط ادمین
-        if data.startswith(b"admin_toggle_user_"):
+        # مدیریت قابلیت‌های یک کاربر توسط ادمین (بند ۷)
+        if data.startswith(b"admin_features_"):
+            target_id = int(data.decode().split("admin_features_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event,
+                get_user_features_text(target_id),
+                buttons=get_user_features_keyboard(target_id, user_data[target_id])
+            )
+            return
+
+        if data.startswith(b"admin_togglefeat_"):
+            remainder = data.decode().split("admin_togglefeat_", 1)[1]
+            field, _, target_id_str = remainder.rpartition("_")
+            target_id = int(target_id_str)
+
+            if target_id not in user_data or field not in dict(ADMIN_MANAGEABLE_FEATURES):
+                await event.answer("❌ عملیات نامعتبر است.", alert=True)
+                return
+
+            target_user = user_data[target_id]
+            target_user[field] = not target_user.get(field)
+            save_user(target_id, target_user)
+            log_admin_action(user_id, target_id, "toggle_feature", f"{field}={target_user[field]}")
+
+            await safe_edit(event,
+                get_user_features_text(target_id),
+                buttons=get_user_features_keyboard(target_id, target_user)
+            )
+            return
+
+
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
                 user = user_data[target_id]
@@ -1757,11 +2039,29 @@ async def callback_handler(event):
             "step": "get_phone",
             "phone": None,
             "phone_code_hash": None,
-            "code_buffer": ""
+            "code_buffer": "",
+            "recovery": False
         }
         await safe_edit(event,
             "📞 **مرحله اول: وارد کردن شماره**\n\n"
             "لطفاً شماره تلفن خود را به همراه کد کشور وارد کنید.\n"
+            "مثال: `+989123456789`"
+        )
+        return
+
+    if data == b"account_recover_session":
+        generator_data[user_id] = {
+            "step": "get_phone",
+            "phone": None,
+            "phone_code_hash": None,
+            "code_buffer": "",
+            "recovery": True
+        }
+        await safe_edit(event,
+            "🔄 **بازیابی نشست**\n\n"
+            "موجودی، تنظیمات و رفرال شما دست‌نخورده باقی می‌ماند و فقط نشستِ اتصال حساب "
+            "دوباره ساخته می‌شود.\n\n"
+            "لطفاً شماره تلفن حساب خود را به همراه کد کشور وارد کنید.\n"
             "مثال: `+989123456789`"
         )
         return
@@ -2029,6 +2329,15 @@ async def callback_handler(event):
         )
         return
 
+    if data == b"account_giftcode_start":
+        user["step"] = "giftcode_get_code"
+        await safe_edit(event,
+            "🎁 **کد هدیه**\n\n"
+            "لطفاً کد هدیه‌ی خود را ارسال کنید:",
+            buttons=[[styled_button("❌ لغو", b"menu_account", style=STYLE_OFF)]]
+        )
+        return
+
     if data == b"transfer_cancel":
         transfer_data.pop(user_id, None)
         user["step"] = "managed"
@@ -2142,8 +2451,17 @@ async def process_code_signin(event, user_id, code):
         await client.sign_in(generator["phone"], code, phone_code_hash=generator["phone_code_hash"])
         session_string = client.session.save()
 
-        user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+        if generator.get("recovery") and user_id in user_data:
+            # بازیابی نشست: فقط Session و وضعیت آپدیت می‌شود، بقیه‌ی اطلاعات (الماس،
+            # تنظیمات، رفرال و ...) دست‌نخورده باقی می‌ماند.
+            user_data[user_id]["session"] = session_string
+            user_data[user_id]["status"] = True
+            user_data[user_id]["step"] = "managed"
+        else:
+            user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+
         save_user(user_id, user_data[user_id])
+        await _teardown_existing_client(user_id)
         register_active_client(user_id, client)
 
         await event.respond(
@@ -2189,7 +2507,7 @@ async def message_handler(event):
     # لغو عملیات
     _pending_steps = {
         "transfer_get_target", "transfer_get_amount", "transfer_confirm",
-        "secretary_get_text", "secretary_get_time"
+        "secretary_get_text", "secretary_get_time", "giftcode_get_code"
     }
     _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
 
@@ -2203,6 +2521,58 @@ async def message_handler(event):
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
         return
+
+    # ====== ساخت کد هدیه توسط ادمین (چندمرحله‌ای، قبل از هندلر عمومی عددی) ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "create_giftcode":
+        action = admin_action_data[user_id]
+        cancel_kb = [[styled_button("❌ لغو", b"admin_giftcodes", style=STYLE_OFF)]]
+
+        if action["step"] == "get_code":
+            code = text.strip()
+            if not code.isalnum() or not code.isascii() or len(code) > 20:
+                await event.respond("❌ کد باید فقط شامل حروف/اعداد انگلیسی و حداکثر ۲۰ کاراکتر باشد.", buttons=cancel_kb)
+                return
+            action["code"] = code.upper()
+            action["step"] = "get_diamonds"
+            await event.respond(f"✅ کد: `{action['code']}`\n\nحالا مقدار الماس این کد را وارد کنید:", buttons=cancel_kb)
+            return
+
+        if action["step"] == "get_diamonds":
+            try:
+                diamonds = float(text)
+                if diamonds <= 0:
+                    raise ValueError
+            except ValueError:
+                await event.respond("❌ لطفاً یک عدد معتبر و بزرگ‌تر از صفر ارسال کنید.", buttons=cancel_kb)
+                return
+            action["diamonds"] = diamonds
+            action["step"] = "get_expiry"
+            await event.respond("📅 چند روز دیگر این کد منقضی شود؟ (برای بدون انقضا عدد ۰ را ارسال کنید)", buttons=cancel_kb)
+            return
+
+        if action["step"] == "get_expiry":
+            try:
+                days = int(text)
+                if days < 0:
+                    raise ValueError
+            except ValueError:
+                await event.respond("❌ لطفاً یک عدد صحیح و غیرمنفی ارسال کنید.", buttons=cancel_kb)
+                return
+
+            expires_at = (datetime.now() + timedelta(days=days)) if days > 0 else None
+            success, error = create_gift_code_db(action["code"], action["diamonds"], expires_at, user_id)
+            del admin_action_data[user_id]
+
+            if not success:
+                await event.respond(f"❌ خطا در ساخت کد: {error}", buttons=get_giftcodes_admin_keyboard())
+                return
+
+            log_admin_action(user_id, 0, "create_giftcode", f"code={action['code']} diamonds={action['diamonds']}")
+            await event.respond(
+                f"✅ کد هدیه `{action['code']}` با موفقیت ساخته شد.",
+                buttons=get_giftcodes_admin_keyboard()
+            )
+            return
 
     # ====== پردازش عملیات مدیریتی الماس/رفرال ======
     if user_id in admin_action_data and is_admin(user_id):
@@ -2297,8 +2667,8 @@ async def message_handler(event):
                     f"---\n{text}\n---\n\n"
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
-                        [Button.inline("✅ بله، ارسال کن", b"broadcast_confirm")],
-                        [Button.inline("❌ لغو", b"broadcast_cancel")]
+                        [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
+                        [styled_button("❌ لغو", b"broadcast_cancel", style=STYLE_OFF)]
                     ]
                 )
             else:
@@ -2310,8 +2680,8 @@ async def message_handler(event):
                     f"---\n{text}\n---\n\n"
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
-                        [Button.inline("✅ بله، ارسال کن", b"broadcast_confirm")],
-                        [Button.inline("❌ لغو", b"broadcast_cancel")]
+                        [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
+                        [styled_button("❌ لغو", b"broadcast_cancel", style=STYLE_OFF)]
                     ]
                 )
             return
@@ -2363,8 +2733,15 @@ async def message_handler(event):
                 await client.sign_in(password=text)
                 session_string = client.session.save()
 
-                user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+                if generator.get("recovery") and user_id in user_data:
+                    user_data[user_id]["session"] = session_string
+                    user_data[user_id]["status"] = True
+                    user_data[user_id]["step"] = "managed"
+                else:
+                    user_data[user_id] = make_default_user(session=session_string, status=True, step="managed")
+
                 save_user(user_id, user_data[user_id])
+                await _teardown_existing_client(user_id)
                 register_active_client(user_id, client)
 
                 await event.respond(
@@ -2426,6 +2803,22 @@ async def message_handler(event):
         return
 
     # ====== انتقال الماس: مرحله اول (آیدی مقصد) ======
+    # ====== کد هدیه: دریافت و اعتبارسنجی کد از کاربر ======
+    if user_id in user_data and user_data[user_id].get("step") == "giftcode_get_code":
+        code = text.strip()
+        user_data[user_id]["step"] = "managed"
+
+        success, message, new_balance = redeem_gift_code_db(code, user_id)
+        if success and new_balance is not None:
+            user_data[user_id]["diamonds"] = new_balance
+            log_settings_change(user_id, "giftcode_redeemed", code)
+
+        await event.respond(
+            message,
+            buttons=[[styled_button("🔙 بازگشت به حساب کاربری", b"menu_account", style=STYLE_INFO)]]
+        )
+        return
+
     if user_id in user_data and user_data[user_id].get("step") == "transfer_get_target":
         try:
             target_id = int(text)
