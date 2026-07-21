@@ -16,6 +16,7 @@ nova_utils.py
   4) جلوگیری از پردازش کلیک‌های تکراری (Debounce)
   5) اجرای امن عملیات تلگرام با مدیریت خودکار FloodWait
   6) لاگ داخلی عملیات مهم (فایل جدا: nova_internal.log)
+  7) دکمه‌های شیشه‌ای رنگی (Bot API 9.4، با Fallback امن)
 ====================================================================
 """
 
@@ -25,9 +26,45 @@ import asyncio
 from datetime import datetime
 
 from telethon.errors import FloodWaitError
+from telethon.tl.custom import Button
 
-# ==================== ۱. آیکون یکپارچه‌ی وضعیت ====================
-ICON_ON = "✓"
+# ==================== ۷. دکمه‌ی شیشه‌ای رنگی (با Fallback) ====================
+# تلگرام از Bot API 9.4 (۹ فوریه ۲۰۲۶) فیلد style را به دکمه‌ها اضافه کرد که
+# فقط ۳ مقدار دارد: primary (آبی), success (سبز), danger (قرمز).
+# این ویژگی فقط روی نسخه‌های تازه‌ی Telethon (>=1.44.0) و کلاینت‌های تلگرامِ
+# بعد از فوریه ۲۰۲۶ نمایش داده می‌شود؛ روی بقیه، دکمه بدون رنگ (حالت عادی) دیده می‌شود.
+STYLE_ON = "success"    # سبز — برای وضعیت فعال/روشن
+STYLE_OFF = "danger"    # قرمز — برای وضعیت غیرفعال/خاموش
+STYLE_INFO = "primary"  # آبی — برای دکمه‌های اطلاعاتی/خنثی مثل «حساب کاربری»
+
+_style_supported = True  # اگر نسخه‌ی Telethon قدیمی باشد و اولین‌بار خطا بدهد، خودکار False می‌شود
+
+
+def styled_button(text: str, data: bytes, style: str = None):
+    """
+    معادل امنِ Button.inline که در صورت پشتیبانی، رنگ می‌گیرد.
+    اگر نسخه‌ی نصب‌شده‌ی Telethon از پارامتر style پشتیبانی نکند (کتابخانه‌ی
+    قدیمی‌تر)، خودش خاموش‌شان می‌کند و به‌جای کرش‌کردن، دکمه‌ی بدون رنگ برمی‌گرداند.
+    """
+    global _style_supported
+
+    if style and _style_supported:
+        try:
+            return Button.inline(text, data, style=style)
+        except TypeError:
+            _style_supported = False
+            logging.warning("⚠️ این نسخه از Telethon از دکمه‌های رنگی (style) پشتیبانی نمی‌کند؛ نسخه را به‌روزرسانی کنید.")
+
+    return Button.inline(text, data)
+
+
+def toggle_button(label: str, flag: bool, data: bytes):
+    """دکمه‌ی روشن/خاموش با آیکون یکپارچه و رنگ متناظر (سبز=فعال، قرمز=غیرفعال)."""
+    text = toggle_label(label, flag)
+    style = STYLE_ON if flag else STYLE_OFF
+    return styled_button(text, data, style=style)
+
+
 ICON_OFF = "✕"
 
 
