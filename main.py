@@ -2897,8 +2897,15 @@ async def message_handler(event):
 # ======================== هندلر دکمه‌های تایید ارسال پیام ========================
 @bot.on(events.CallbackQuery)
 async def broadcast_callback_handler(event):
-    user_id = event.sender_id
     data = event.data
+
+    # این هندلر فقط باید به دکمه‌های تایید/لغو ارسال همگانی واکنش نشان دهد؛
+    # بدون این فیلتر، روی هر کلیکی در کل ربات هم اجرا می‌شد و برای ادمین‌ها
+    # پیام «عملیات فعالی وجود ندارد» را حتی روی دکمه‌های بی‌ربط نشان می‌داد.
+    if data not in (b"broadcast_confirm", b"broadcast_cancel"):
+        return
+
+    user_id = event.sender_id
 
     if not is_admin(user_id):
         await event.answer("❌ شما دسترسی ادمین ندارید!", alert=True)
