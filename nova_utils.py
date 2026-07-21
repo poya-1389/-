@@ -65,6 +65,7 @@ def toggle_button(label: str, flag: bool, data: bytes):
     return styled_button(text, data, style=style)
 
 
+ICON_ON = "✓"
 ICON_OFF = "✕"
 
 
