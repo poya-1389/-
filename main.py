@@ -1859,10 +1859,22 @@ async def admin_handler(event):
 async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
+    panel_owner_id = None  # فقط وقتی پر می‌شود که این کلیک از یک پنل درون‌چتی آمده باشد
 
     if data == b"void":
         await event.answer()
         return
+
+    # safe_edit را همین‌جا (بدون قید و شرط) به یک بسته‌بندی محلی تبدیل می‌کنیم تا هر
+    # فراخوانی safe_edit در ادامه‌ی همین تابع، خودکار از این نسخه استفاده کند. وقتی
+    # panel_owner_id (پایین‌تر) پر بشود، این نسخه خودش دکمه‌ها را با پیشوند مالک و
+    # دکمه‌ی «✕ بستن پنل» بازسازی می‌کند؛ در غیر این صورت دقیقاً مثل قبل عمل می‌کند.
+    _module_safe_edit = safe_edit
+
+    async def safe_edit(ev, text, buttons=None):
+        if panel_owner_id is not None and buttons:
+            buttons = wrap_panel_buttons(buttons, panel_owner_id, add_close=True)
+        return await _module_safe_edit(ev, text, buttons=buttons)
 
     # ====== پنل درون‌چتی (بندهای ۸-۱۲): بازکردن پیشوند مالکیت + کنترل دسترسی ======
     if data.startswith(b"ip_"):
@@ -1878,11 +1890,12 @@ async def callback_handler(event):
             return
 
         if real_action == "panel_close":
-            await safe_edit(event, "✕ پنل بسته شد.", buttons=None)
+            await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
             return
 
         user_id = owner_id
         data = real_action.encode()
+        panel_owner_id = owner_id
 
     if not click_debouncer.should_process(user_id, data):
         await event.answer()  # کلیک تکراری/سریع؛ بی‌صدا نادیده گرفته می‌شود
