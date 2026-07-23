@@ -876,9 +876,10 @@ def get_main_menu_keyboard(user):
             styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
             styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
         ],
-        [styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO)],
-        [styled_button(toggle_label("🐱 میو", user.get("meow_enabled", False)), b"menu_meow",
-                        style=STYLE_ON if user.get("meow_enabled") else STYLE_OFF)],
+        [
+            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
+            styled_button("🐱 میو", b"menu_meow", style=STYLE_INFO),
+        ],
     ]
 
 def get_time_menu_keyboard(user):
