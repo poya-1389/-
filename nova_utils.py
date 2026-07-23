@@ -66,6 +66,24 @@ def toggle_button(label: str, flag: bool, data: bytes):
 
 
 # ==================== ۸. پنل درون‌چتی (Inline Mode) ====================
+def _style_obj_to_str(style_obj):
+    """
+    بعد از ساخته‌شدنِ یک دکمه، مقدار style روی خودِ شیء دیگر رشته‌ی ساده
+    ('success'/'danger'/'primary') نیست، بلکه یک شیء داخلی TL با فلگ‌های
+    bg_success/bg_danger/bg_primary است. این تابع همان مقدار را دوباره به
+    رشته‌ای که Button.inline قبول می‌کند برمی‌گرداند.
+    """
+    if style_obj is None:
+        return None
+    if getattr(style_obj, "bg_danger", False):
+        return "danger"
+    if getattr(style_obj, "bg_success", False):
+        return "success"
+    if getattr(style_obj, "bg_primary", False):
+        return "primary"
+    return None
+
+
 def wrap_panel_buttons(rows, owner_id, add_close=True):
     """
     یک صفحه‌کلید معمولیِ پنل خصوصی را برای استفاده در «پنل درون‌چتی» (که از طریق
@@ -81,7 +99,7 @@ def wrap_panel_buttons(rows, owner_id, add_close=True):
             data = getattr(btn, "data", None)
             if data:
                 new_data = f"ip_{owner_id}_".encode() + data
-                style = getattr(btn, "style", None)
+                style = _style_obj_to_str(getattr(btn, "style", None))
                 new_row.append(styled_button(btn.text, new_data, style=style))
             else:
                 new_row.append(btn)  # دکمه‌های URL و مشابه بدون تغییر باقی می‌مانند
