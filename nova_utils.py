@@ -65,6 +65,34 @@ def toggle_button(label: str, flag: bool, data: bytes):
     return styled_button(text, data, style=style)
 
 
+# ==================== ۸. پنل درون‌چتی (Inline Mode) ====================
+def wrap_panel_buttons(rows, owner_id, add_close=True):
+    """
+    یک صفحه‌کلید معمولیِ پنل خصوصی را برای استفاده در «پنل درون‌چتی» (که از طریق
+    Inline Mode ساخته می‌شود) آماده می‌کند: شناسه‌ی صاحبِ Self را جلوی callback_data
+    هر دکمه اضافه می‌کند تا در callback_handler بشود فهمید این کلیک برای چه کسی
+    مجاز است (بند ۱۰ - Permission)، و طبق درخواست یک دکمه‌ی «✕ بستن پنل» به انتهای
+    صفحه اضافه می‌کند (بند ۱۱).
+    """
+    wrapped = []
+    for row in rows:
+        new_row = []
+        for btn in row:
+            data = getattr(btn, "data", None)
+            if data:
+                new_data = f"ip_{owner_id}_".encode() + data
+                style = getattr(btn, "style", None)
+                new_row.append(styled_button(btn.text, new_data, style=style))
+            else:
+                new_row.append(btn)  # دکمه‌های URL و مشابه بدون تغییر باقی می‌مانند
+        wrapped.append(new_row)
+
+    if add_close:
+        wrapped.append([styled_button("✕ بستن پنل", f"ip_{owner_id}_panel_close".encode(), style=STYLE_OFF)])
+
+    return wrapped
+
+
 ICON_ON = "✓"
 ICON_OFF = "✕"
 
