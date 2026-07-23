@@ -27,7 +27,7 @@ from nova_utils import (
     status_icon, toggle_label, build_clock_preview, build_date_preview,
     build_sender_receipt, build_receiver_receipt, ClickDebouncer, safe_call,
     log_diamond_transfer, log_self_toggle, log_settings_change, log_internal_error,
-    styled_button, toggle_button, STYLE_ON, STYLE_OFF, STYLE_INFO,
+    styled_button, toggle_button, STYLE_ON, STYLE_OFF, STYLE_INFO, wrap_panel_buttons,
 )
 
 # ======================== تنظیمات اولیه ========================
@@ -56,6 +56,7 @@ SUPPORT_USERNAME = "@SayPouYa"
 
 # ======================== دیکشنری‌های عمومی ========================
 active_clients = {}
+BOT_USERNAME = None  # موقع اجرای برنامه از get_me() پر می‌شود (برای پنل درون‌چتی لازم است)
 generator_data = {}
 active_signins = {}
 user_data = {}
@@ -68,6 +69,7 @@ click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پر
 
 TAG_ADMIN_TRIGGERS = {".تگ ادمین", ".تگادمین", ".tagadmins"}
 TAG_MEMBERS_TRIGGERS = {".تگ اعضا", ".تگاعضا", ".tagall"}
+PANEL_TRIGGERS = {".پنل", ".panel"}
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -812,7 +814,16 @@ async def safe_edit(event, text, buttons=None):
     """
     ویرایش امن پیام + پاسخ فوری به Callback (برای جلوگیری از تأخیر/اسپینر روی دکمه‌ها).
     جلوگیری از کرش شدن هندلرها به‌خاطر خطای ویرایش پیام (مثل MessageNotModified).
+
+    اگر این کلیک از یک «پنل درون‌چتی» (ساخته‌شده با Inline Mode) آمده باشد،
+    دکمه‌های صفحه‌ی بعدی را هم خودکار با پیشوند مالکیت بازپیچی می‌کنیم تا
+    تمام مراحل ناوبری پنل، نه فقط صفحه‌ی اول، محدود به صاحب Self بماند (بند ۱۰).
     """
+    if buttons and getattr(event, "_is_inline_panel", False):
+        owner_id = getattr(event, "_panel_owner_id", None)
+        if owner_id:
+            buttons = wrap_panel_buttons(buttons, owner_id)
+
     try:
         await event.edit(text, buttons=buttons)
     except MessageNotModifiedError:
@@ -852,7 +863,7 @@ def get_time_menu_keyboard(user):
         [toggle_button("ساعت نام", user["name_time"], b"toggle_name_time")],
         [toggle_button("ساعت بیو", user["bio_time"], b"toggle_bio_time")],
         [styled_button("فونت ساعت", b"menu_fonts", style=STYLE_INFO)],
-        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
     ]
 
 def get_time_menu_text(user):
@@ -889,7 +900,7 @@ def get_fonts_menu_keyboard(current_font_id):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("🔙 بازگشت به ساعت", b"menu_time", style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"menu_time", style=STYLE_OFF)])
     return buttons
 
 def get_actions_menu_keyboard(current_action):
@@ -908,7 +919,7 @@ def get_actions_menu_keyboard(current_action):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)])
     return buttons
 
 def get_date_menu_keyboard(user):
@@ -924,7 +935,7 @@ def get_date_menu_keyboard(user):
         [toggle_button("تاریخ بیو", user.get("date_enabled"), b"toggle_date_enabled")],
         type_row,
         [styled_button("فونت تاریخ", b"menu_date_fonts", style=STYLE_INFO)],
-        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
     ]
 
 def get_date_menu_text(user):
@@ -950,7 +961,7 @@ def get_date_fonts_menu_keyboard(current_font_id):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("🔙 بازگشت به تاریخ", b"menu_date", style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"menu_date", style=STYLE_OFF)])
     return buttons
 
 def get_date_fonts_menu_text(user):
@@ -978,7 +989,7 @@ def get_textmode_menu_keyboard(current_mode):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)])
     return buttons
 
 def get_tag_menu_text():
@@ -994,7 +1005,7 @@ def get_tag_menu_text():
     )
 
 def get_tag_menu_keyboard():
-    return [[Button.inline("🔙 بازگشت", b"back_to_main")]]
+    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
 
 def get_secretary_menu_text(user):
     status = status_icon(user.get("secretary_enabled"))
@@ -1013,13 +1024,10 @@ def get_secretary_menu_keyboard(user):
     on = user.get("secretary_enabled", False)
     delay = user.get("secretary_delay", 60)
     return [
-        [
-            styled_button(f"روشن ({status_icon(on)})", b"secretary_on", style=STYLE_ON if on else STYLE_OFF),
-            styled_button(f"خاموش ({status_icon(not on)})", b"secretary_off", style=STYLE_ON if not on else STYLE_OFF),
-        ],
+        [toggle_button("منشی", on, b"secretary_toggle")],
         [styled_button("📝 تنظیم متن", b"secretary_set_text", style=STYLE_INFO)],
         [styled_button(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time", style=STYLE_INFO)],
-        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
     ]
 
 def get_account_text(user_id, user):
@@ -1044,27 +1052,27 @@ def get_account_keyboard():
     return [
         [
             styled_button("💎 خرید الماس", b"account_buy_diamond", style=STYLE_ON),
-            styled_button("💸 انتقال الماس", b"account_transfer_start", style=STYLE_INFO),
+            styled_button("💸 انتقال الماس", b"account_transfer_start", style=STYLE_ON),
         ],
         [styled_button("🎁 کد هدیه", b"account_giftcode_start", style=STYLE_ON)],
         [styled_button("🔄 بازیابی نشست", b"account_recover_session", style=STYLE_INFO)],
         [styled_button("🗑 حذف حساب کاربری", b"account_delete_confirm", style=STYLE_OFF)],
-        [styled_button("🔙 بازگشت", b"back_to_main", style=STYLE_INFO)]
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
     ]
 
 def get_account_delete_warning_keyboard():
     return [
-        [styled_button("❌ لغو عملیات", b"menu_account", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)],
         [styled_button("✅ تایید و حذف حساب کاربری", b"account_delete_final", style=STYLE_OFF)]
     ]
 
 def get_transfer_cancel_keyboard():
-    return [[styled_button("❌ لغو", b"transfer_cancel", style=STYLE_OFF)]]
+    return [[styled_button("➜ بازگشت", b"transfer_cancel", style=STYLE_OFF)]]
 
 def get_transfer_confirm_keyboard():
     return [
         [styled_button("✅ تایید انتقال", b"transfer_confirm_execute", style=STYLE_ON)],
-        [styled_button("❌ لغو", b"transfer_cancel", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"transfer_cancel", style=STYLE_OFF)]
     ]
 
 def get_code_keyboard(current_code=""):
@@ -1119,7 +1127,7 @@ def get_giftcodes_admin_keyboard():
             style=STYLE_ON if active else STYLE_OFF
         )])
 
-    buttons.append([styled_button("🔙 بازگشت به پنل ادمین", b"admin_panel", style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
     return buttons
 
 def get_users_list_page(page=0, per_page=10):
@@ -1141,25 +1149,26 @@ def get_users_list_page(page=0, per_page=10):
 
         buttons = []
         for user in users:
-            mark = status_icon(user[1])
-            buttons.append([Button.inline(
-                f"{mark} کاربر {user[0]}",
-                f"admin_view_user_{user[0]}".encode()
+            is_active = bool(user[1])
+            buttons.append([styled_button(
+                f"{status_icon(is_active)} کاربر {user[0]}",
+                f"admin_view_user_{user[0]}".encode(),
+                style=STYLE_ON if is_active else STYLE_OFF
             )])
 
         nav_buttons = []
         if page > 0:
-            nav_buttons.append(Button.inline("⬅️ قبلی", f"admin_users_page_{page-1}".encode()))
-        nav_buttons.append(Button.inline(f"📄 صفحه {page+1}", b"void"))
-        nav_buttons.append(Button.inline("➡️ بعدی", f"admin_users_page_{page+1}".encode()))
+            nav_buttons.append(styled_button("⬅️ قبلی", f"admin_users_page_{page-1}".encode(), style=STYLE_INFO))
+        nav_buttons.append(styled_button(f"📄 صفحه {page+1}", b"void", style=STYLE_INFO))
+        nav_buttons.append(styled_button("➡️ بعدی", f"admin_users_page_{page+1}".encode(), style=STYLE_INFO))
         buttons.append(nav_buttons)
 
-        buttons.append([Button.inline("🔙 بازگشت به پنل ادمین", b"admin_panel")])
+        buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
 
         return buttons
     except Exception as e:
         logging.error(f"❌ خطا در دریافت لیست کاربران: {e}")
-        return [[Button.inline("🔙 بازگشت", b"admin_panel")]]
+        return [[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]]
 
 def get_user_detail_buttons(user_id):
     return [
@@ -1172,7 +1181,7 @@ def get_user_detail_buttons(user_id):
         [styled_button("⚙️ مدیریت قابلیت‌ها", f"admin_features_{user_id}".encode(), style=STYLE_INFO)],
         [styled_button("❌ حذف کاربر", f"admin_delete_user_{user_id}".encode(), style=STYLE_OFF)],
         [styled_button("📨 ارسال پیام به این کاربر", f"admin_send_to_user_{user_id}".encode(), style=STYLE_INFO)],
-        [styled_button("🔙 بازگشت به لیست", b"admin_users_list", style=STYLE_INFO)]
+        [styled_button("➜ بازگشت", b"admin_users_list", style=STYLE_OFF)]
     ]
 
 # قابلیت‌های قابل مدیریت توسط ادمین برای هر کاربر: (کلید_در_دیتابیس، برچسب نمایشی)
@@ -1191,7 +1200,75 @@ def get_user_features_keyboard(user_id, user):
     for field, label in ADMIN_MANAGEABLE_FEATURES:
         current = bool(user.get(field))
         buttons.append([toggle_button(label, current, f"admin_togglefeat_{field}_{user_id}".encode())])
-    buttons.append([styled_button("🔙 بازگشت", f"admin_view_user_{user_id}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("🔤 فونت ساعت", f"admin_userfont_{user_id}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("🔤 فونت تاریخ", f"admin_userdatefont_{user_id}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("🖊️ حالت متن", f"admin_usertextmode_{user_id}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("🎭 اکشن‌ها", f"admin_useractions_{user_id}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", f"admin_view_user_{user_id}".encode(), style=STYLE_OFF)])
+    return buttons
+
+def get_admin_font_grid_keyboard(target_id, current_font_id):
+    buttons = []
+    row = []
+    for font_id, font_name in FONT_NAMES.items():
+        selected = (font_id == current_font_id)
+        row.append(styled_button(f"{status_icon(selected)} {font_name}",
+                                  f"admin_setfont_{target_id}_{font_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([styled_button("➜ بازگشت", f"admin_features_{target_id}".encode(), style=STYLE_OFF)])
+    return buttons
+
+def get_admin_datefont_grid_keyboard(target_id, current_font_id):
+    buttons = []
+    row = []
+    for font_id, font_name in FONT_NAMES.items():
+        selected = (font_id == current_font_id)
+        row.append(styled_button(f"{status_icon(selected)} {font_name}",
+                                  f"admin_setdatefont_{target_id}_{font_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([styled_button("➜ بازگشت", f"admin_features_{target_id}".encode(), style=STYLE_OFF)])
+    return buttons
+
+def get_admin_textmode_grid_keyboard(target_id, current_mode):
+    buttons = []
+    row = []
+    for mode_id, mode_name in TEXTMODE_NAMES.items():
+        selected = (mode_id == current_mode)
+        row.append(styled_button(f"{status_icon(selected)} {mode_name}",
+                                  f"admin_settextmode_{target_id}_{mode_id}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([styled_button("➜ بازگشت", f"admin_features_{target_id}".encode(), style=STYLE_OFF)])
+    return buttons
+
+def get_admin_actions_grid_keyboard(target_id, current_action):
+    buttons = []
+    row = []
+    for action_key, (action_name, _) in ACTIONS.items():
+        selected = (action_key == current_action)
+        row.append(styled_button(f"{status_icon(selected)} {action_name}",
+                                  f"admin_setaction_{target_id}_{action_key}".encode(),
+                                  style=STYLE_ON if selected else STYLE_OFF))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([styled_button("➜ بازگشت", f"admin_features_{target_id}".encode(), style=STYLE_OFF)])
     return buttons
 
 # ======================== کمکی: پیام‌های خودکار (نباید توسط حالت متن دوباره ادیت شوند) ========================
@@ -1307,6 +1384,30 @@ async def handle_tag_members(event, user_id):
         logging.error(f"⚠️ خطا در تگ اعضا (کاربر {user_id}): {e}")
 
 # ======================== هندلر یکپارچه پیام‌های خروجی (حالت متن + دستورات تگ) ========================
+async def handle_panel_command(event, user_id):
+    """
+    ساخت «پنل درون‌چتی» با استفاده از ترفند Inline Mode: چون اکانت سلف (کاربر عادی)
+    اجازه‌ی ضمیمه‌کردن دکمه به پیام‌های خودش را ندارد (محدودیت خودِ تلگرام)، به‌جایش
+    از طریق Inline Mode به بات NovaSelf کوئری می‌زنیم و نتیجه‌ی برگشتی (که واقعاً
+    از طرف بات و همراه با دکمه است) را در همین چت درج می‌کنیم.
+    """
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+    if not BOT_USERNAME:
+        return
+
+    try:
+        results = await event.client.inline_query(BOT_USERNAME, "")
+        if not results:
+            return
+        reply_to = event.reply_to_msg_id if event.is_reply else None
+        await results[0].click(event.chat_id, reply_to=reply_to)
+    except Exception as e:
+        logging.error(f"⚠️ خطا در ساخت پنل درون‌چتی برای کاربر {user_id}: {e}")
+
 def make_outgoing_handler(user_id):
     async def handler(event):
         try:
@@ -1319,6 +1420,11 @@ def make_outgoing_handler(user_id):
 
             raw_text = event.raw_text
             text_stripped = raw_text.strip() if raw_text else ""
+
+            # --- دستور ساخت پنل درون‌چتی (در هر نوع چتی، برخلاف دستورات تگ) ---
+            if text_stripped and text_stripped.lower() in PANEL_TRIGGERS:
+                await handle_panel_command(event, user_id)
+                return
 
             # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
             if text_stripped and not event.is_private:
@@ -1677,6 +1783,35 @@ async def autostart_saved_users():
                 logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل نشست نامعتبر غیرفعال شد.")
 
 # ======================== هندلرهای ربات ========================
+@bot.on(events.InlineQuery)
+async def inline_panel_handler(event):
+    """
+    این هندلر فقط برای ساختن «پنل درون‌چتی» به کار می‌رود (بند ۸-۹): وقتی خودِ سلف
+    (نه هیچ کاربر دیگری) از طریق Inline Mode به این بات کوئری می‌زند، یک نتیجه‌ی
+    تکی حاوی همان منوی اصلیِ پنل خصوصی برمی‌گردانیم؛ خودِ سلف با .click() این نتیجه
+    را در چتِ فعلی‌اش (گروه/پیوی/Saved Messages) درج می‌کند.
+    """
+    owner_id = event.query.user_id
+    user = user_data.get(owner_id)
+
+    if not user:
+        builder = event.builder
+        result = builder.article(
+            "❌ ثبت‌نام نشده‌اید",
+            text="ابتدا با /start در ربات ثبت‌نام کنید.",
+        )
+        await event.answer([result], cache_time=0)
+        return
+
+    builder = event.builder
+    keyboard = wrap_panel_buttons(get_main_menu_keyboard(user), owner_id)
+    result = builder.article(
+        "🔗 پنل NovaSelf",
+        text="🔗 **پنل مدیریت NovaSelf**\nاز طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+        buttons=keyboard,
+    )
+    await event.answer([result], cache_time=0)
+
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """هندلر دستور /start - کاملاً یکسان برای همه کاربران"""
@@ -1729,6 +1864,26 @@ async def callback_handler(event):
         await event.answer()
         return
 
+    # ====== پنل درون‌چتی (بندهای ۸-۱۲): بازکردن پیشوند مالکیت + کنترل دسترسی ======
+    if data.startswith(b"ip_"):
+        try:
+            _, owner_id_str, real_action = data.decode().split("_", 2)
+            owner_id = int(owner_id_str)
+        except (ValueError, IndexError):
+            await event.answer("❌ داده نامعتبر است.", alert=True)
+            return
+
+        if event.sender_id != owner_id:
+            await event.answer("⛔ فقط صاحب این Self می‌تواند از این پنل استفاده کند.", alert=True)
+            return
+
+        if real_action == "panel_close":
+            await safe_edit(event, "✕ پنل بسته شد.", buttons=None)
+            return
+
+        user_id = owner_id
+        data = real_action.encode()
+
     if not click_debouncer.should_process(user_id, data):
         await event.answer()  # کلیک تکراری/سریع؛ بی‌صدا نادیده گرفته می‌شود
         return
@@ -1753,7 +1908,7 @@ async def callback_handler(event):
                 f"🟢 کاربران فعال: {active}\n"
                 f"🔴 کاربران غیرفعال: {total - active}\n\n"
                 f"🕐 آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                buttons=[styled_button("🔙 بازگشت", b"admin_panel", style=STYLE_INFO)]
+                buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
             )
             return
 
@@ -1767,7 +1922,7 @@ async def callback_handler(event):
             await safe_edit(event,
                 "➕ **ساخت کد هدیه**\n\n"
                 "لطفاً یک کد دلخواه وارد کنید (فقط حروف/اعداد انگلیسی، بدون فاصله، حداکثر ۲۰ کاراکتر):",
-                buttons=[[styled_button("❌ لغو", b"admin_giftcodes", style=STYLE_OFF)]]
+                buttons=[[styled_button("➜ بازگشت", b"admin_giftcodes", style=STYLE_OFF)]]
             )
             return
 
@@ -1880,7 +2035,97 @@ async def callback_handler(event):
             )
             return
 
+        if data.startswith(b"admin_userfont_"):
+            target_id = int(data.decode().split("admin_userfont_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event, "🔤 **فونت ساعت این کاربر**",
+                             buttons=get_admin_font_grid_keyboard(target_id, user_data[target_id].get("font_id", 1)))
+            return
 
+        if data.startswith(b"admin_setfont_"):
+            parts = data.decode().split("_")
+            target_id, font_id = int(parts[-2]), int(parts[-1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            user_data[target_id]["font_id"] = font_id
+            save_user(target_id, user_data[target_id])
+            log_admin_action(user_id, target_id, "set_font", str(font_id))
+            await safe_edit(event, "🔤 **فونت ساعت این کاربر**",
+                             buttons=get_admin_font_grid_keyboard(target_id, font_id))
+            return
+
+        if data.startswith(b"admin_userdatefont_"):
+            target_id = int(data.decode().split("admin_userdatefont_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event, "🔤 **فونت تاریخ این کاربر**",
+                             buttons=get_admin_datefont_grid_keyboard(target_id, user_data[target_id].get("date_font", 1)))
+            return
+
+        if data.startswith(b"admin_setdatefont_"):
+            parts = data.decode().split("_")
+            target_id, font_id = int(parts[-2]), int(parts[-1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            user_data[target_id]["date_font"] = font_id
+            save_user(target_id, user_data[target_id])
+            log_admin_action(user_id, target_id, "set_date_font", str(font_id))
+            await safe_edit(event, "🔤 **فونت تاریخ این کاربر**",
+                             buttons=get_admin_datefont_grid_keyboard(target_id, font_id))
+            return
+
+        if data.startswith(b"admin_usertextmode_"):
+            target_id = int(data.decode().split("admin_usertextmode_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event, "🖊️ **حالت متن این کاربر**",
+                             buttons=get_admin_textmode_grid_keyboard(target_id, user_data[target_id].get("text_mode", 0)))
+            return
+
+        if data.startswith(b"admin_settextmode_"):
+            parts = data.decode().split("_")
+            target_id, mode_id = int(parts[-2]), int(parts[-1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            user_data[target_id]["text_mode"] = mode_id
+            save_user(target_id, user_data[target_id])
+            log_admin_action(user_id, target_id, "set_text_mode", str(mode_id))
+            await safe_edit(event, "🖊️ **حالت متن این کاربر**",
+                             buttons=get_admin_textmode_grid_keyboard(target_id, mode_id))
+            return
+
+        if data.startswith(b"admin_useractions_"):
+            target_id = int(data.decode().split("admin_useractions_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event, "🎭 **اکشن این کاربر**",
+                             buttons=get_admin_actions_grid_keyboard(target_id, user_data[target_id].get("active_action", "none")))
+            return
+
+        if data.startswith(b"admin_setaction_"):
+            raw = data.decode()[len("admin_setaction_"):]
+            target_id_str, action_key = raw.rsplit("_", 1)
+            target_id = int(target_id_str)
+            if target_id not in user_data or action_key not in ACTIONS:
+                await event.answer("❌ عملیات نامعتبر است.", alert=True)
+                return
+            user_data[target_id]["active_action"] = action_key
+            save_user(target_id, user_data[target_id])
+            log_admin_action(user_id, target_id, "set_action", action_key)
+            await safe_edit(event, "🎭 **اکشن این کاربر**",
+                             buttons=get_admin_actions_grid_keyboard(target_id, action_key))
+            return
+
+
+        if data.startswith(b"admin_toggle_user_"):
             target_id = int(data.decode().split("_")[3])
             if target_id in user_data:
                 user = user_data[target_id]
@@ -1924,7 +2169,7 @@ async def callback_handler(event):
                 await event.answer("✅ کاربر حذف شد!", alert=True)
                 await safe_edit(event,
                     "🗑️ **کاربر با موفقیت حذف شد.**",
-                    buttons=[Button.inline("🔙 بازگشت به لیست", b"admin_users_list")]
+                    buttons=[styled_button("➜ بازگشت", b"admin_users_list", style=STYLE_OFF)]
                 )
             return
 
@@ -1980,7 +2225,7 @@ async def callback_handler(event):
                     ts = created_at_l.strftime("%Y-%m-%d %H:%M") if created_at_l else "؟"
                     lines.append(f"▫️ [{ts}] ادمین {admin_id_l} ← کاربر {target_id_l} | {action_l} {details_l}")
                 log_text = "\n".join(lines)
-            await safe_edit(event, log_text, buttons=[Button.inline("🔙 بازگشت", b"admin_panel")])
+            await safe_edit(event, log_text, buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
             return
 
         # افزایش الماس
@@ -2028,7 +2273,7 @@ async def callback_handler(event):
 
             await safe_edit(event,
                 "✅ **همه کاربران با موفقیت بروزرسانی شدند!**",
-                buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
+                buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
             )
             return
 
@@ -2050,6 +2295,17 @@ async def callback_handler(event):
         return
 
     if data == b"account_recover_session":
+        await safe_edit(event,
+            "آیا مطمئن هستید که می‌خواهید نشست خود را بازیابی کنید؟\n\n"
+            "⚠️ اطلاعات حساب حذف نمی‌شود اما نیاز به ورود دوباره دارید.",
+            buttons=[
+                [styled_button("🟢 تایید", b"account_recover_session_confirmed", style=STYLE_ON)],
+                [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]
+            ]
+        )
+        return
+
+    if data == b"account_recover_session_confirmed":
         generator_data[user_id] = {
             "step": "get_phone",
             "phone": None,
@@ -2293,7 +2549,7 @@ async def callback_handler(event):
             "💎 **خرید الماس**\n\n"
             "در حال حاضر درگاه پرداخت فعال نیست.\n\n"
             f"جهت خرید الماس با {SUPPORT_USERNAME} در تماس باشید.",
-            buttons=[[Button.inline("🔙 بازگشت", b"menu_account")]]
+            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
         )
         return
 
@@ -2334,7 +2590,7 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎁 **کد هدیه**\n\n"
             "لطفاً کد هدیه‌ی خود را ارسال کنید:",
-            buttons=[[styled_button("❌ لغو", b"menu_account", style=STYLE_OFF)]]
+            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
         )
         return
 
@@ -2376,7 +2632,7 @@ async def callback_handler(event):
             # --- رسید فرستنده (روی همین پیام) ---
             await safe_edit(event,
                 build_sender_receipt(receiver_label, amount_str, format_diamonds(sender_balance), when),
-                buttons=[[Button.inline("🔙 بازگشت به حساب کاربری", b"menu_account")]]
+                buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
             )
 
             # --- رسید گیرنده (پیام جداگانه به خودش، اگر قبلاً با ربات استارت زده باشد) ---
@@ -2390,7 +2646,7 @@ async def callback_handler(event):
         else:
             await safe_edit(event,
                 f"{message}",
-                buttons=[[Button.inline("🔙 بازگشت به حساب کاربری", b"menu_account")]]
+                buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
             )
             transfer_data.pop(user_id, None)
             user["step"] = "managed"
@@ -2404,17 +2660,10 @@ async def callback_handler(event):
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
-    if data == b"secretary_on":
-        user["secretary_enabled"] = True
+    if data == b"secretary_toggle":
+        user["secretary_enabled"] = not user.get("secretary_enabled", False)
         save_user(user_id, user)
-        log_settings_change(user_id, "secretary_enabled", True)
-        await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
-        return
-
-    if data == b"secretary_off":
-        user["secretary_enabled"] = False
-        save_user(user_id, user)
-        log_settings_change(user_id, "secretary_enabled", False)
+        log_settings_change(user_id, "secretary_enabled", user["secretary_enabled"])
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
@@ -2525,7 +2774,7 @@ async def message_handler(event):
     # ====== ساخت کد هدیه توسط ادمین (چندمرحله‌ای، قبل از هندلر عمومی عددی) ======
     if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "create_giftcode":
         action = admin_action_data[user_id]
-        cancel_kb = [[styled_button("❌ لغو", b"admin_giftcodes", style=STYLE_OFF)]]
+        cancel_kb = [[styled_button("➜ بازگشت", b"admin_giftcodes", style=STYLE_OFF)]]
 
         if action["step"] == "get_code":
             code = text.strip()
@@ -2668,7 +2917,7 @@ async def message_handler(event):
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
                         [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
-                        [styled_button("❌ لغو", b"broadcast_cancel", style=STYLE_OFF)]
+                        [styled_button("➜ بازگشت", b"broadcast_cancel", style=STYLE_OFF)]
                     ]
                 )
             else:
@@ -2681,7 +2930,7 @@ async def message_handler(event):
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
                         [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
-                        [styled_button("❌ لغو", b"broadcast_cancel", style=STYLE_OFF)]
+                        [styled_button("➜ بازگشت", b"broadcast_cancel", style=STYLE_OFF)]
                     ]
                 )
             return
@@ -2815,7 +3064,7 @@ async def message_handler(event):
 
         await event.respond(
             message,
-            buttons=[[styled_button("🔙 بازگشت به حساب کاربری", b"menu_account", style=STYLE_INFO)]]
+            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
         )
         return
 
@@ -2928,12 +3177,12 @@ async def broadcast_callback_handler(event):
                 await bot.send_message(target_id, message)
                 await safe_edit(event,
                     f"✅ **پیام با موفقیت به کاربر {target_id} ارسال شد!**",
-                    buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
+                    buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
                 )
             except Exception as e:
                 await safe_edit(event,
                     f"❌ **خطا در ارسال پیام:**\n\n`{str(e)}`",
-                    buttons=[Button.inline("🔙 بازگشت", b"admin_panel")]
+                    buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
                 )
 
         else:
@@ -2955,7 +3204,7 @@ async def broadcast_callback_handler(event):
                 f"📨 تعداد کل: {total_users}\n"
                 f"✅ موفق: {success_count}\n"
                 f"❌ ناموفق: {fail_count}",
-                buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
+                buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
             )
 
         del broadcast_data[user_id]
@@ -2965,7 +3214,7 @@ async def broadcast_callback_handler(event):
         del broadcast_data[user_id]
         await safe_edit(event,
             "❌ **ارسال پیام لغو شد.**",
-            buttons=[Button.inline("🔙 بازگشت به پنل", b"admin_panel")]
+            buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
         )
         return
 
@@ -2978,6 +3227,14 @@ if __name__ == "__main__":
     logging.info(f"📊 تعداد کاربران بارگذاری شده: {len(user_data)}")
 
     loop = asyncio.get_event_loop()
+
+    async def _load_bot_username():
+        global BOT_USERNAME
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        logging.info(f"🤖 نام‌کاربری ربات برای پنل درون‌چتی ذخیره شد: @{BOT_USERNAME}")
+
+    loop.run_until_complete(_load_bot_username())
     loop.create_task(autostart_saved_users())
 
     webapp_app = create_webapp_app(
