@@ -1869,7 +1869,10 @@ async def callback_handler(event):
     # فراخوانی safe_edit در ادامه‌ی همین تابع، خودکار از این نسخه استفاده کند. وقتی
     # panel_owner_id (پایین‌تر) پر بشود، این نسخه خودش دکمه‌ها را با پیشوند مالک و
     # دکمه‌ی «✕ بستن پنل» بازسازی می‌کند؛ در غیر این صورت دقیقاً مثل قبل عمل می‌کند.
-    _module_safe_edit = safe_edit
+    # نکته‌ی مهم: چون خودِ همین تابع دوباره safe_edit را محلی تعریف می‌کند، نباید
+    # مستقیم به نام safe_edit رجوع کرد (Python کل تابع را "لوکال" حساب می‌کند و قبل
+    # از این خط با UnboundLocalError مواجه می‌شود)؛ برای همین از globals() می‌خوانیم.
+    _module_safe_edit = globals()['safe_edit']
 
     async def safe_edit(ev, text, buttons=None):
         if panel_owner_id is not None and buttons:
