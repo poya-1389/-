@@ -9,7 +9,9 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, events, Button, helpers
 from telethon.sessions import StringSession
 from telethon.errors import (
-    SessionPasswordNeededError, FloodWaitError, MessageNotModifiedError, RPCError
+    SessionPasswordNeededError, FloodWaitError, MessageNotModifiedError, RPCError,
+    ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
+    UserNotParticipantError, ChatAdminRequiredError,
 )
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
@@ -52,6 +54,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 DIAMOND_RATE_PER_HOUR = 5       # مصرف الماس به ازای هر ساعت روشن بودن سلف
 DIAMOND_PRICE_TOMAN = 20        # قیمت هر الماس به تومان
 BILLING_INTERVAL_SECONDS = 60   # فاصله زمانی محاسبه و کسر الماس
+MEOW_INTERVAL_SECONDS = 5 * 60 + 20   # فاصله‌ی ارسال پیام «میو» (۵ دقیقه و ۲۰ ثانیه)
 SUPPORT_USERNAME = "@SayPouYa"
 
 # ======================== دیکشنری‌های عمومی ========================
@@ -64,6 +67,7 @@ broadcast_data = {}
 secretary_state = {}   # {user_id: {peer_id: {"replied": bool, "task": Task}}}
 _auto_sent_marks = set()  # {(user_id, chat_id, message_id)} پیام‌هایی که خودمان خودکار فرستادیم (نباید توسط حالت متن ادیت شوند)
 transfer_data = {}     # {user_id: {"target_id":..., "amount":...}} وضعیت موقت انتقال الماس
+meow_group_cache = {}  # {user_id: [(chat_id, title), ...]} کش موقت لیست گروه‌ها برای صفحه‌بندی انتخاب گروه میو
 admin_action_data = {} # {admin_id: {"type":..., "target_id":..., "step":...}} وضعیت موقت عملیات مدیریتی روی الماس/رفرال
 click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پردازش کلیک تکراری روی دکمه‌ها
 
@@ -172,6 +176,9 @@ def init_db():
             ("referral_count", "INTEGER DEFAULT 0"),
             ("username", "TEXT"),
             ("last_charge_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+            ("meow_enabled", "INTEGER DEFAULT 0"),
+            ("meow_chat_id", "BIGINT"),
+            ("meow_last_sent_at", "TIMESTAMP"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -230,7 +237,8 @@ def get_all_users():
             SELECT user_id, session, font_id, status, name_time, bio_time, active_action,
                    joined_at, date_enabled, date_type, date_font, text_mode,
                    secretary_enabled, secretary_text, secretary_delay,
-                   diamonds, referral_count, username, last_charge_at
+                   diamonds, referral_count, username, last_charge_at,
+                   meow_enabled, meow_chat_id, meow_last_sent_at
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -261,10 +269,14 @@ def get_all_users():
                 "username": row['username'],
                 "last_charge_at": row['last_charge_at'] or datetime.now(),
                 "joined_at": row['joined_at'] or datetime.now(),
+                "meow_enabled": bool(row['meow_enabled']) if row['meow_enabled'] is not None else False,
+                "meow_chat_id": row['meow_chat_id'],
+                "meow_last_sent_at": row['meow_last_sent_at'],
                 "step": "managed",
                 "task": None,
                 "action_task": None,
-                "billing_task": None
+                "billing_task": None,
+                "meow_task": None
             }
         return data
     except Exception as e:
@@ -287,8 +299,9 @@ def save_user(user_id, user):
                 (user_id, session, font_id, status, name_time, bio_time, active_action,
                  date_enabled, date_type, date_font, text_mode,
                  secretary_enabled, secretary_text, secretary_delay,
-                 diamonds, referral_count, username, last_charge_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 diamonds, referral_count, username, last_charge_at,
+                 meow_enabled, meow_chat_id, meow_last_sent_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -303,7 +316,10 @@ def save_user(user_id, user):
                 text_mode = EXCLUDED.text_mode,
                 secretary_enabled = EXCLUDED.secretary_enabled,
                 secretary_text = EXCLUDED.secretary_text,
-                secretary_delay = EXCLUDED.secretary_delay
+                secretary_delay = EXCLUDED.secretary_delay,
+                meow_enabled = EXCLUDED.meow_enabled,
+                meow_chat_id = EXCLUDED.meow_chat_id,
+                meow_last_sent_at = EXCLUDED.meow_last_sent_at
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -313,7 +329,8 @@ def save_user(user_id, user):
             int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
             user.get("secretary_delay", 60),
             user.get("diamonds", 0), user.get("referral_count", 0), user.get("username"),
-            user.get("last_charge_at", datetime.now())
+            user.get("last_charge_at", datetime.now()),
+            int(user.get("meow_enabled", False)), user.get("meow_chat_id"), user.get("meow_last_sent_at")
         ))
         conn.commit()
         cursor.close()
@@ -752,9 +769,13 @@ def make_default_user(session=None, status=False, step="menu"):
         "referral_count": 0,
         "username": None,
         "last_charge_at": datetime.now(),
+        "meow_enabled": False,
+        "meow_chat_id": None,
+        "meow_last_sent_at": None,
         "task": None,
         "action_task": None,
         "billing_task": None,
+        "meow_task": None,
         "step": step,
         "joined_at": datetime.now()
     }
@@ -856,6 +877,8 @@ def get_main_menu_keyboard(user):
             styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
         ],
         [styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO)],
+        [styled_button(toggle_label("🐱 میو", user.get("meow_enabled", False)), b"menu_meow",
+                        style=STYLE_ON if user.get("meow_enabled") else STYLE_OFF)],
     ]
 
 def get_time_menu_keyboard(user):
@@ -1019,6 +1042,51 @@ def get_secretary_menu_text(user):
         "وقتی روشن باشد، به اولین پیام خصوصی هر شخص (که هنوز پاسخ منشی نگرفته) "
         "بعد از تأخیر تعیین‌شده، این متن ارسال می‌شود؛ تا وقتی طرف پیام تازه‌ای ندهد، دوباره ارسال نمی‌شود."
     )
+
+def get_meow_menu_text(user):
+    on = user.get("meow_enabled", False)
+    chat_id = user.get("meow_chat_id")
+    group_line = f"`{chat_id}`" if chat_id else "هنوز انتخاب نشده"
+    last_sent = user.get("meow_last_sent_at")
+    last_line = last_sent.strftime("%Y-%m-%d %H:%M:%S") if last_sent else "—"
+    return (
+        "🐱 **مدیریت میو**\n\n"
+        f"وضعیت: {status_icon(on)}\n"
+        f"گروه انتخاب‌شده: {group_line}\n"
+        f"آخرین ارسال: {last_line}\n\n"
+        "وقتی روشن باشد، هر ۵ دقیقه و ۲۰ ثانیه یک پیام «میو» در گروه انتخاب‌شده ارسال می‌شود."
+    )
+
+def get_meow_menu_keyboard(user):
+    on = user.get("meow_enabled", False)
+    return [
+        [toggle_button("میو", on, b"meow_toggle")],
+        [styled_button("انتخاب گروه", b"meow_select_group", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+    ]
+
+def get_meow_group_list_keyboard(groups, page, current_chat_id):
+    page_size = 6
+    start = page * page_size
+    page_groups = groups[start:start + page_size]
+
+    buttons = []
+    for chat_id, title in page_groups:
+        selected = (chat_id == current_chat_id)
+        label = f"{status_icon(selected)} {title[:30]}"
+        buttons.append([styled_button(label, f"meow_setgroup_{chat_id}".encode(),
+                                       style=STYLE_ON if selected else STYLE_OFF)])
+
+    nav = []
+    if page > 0:
+        nav.append(styled_button("⬅️ قبلی", f"meow_grouppage_{page - 1}".encode(), style=STYLE_INFO))
+    if start + page_size < len(groups):
+        nav.append(styled_button("➡️ بعدی", f"meow_grouppage_{page + 1}".encode(), style=STYLE_INFO))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)])
+    return buttons
 
 def get_secretary_menu_keyboard(user):
     on = user.get("secretary_enabled", False)
@@ -1537,7 +1605,7 @@ async def _teardown_existing_client(user_id):
     current = asyncio.current_task()
 
     if user:
-        for key in ("task", "action_task", "billing_task"):
+        for key in ("task", "action_task", "billing_task", "meow_task"):
             t = user.get(key)
             if t and t is not current and not t.done():
                 t.cancel()
@@ -1561,6 +1629,9 @@ def register_active_client(user_id, client):
         user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
         user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
         user_data[user_id]["billing_task"] = loop.create_task(diamond_billing_worker(user_id, client))
+        # میو: فقط اگر قبلاً فعال بوده (مثلاً بعد از Restart) خودکار دوباره استارت می‌شود
+        if user_data[user_id].get("meow_enabled") and user_data[user_id].get("meow_chat_id"):
+            user_data[user_id]["meow_task"] = loop.create_task(meow_worker(user_id, client))
 
 async def start_self_client(user_id, session_string):
     """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن (بعد از جمع‌کردن ایمن کلاینت قبلی در صورت وجود)."""
@@ -1593,7 +1664,7 @@ async def stop_self_client(user_id):
     current = asyncio.current_task()
 
     if user:
-        for key in ("task", "action_task", "billing_task"):
+        for key in ("task", "action_task", "billing_task", "meow_task"):
             t = user.get(key)
             if t and t is not current:
                 t.cancel()
@@ -1710,7 +1781,55 @@ async def self_bot_action_worker(user_id, client):
     except Exception as e:
         logging.error(f"❌ خطای اکشن برای کاربر {user_id}: {e}")
 
-async def diamond_billing_worker(user_id, client):
+async def meow_worker(user_id, client):
+    """
+    هر MEOW_INTERVAL_SECONDS ثانیه، پیام «میو» را به گروه انتخاب‌شده‌ی کاربر می‌فرستد.
+    خطاهای رایج (حذف از گروه، نبودِ دسترسی ارسال، محدودیت اکانت، FloodWait) گرفته
+    می‌شوند طوری که هیچ‌کدام سرویس اصلیِ Self را متوقف نکنند؛ فقط خودِ قابلیت میو
+    خاموش و به کاربر اطلاع داده می‌شود.
+    """
+    while True:
+        if user_id not in user_data or not user_data[user_id].get("meow_enabled"):
+            break
+
+        chat_id = user_data[user_id].get("meow_chat_id")
+        if not chat_id:
+            break
+
+        try:
+            await safe_call(client.send_message, chat_id, "میو")
+            user_data[user_id]["meow_last_sent_at"] = datetime.now()
+            save_user(user_id, user_data[user_id])
+
+        except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
+                UserNotParticipantError, ChatAdminRequiredError) as e:
+            # این‌ها یعنی سلف دیگر اجازه/عضویت لازم برای ارسال در آن گروه را ندارد؛
+            # قابلیت میو را خاموش می‌کنیم تا هر ۵ دقیقه دوباره همین خطا تکرار نشود.
+            logging.warning(f"⚠️ میو برای کاربر {user_id} به‌دلیل عدم دسترسی در گروه {chat_id} غیرفعال شد: {e}")
+            log_internal_error("meow_permission_lost", e)
+            if user_id in user_data:
+                user_data[user_id]["meow_enabled"] = False
+                save_user(user_id, user_data[user_id])
+            try:
+                await bot.send_message(
+                    user_id,
+                    "⛔ **میو غیرفعال شد.**\n\n"
+                    "دیگر دسترسی لازم برای ارسال پیام در گروه انتخاب‌شده وجود ندارد "
+                    "(احتمالاً از گروه حذف شده‌اید یا دسترسی ارسال پیام گرفته شده)."
+                )
+            except Exception:
+                pass
+            break
+
+        except Exception as e:
+            # خطای ناشناخته/موقت (مثلاً قطعی شبکه): فقط لاگ می‌شود، سرویس اصلی سلف
+            # و بقیه‌ی Taskها متوقف نمی‌شوند و چرخه در تلاش بعدی ادامه پیدا می‌کند.
+            logging.error(f"⚠️ خطا در ارسال میو برای کاربر {user_id}: {e}")
+            log_internal_error("meow_send_error", e)
+
+        await asyncio.sleep(MEOW_INTERVAL_SECONDS)
+
+
     """
     هر BILLING_INTERVAL_SECONDS ثانیه، به نسبت مدت‌زمان سپری‌شده الماس کسر می‌کند
     (نرخ: DIAMOND_RATE_PER_HOUR الماس به ازای هر ساعت روشن بودن سلف).
@@ -2674,6 +2793,101 @@ async def callback_handler(event):
 
     if data == b"menu_secretary":
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
+        return
+
+    # ====== میو ======
+    if data == b"menu_meow":
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        return
+
+    if data == b"meow_toggle":
+        want_on = not user.get("meow_enabled", False)
+
+        if want_on and not user.get("meow_chat_id"):
+            await event.answer("❌ ابتدا یک گروه برای میو انتخاب کنید.", alert=True)
+            return
+
+        user["meow_enabled"] = want_on
+        save_user(user_id, user)
+        log_settings_change(user_id, "meow_enabled", want_on)
+
+        # بلافاصله Task مربوطه را متوقف/شروع می‌کنیم (نه اینکه منتظر چرخه‌ی بعدی بمانیم)
+        old_task = user.get("meow_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        user["meow_task"] = None
+
+        if want_on:
+            client = active_clients.get(user_id)
+            if client:
+                user["meow_task"] = asyncio.get_event_loop().create_task(meow_worker(user_id, client))
+            else:
+                user["meow_enabled"] = False
+                save_user(user_id, user)
+                await event.answer("❌ ابتدا Self را روشن کنید.", alert=True)
+
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        return
+
+    if data == b"meow_select_group":
+        client = active_clients.get(user_id)
+        if not client:
+            await event.answer("❌ ابتدا Self را روشن کنید تا لیست گروه‌ها خوانده شود.", alert=True)
+            return
+
+        try:
+            groups = []
+            async for dialog in client.iter_dialogs(limit=200):
+                if dialog.is_group:
+                    groups.append((dialog.id, dialog.title or "بدون‌نام"))
+        except Exception as e:
+            log_internal_error("meow_fetch_groups", e)
+            await event.answer("❌ خطا در دریافت لیست گروه‌ها.", alert=True)
+            return
+
+        if not groups:
+            await event.answer("❌ هیچ گروهی پیدا نشد.", alert=True)
+            return
+
+        meow_group_cache[user_id] = groups
+        await safe_edit(event,
+            "📋 **انتخاب گروه برای میو**\n\nیکی از گروه‌های زیر را انتخاب کنید:",
+            buttons=get_meow_group_list_keyboard(groups, 0, user.get("meow_chat_id"))
+        )
+        return
+
+    if data.startswith(b"meow_grouppage_"):
+        page = int(data.decode().split("meow_grouppage_", 1)[1])
+        groups = meow_group_cache.get(user_id)
+
+        if groups is None:
+            await event.answer("❌ لیست منقضی شده، دوباره «انتخاب گروه» را بزنید.", alert=True)
+            return
+
+        await safe_edit(event,
+            "📋 **انتخاب گروه برای میو**\n\nیکی از گروه‌های زیر را انتخاب کنید:",
+            buttons=get_meow_group_list_keyboard(groups, page, user.get("meow_chat_id"))
+        )
+        return
+
+    if data.startswith(b"meow_setgroup_"):
+        chat_id = int(data.decode().split("meow_setgroup_", 1)[1])
+        user["meow_chat_id"] = chat_id
+        save_user(user_id, user)
+        log_settings_change(user_id, "meow_chat_id", chat_id)
+
+        # اگر میو از قبل روشن بوده ولی هنوز گروهی نداشت (Task متوقف شده بود)، حالا با
+        # گروه جدید دوباره راه‌اندازی می‌شود؛ اگر Task زنده‌ای هم در حال اجرا باشد،
+        # خودش با خواندن meow_chat_id تازه از user_data در چرخه‌ی بعدی هماهنگ می‌شود.
+        if user.get("meow_enabled"):
+            old_task = user.get("meow_task")
+            if not old_task or old_task.done():
+                client = active_clients.get(user_id)
+                if client:
+                    user["meow_task"] = asyncio.get_event_loop().create_task(meow_worker(user_id, client))
+
+        meow_group_cache.pop(user_id, None)
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
         return
 
     if data == b"secretary_toggle":
