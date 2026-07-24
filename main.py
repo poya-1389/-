@@ -1830,7 +1830,7 @@ async def meow_worker(user_id, client):
 
         await asyncio.sleep(MEOW_INTERVAL_SECONDS)
 
-
+async def diamond_billing_worker(user_id, client):
     """
     هر BILLING_INTERVAL_SECONDS ثانیه، به نسبت مدت‌زمان سپری‌شده الماس کسر می‌کند
     (نرخ: DIAMOND_RATE_PER_HOUR الماس به ازای هر ساعت روشن بودن سلف).
@@ -1887,20 +1887,26 @@ async def autostart_saved_users():
     await asyncio.sleep(5)
 
     for user_id, user in list(user_data.items()):
-        if user["status"] and user["session"]:
-            if float(user.get("diamonds", 0)) <= 0:
-                user["status"] = False
-                save_user(user_id, user)
-                logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل موجودی صفر الماس غیرفعال ماند.")
-                continue
+        try:
+            if user["status"] and user["session"]:
+                if float(user.get("diamonds", 0)) <= 0:
+                    user["status"] = False
+                    save_user(user_id, user)
+                    logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل موجودی صفر الماس غیرفعال ماند.")
+                    continue
 
-            client = await start_self_client(user_id, user["session"])
-            if client:
-                logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
-            else:
-                user["status"] = False
-                save_user(user_id, user)
-                logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل نشست نامعتبر غیرفعال شد.")
+                client = await start_self_client(user_id, user["session"])
+                if client:
+                    logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
+                else:
+                    user["status"] = False
+                    save_user(user_id, user)
+                    logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل نشست نامعتبر غیرفعال شد.")
+        except Exception as e:
+            # هر خطایی برای یک کاربر، فقط همان کاربر را تحت تأثیر قرار می‌دهد؛ بقیه‌ی
+            # کاربران باید مستقل از این، در همین چرخه‌ی استارتاپ راه‌اندازی شوند.
+            logging.error(f"❌ خطا در autostart برای کاربر {user_id}: {e}")
+            log_internal_error("autostart_saved_users", e)
 
 # ======================== هندلرهای ربات ========================
 @bot.on(events.InlineQuery)
