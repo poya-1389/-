@@ -1919,15 +1919,22 @@ async def meow_worker(user_id, client):
         await asyncio.sleep(interval)
 
 async def _wait_for_bot_message(client, chat_id, after_id, timeout):
-    """منتظر اولین پیام جدید از MeowieQBot (بعد از شناسه‌ی after_id) در این چت می‌ماند."""
+    """
+    منتظر اولین پیام جدیدِ ورودی (غیر از پیام‌های خودِ سلف) بعد از شناسه‌ی
+    after_id در این چت می‌ماند. عمداً روی فیلترِ from_user تکیه نمی‌کند، چون
+    اگر یوزرنیم ربات به هر دلیلی (مثلاً هنوز در کش کلاینت resolve نشده) قابل
+    شناسایی نباشد، آن فیلتر بی‌سروصدا هیچ نتیجه‌ای برنمی‌گرداند و کل قابلیت
+    همیشه با «به‌موقع پاسخ نداد» مواجه می‌شود؛ این نسخه چنین وابستگی‌ای ندارد.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            msgs = await client.get_messages(chat_id, from_user=MEOWIEQBOT_USERNAME, limit=3)
-        except Exception:
+            msgs = await client.get_messages(chat_id, limit=8)
+        except Exception as e:
+            logging.error(f"⚠️ خطا در خواندن پیام‌های چت هنگام انتظار پاسخ ربات: {e}")
             msgs = []
         for m in msgs:
-            if m.id > after_id:
+            if m.id > after_id and not m.out:
                 return m
         await asyncio.sleep(1.5)
     return None
