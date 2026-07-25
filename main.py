@@ -1,5 +1,6 @@
 import asyncio
 import time
+import re
 import os
 import pytz
 import psycopg2
@@ -62,7 +63,7 @@ FISH_RESPONSE_TIMEOUT = 15            # حداکثر انتظار برای او�
 FISH_EDIT_WAIT_SECONDS = 12           # حداکثر انتظار برای ادیت‌شدنِ پیام اولیه (استیکر) به متن اطلاعات
 FISH_NUTRITION_BY_RARITY = {"معمولی": 1, "کمیاب": 2, "حماسی": 3, "افسانه‌ای": 5}
 MEOWPOINT_INTERVAL_SECONDS = 45 * 60  # فاصله‌ی پیش‌فرض ارسال پیام «پیشی» (۴۵ دقیقه)
-MEOWPOINT_RESPONSE_TIMEOUT = 5         # حداکثر انتظار برای پاسخ ربات (طبق درخواست: حدود ۵ ثانیه)
+MEOWPOINT_RESPONSE_TIMEOUT = 15  # طبق تست واقعی، ۵ ثانیه کافی نبود و پاسخ ربات را از دست می‌داد
 INTERVAL_STEP_SECONDS = 5 * 60         # هر کلیک ➕/➖ (برای ماهی و میو پوینت) ۵ دقیقه تغییر می‌کند
 
 def format_interval(total_seconds):
@@ -1939,11 +1940,12 @@ def _normalize_fa(text):
     return text.replace("\u200c", "").replace(" ", "")
 
 def _find_button(message, label_contains):
-    if not message.buttons:
+    if not message or not message.buttons:
         return None
+    target = _normalize_fa(label_contains)
     for row in message.buttons:
         for btn in row:
-            if label_contains in (btn.text or ""):
+            if target in _normalize_fa(btn.text or ""):
                 return btn
     return None
 
@@ -1960,6 +1962,8 @@ async def fish_worker(user_id, client):
         chat_id = user_data[user_id].get("meow_chat_id")
         if not chat_id:
             break
+
+        cooldown_override = None
 
         try:
             sent = await safe_call(client.send_message, chat_id, "ماهی")
@@ -2003,6 +2007,16 @@ async def fish_worker(user_id, client):
                                 sell_btn = _find_button(after_click, "فروش ماهی")
                                 if sell_btn:
                                     await safe_call(sell_btn.click)
+                elif "خواب" in normalized_text or "صبرکنی" in normalized_text:
+                    # ماهی‌ها هنوز کول‌داون دارند؛ این خطا نیست، فقط باید صبر کرد.
+                    # اگه زمان دقیق تو پیام باشه (مثل 33:01)، دقیقاً همون‌قدر می‌خوابیم
+                    # تا هر چند دقیقه بی‌خودی دوباره تلاش نکنیم.
+                    m = re.search(r'(\d+):(\d+)', info.text or "")
+                    if m:
+                        cooldown_override = int(m.group(1)) * 60 + int(m.group(2)) + 5
+                        logging.info(f"ℹ️ کاربر {user_id}: ماهی‌ها در کول‌داون هستند، {cooldown_override} ثانیه صبر می‌کنیم.")
+                    else:
+                        logging.info(f"ℹ️ کاربر {user_id}: ماهی‌ها در کول‌داون هستند.")
                 else:
                     preview = (info.text or "(بدون متن)")[:300]
                     logging.warning(
@@ -2027,8 +2041,11 @@ async def fish_worker(user_id, client):
             logging.error(f"⚠️ خطا در چرخه‌ی ماهی برای کاربر {user_id}: {e}")
             log_internal_error("fish_cycle_error", e)
 
-        fish_interval = user_data.get(user_id, {}).get("fish_interval_seconds", FISH_INTERVAL_SECONDS)
-        await asyncio.sleep(fish_interval)
+        if cooldown_override:
+            await asyncio.sleep(cooldown_override)
+        else:
+            fish_interval = user_data.get(user_id, {}).get("fish_interval_seconds", FISH_INTERVAL_SECONDS)
+            await asyncio.sleep(fish_interval)
 
 async def meowpoint_worker(user_id, client):
     """
@@ -2055,11 +2072,25 @@ async def meowpoint_worker(user_id, client):
             if not reply:
                 logging.warning(f"⚠️ کاربر {user_id}: ربات پیشی به‌موقع پاسخ نداد.")
             else:
-                btn = _find_button(reply, "برداشت میو پوینت")
+                # مثل ماهی، ممکنه پیام اول بدون دکمه باشه و چند ثانیه بعد ادیت بشه
+                info = reply
+                deadline = time.monotonic() + FISH_EDIT_WAIT_SECONDS
+                while time.monotonic() < deadline and not _find_button(info, "برداشت میو پوینت"):
+                    await asyncio.sleep(1.5)
+                    try:
+                        fresh = await client.get_messages(chat_id, ids=reply.id)
+                        if fresh:
+                            info = fresh
+                    except Exception:
+                        break
+
+                btn = _find_button(info, "برداشت میو پوینت")
                 if btn:
                     await safe_call(btn.click)
                 else:
-                    logging.warning(f"⚠️ کاربر {user_id}: دکمه‌ی برداشت میو پوینت پیدا نشد.")
+                    preview = (info.text or "(بدون متن)")[:300]
+                    logging.warning(f"⚠️ کاربر {user_id}: دکمه‌ی برداشت میو پوینت پیدا نشد. متن دریافتی: {preview!r}")
+                    log_internal_error("meowpoint_button_not_found", preview)
 
         except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
                 UserNotParticipantError, ChatAdminRequiredError) as e:
