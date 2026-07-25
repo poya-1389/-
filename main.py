@@ -1114,9 +1114,7 @@ def get_meow_menu_text(user):
         f"وضعیت میو: {status_icon(on)}\n"
         f"گروه انتخاب‌شده (مشترک برای میو/ماهی/میو پوینت): {group_line}\n"
         f"آخرین ارسال میو: {last_line}\n"
-        f"فاصله‌ی ارسال میو: {format_interval(interval)}\n\n"
-        "وقتی میو روشن باشد، طبق فاصله‌ی بالا پیام «میو» در گروه انتخاب‌شده ارسال می‌شود. "
-        "قابلیت‌های «ماهی» و «میو پوینت» هم از همین گروه استفاده می‌کنند ولی هرکدام تنظیمات و Task مستقل خودشان را دارند."
+        f"فاصله‌ی ارسال میو: {format_interval(interval)}"
     )
 
 def get_meow_menu_keyboard(user):
@@ -1933,6 +1931,13 @@ async def _wait_for_bot_message(client, chat_id, after_id, timeout):
         await asyncio.sleep(1.5)
     return None
 
+def _normalize_fa(text):
+    """برای تشخیص مقاوم‌تر متن فارسی: نیم‌فاصله و فاصله‌های اضافه را نادیده می‌گیرد
+    (چون ممکن است پیام واقعی ربات با کاراکتر متفاوتی از چیزی که اینجا نوشته شده باشد)."""
+    if not text:
+        return ""
+    return text.replace("\u200c", "").replace(" ", "")
+
 def _find_button(message, label_contains):
     if not message.buttons:
         return None
@@ -1968,7 +1973,7 @@ async def fish_worker(user_id, client):
                 # پیام اول ممکن است فقط استیکر باشد و چند ثانیه بعد به متن اطلاعات ماهی ادیت شود
                 info = reply
                 deadline = time.monotonic() + FISH_EDIT_WAIT_SECONDS
-                while time.monotonic() < deadline and not (info.text and "سطح" in info.text):
+                while time.monotonic() < deadline and "سطح" not in _normalize_fa(info.text):
                     await asyncio.sleep(1.5)
                     try:
                         fresh = await client.get_messages(chat_id, ids=reply.id)
@@ -1977,7 +1982,8 @@ async def fish_worker(user_id, client):
                     except Exception:
                         break
 
-                rarity = next((r for r in FISH_NUTRITION_BY_RARITY if info.text and r in info.text), None)
+                normalized_text = _normalize_fa(info.text)
+                rarity = next((r for r in FISH_NUTRITION_BY_RARITY if _normalize_fa(r) in normalized_text), None)
 
                 if rarity:
                     target_label = "فروش ماهی" if rarity == "افسانه‌ای" else "بده پیشی بخوره"
@@ -1992,13 +1998,17 @@ async def fish_worker(user_id, client):
                                 after_click = await client.get_messages(chat_id, ids=info.id)
                             except Exception:
                                 after_click = None
-                            full_text = (after_click.text if after_click else "") or ""
-                            if "سیر" in full_text:
+                            full_text_norm = _normalize_fa(after_click.text if after_click else "")
+                            if "سیر" in full_text_norm:
                                 sell_btn = _find_button(after_click, "فروش ماهی")
                                 if sell_btn:
                                     await safe_call(sell_btn.click)
                 else:
-                    logging.warning(f"⚠️ کاربر {user_id}: سطح ماهی از پیام دریافتی قابل تشخیص نبود.")
+                    preview = (info.text or "(بدون متن)")[:300]
+                    logging.warning(
+                        f"⚠️ کاربر {user_id}: سطح ماهی از پیام دریافتی قابل تشخیص نبود. متن دریافتی: {preview!r}"
+                    )
+                    log_internal_error("fish_rarity_not_detected", preview)
 
         except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
                 UserNotParticipantError, ChatAdminRequiredError) as e:
