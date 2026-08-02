@@ -204,6 +204,7 @@ def init_db():
             ("meowpoint_enabled", "INTEGER DEFAULT 0"),
             ("meowpoint_interval_seconds", "INTEGER DEFAULT 2700"),
             ("meowpoint_last_run_at", "TIMESTAMP"),
+            ("streetcat_enabled", "INTEGER DEFAULT 0"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -265,7 +266,8 @@ def get_all_users():
                    diamonds, referral_count, username, last_charge_at,
                    meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                    fish_enabled, fish_last_run_at, fish_interval_seconds,
-                   meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at
+                   meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
+                   streetcat_enabled
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -306,6 +308,7 @@ def get_all_users():
                 "meowpoint_enabled": bool(row['meowpoint_enabled']) if row['meowpoint_enabled'] is not None else False,
                 "meowpoint_interval_seconds": row['meowpoint_interval_seconds'] if row['meowpoint_interval_seconds'] else MEOWPOINT_INTERVAL_SECONDS,
                 "meowpoint_last_run_at": row['meowpoint_last_run_at'],
+                "streetcat_enabled": bool(row['streetcat_enabled']) if row['streetcat_enabled'] is not None else False,
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -338,8 +341,9 @@ def save_user(user_id, user):
                  diamonds, referral_count, username, last_charge_at,
                  meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                  fish_enabled, fish_last_run_at, fish_interval_seconds,
-                 meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
+                 streetcat_enabled)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -364,7 +368,8 @@ def save_user(user_id, user):
                 fish_interval_seconds = EXCLUDED.fish_interval_seconds,
                 meowpoint_enabled = EXCLUDED.meowpoint_enabled,
                 meowpoint_interval_seconds = EXCLUDED.meowpoint_interval_seconds,
-                meowpoint_last_run_at = EXCLUDED.meowpoint_last_run_at
+                meowpoint_last_run_at = EXCLUDED.meowpoint_last_run_at,
+                streetcat_enabled = EXCLUDED.streetcat_enabled
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -380,7 +385,8 @@ def save_user(user_id, user):
             int(user.get("fish_enabled", False)), user.get("fish_last_run_at"),
             user.get("fish_interval_seconds", FISH_INTERVAL_SECONDS),
             int(user.get("meowpoint_enabled", False)), user.get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS),
-            user.get("meowpoint_last_run_at")
+            user.get("meowpoint_last_run_at"),
+            int(user.get("streetcat_enabled", False))
         ))
         conn.commit()
         cursor.close()
@@ -829,6 +835,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "meowpoint_enabled": False,
         "meowpoint_interval_seconds": MEOWPOINT_INTERVAL_SECONDS,
         "meowpoint_last_run_at": None,
+        "streetcat_enabled": False,
         "task": None,
         "action_task": None,
         "billing_task": None,
@@ -1144,6 +1151,7 @@ def get_meow_menu_keyboard(user):
             styled_button(f"⏱️ {format_interval(meowpoint_interval)}", b"void", style=STYLE_INFO),
             styled_button("➕", b"meowpoint_interval_inc", style=STYLE_ON),
         ],
+        [toggle_button("🐈 پیشی خیابونی", user.get("streetcat_enabled", False), b"streetcat_toggle")],
         [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
     ]
 
@@ -1673,6 +1681,61 @@ def _cleanup_secretary_state(user_id):
             if t and not t.done():
                 t.cancel()
 
+def make_streetcat_handler(user_id):
+    """
+    برخلاف میو/ماهی/میو‌پوینت، «پیشی خیابونی» تایمر ندارد (بند ۸) — چون پیام‌های
+    @MeowieQBot با فاصله‌ی نامشخص می‌آیند، این‌جا فقط منتظر پیام‌های جدیدِ همون
+    گروهِ انتخاب‌شده می‌مانیم و هر پیام را با کلیدواژه/دکمه چک می‌کنیم.
+    """
+    async def handler(event):
+        try:
+            if event.out:
+                return
+
+            user = user_data.get(user_id)
+            if not user or not user.get("streetcat_enabled"):
+                return
+
+            chat_id = user.get("meow_chat_id")
+            if not chat_id or event.chat_id != chat_id:
+                return
+
+            message = event.message
+            has_button = _find_streetcat_button(message) is not None
+            if not has_button and not _is_streetcat_text(message.text or ""):
+                return  # این پیام ربطی به پیشی خیابونی نداشت
+
+            for attempt in range(3):
+                try:
+                    fresh = await event.client.get_messages(chat_id, ids=message.id)
+                except Exception as e:
+                    logging.error(f"⚠️ خطا در خواندن مجدد پیام پیشی خیابونی برای کاربر {user_id}: {e}")
+                    log_internal_error("streetcat_refetch_error", e)
+                    break
+
+                btn = _find_streetcat_button(fresh) if fresh else None
+                if not btn:
+                    break  # دکمه دیگر وجود ندارد (حذف شده یا پیام تغییر کرده) — توقف طبق بند ۷
+
+                try:
+                    await safe_call(btn.click)
+                except FloodWaitError:
+                    raise
+                except Exception as e:
+                    logging.warning(f"⚠️ کاربر {user_id}: خطا در کلیک پیشی خیابونی (تلاش {attempt + 1}): {e}")
+                    log_internal_error("streetcat_click_error", e)
+                    break
+
+                await asyncio.sleep(1.5)
+
+        except FloodWaitError as e:
+            logging.warning(f"⏳ FloodWait پیشی خیابونی برای کاربر {user_id}: {e.seconds} ثانیه")
+        except Exception as e:
+            logging.error(f"⚠️ خطای غیرمنتظره در پیشی خیابونی برای کاربر {user_id}: {e}")
+            log_internal_error("streetcat_unexpected_error", e)
+
+    return handler
+
 # ======================== مدیریت چرخه حیات کلاینت سلف ========================
 async def _teardown_existing_client(user_id):
     """
@@ -1705,6 +1768,7 @@ def register_active_client(user_id, client):
     active_clients[user_id] = client
     client.add_event_handler(make_outgoing_handler(user_id), events.NewMessage(outgoing=True))
     client.add_event_handler(make_secretary_incoming_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_streetcat_handler(user_id), events.NewMessage(incoming=True))
 
     loop = asyncio.get_event_loop()
     if user_id in user_data:
@@ -1918,6 +1982,73 @@ async def meow_worker(user_id, client):
         interval = user_data.get(user_id, {}).get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
         await asyncio.sleep(interval)
 
+STREETCAT_KEYWORDS = ("پیشیخیابونی", "پیشیخیابانی")
+STREETCAT_BUTTON_LABELS = ("نجات پیشی خیابونی", "نجات پیشی خیابانی")
+
+def _is_streetcat_text(text):
+    t = _normalize_fa(text)
+    return any(k in t for k in STREETCAT_KEYWORDS)
+
+def _find_streetcat_button(message):
+    for label in STREETCAT_BUTTON_LABELS:
+        btn = _find_button(message, label)
+        if btn:
+            return btn
+    return None
+
+def _is_meowpoint_text(text):
+    t = _normalize_fa(text)
+    return "میوپوینت" in t or "شکمم" in t or "مقام" in t
+
+def _is_fish_result_text(text):
+    if _is_meowpoint_text(text):
+        return False
+    t = _normalize_fa(text)
+    return "سطح" in t or "خواب" in t or "صبرکنی" in t
+
+async def _wait_for_game_reply(client, chat_id, after_id, timeout, is_ready, is_valid):
+    """
+    منتظر پاسخ صحیحِ ربات می‌ماند. چون میو/ماهی/میو‌پوینت/پیشی‌خیابونی ممکن است
+    مستقل و هم‌زمان به همین گروه پیام بفرستند یا در آن ظاهر شوند، فقط «اولین
+    پیام ورودی جدید» کافی نیست — ممکن است پیامِ قابلیت دیگری باشد. برای هر
+    پیامِ ورودیِ جدید:
+      ۱) با is_ready صبر می‌کند تا کامل شود (مثلاً استیکر که چند ثانیه بعد ادیت می‌شود)
+      ۲) با is_valid چک می‌کند که واقعاً مربوط به همین قابلیت است؛ اگر نبود، آن را
+         رد کرده و به دنبال پیام بعدی می‌گردد.
+    """
+    last_seen_id = after_id
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        try:
+            msgs = await client.get_messages(chat_id, limit=8)
+        except Exception as e:
+            logging.error(f"⚠️ خطا در خواندن پیام‌های چت هنگام انتظار پاسخ ربات: {e}")
+            msgs = []
+
+        candidates = sorted([m for m in msgs if m.id > last_seen_id and not m.out], key=lambda m: m.id)
+
+        for m in candidates:
+            info = m
+            edit_deadline = time.monotonic() + FISH_EDIT_WAIT_SECONDS
+            while time.monotonic() < edit_deadline and not is_ready(info.text or ""):
+                await asyncio.sleep(1.5)
+                try:
+                    fresh = await client.get_messages(chat_id, ids=m.id)
+                    if fresh:
+                        info = fresh
+                except Exception:
+                    break
+
+            if is_valid(info.text or ""):
+                return info
+
+            last_seen_id = m.id  # این پیام مال قابلیت دیگری بود؛ رد شو و دنبال پیام بعدی بگرد
+
+        await asyncio.sleep(1.5)
+
+    return None
+
 async def _wait_for_bot_message(client, chat_id, after_id, timeout):
     """
     منتظر اولین پیام جدیدِ ورودی (غیر از پیام‌های خودِ سلف) بعد از شناسه‌ی
@@ -1977,43 +2108,39 @@ async def fish_worker(user_id, client):
             user_data[user_id]["fish_last_run_at"] = datetime.now()
             save_user(user_id, user_data[user_id])
 
-            reply = await _wait_for_bot_message(client, chat_id, sent.id, FISH_RESPONSE_TIMEOUT)
-            if not reply:
+            info = await _wait_for_game_reply(
+                client, chat_id, sent.id, FISH_RESPONSE_TIMEOUT,
+                is_ready=_is_fish_result_text, is_valid=_is_fish_result_text
+            )
+            if not info:
                 logging.warning(f"⚠️ کاربر {user_id}: MeowieQBot به‌موقع پاسخ نداد.")
             else:
-                # پیام اول ممکن است فقط استیکر باشد و چند ثانیه بعد به متن اطلاعات ماهی ادیت شود
-                info = reply
-                deadline = time.monotonic() + FISH_EDIT_WAIT_SECONDS
-                while time.monotonic() < deadline and "سطح" not in _normalize_fa(info.text):
-                    await asyncio.sleep(1.5)
-                    try:
-                        fresh = await client.get_messages(chat_id, ids=reply.id)
-                        if fresh:
-                            info = fresh
-                    except Exception:
-                        break
-
                 normalized_text = _normalize_fa(info.text)
                 rarity = next((r for r in FISH_NUTRITION_BY_RARITY if _normalize_fa(r) in normalized_text), None)
 
                 if rarity:
-                    target_label = "فروش ماهی" if rarity == "افسانه‌ای" else "بده پیشی بخوره"
+                    if rarity == "افسانه‌ای":
+                        target_label = "بندازش تو یخچال"
+                        fallback_markers = ("یخچالجانداره", "یخچالپره")
+                    else:
+                        target_label = "بده پیشی بخوره"
+                        fallback_markers = ("سیر",)
+
                     btn = _find_button(info, target_label)
                     if btn:
                         await safe_call(btn.click)
 
-                        # اگر «بده پیشی بخوره» زده شده، چک می‌کنیم پیشی سیر نباشد
-                        if target_label == "بده پیشی بخوره":
-                            await asyncio.sleep(2.5)
-                            try:
-                                after_click = await client.get_messages(chat_id, ids=info.id)
-                            except Exception:
-                                after_click = None
-                            full_text_norm = _normalize_fa(after_click.text if after_click else "")
-                            if "سیر" in full_text_norm:
-                                sell_btn = _find_button(after_click, "فروش ماهی")
-                                if sell_btn:
-                                    await safe_call(sell_btn.click)
+                        # چک می‌کنیم به یه دلیلی (پیشی سیره / یخچال پره) عملیات رد نشده باشه
+                        await asyncio.sleep(2.5)
+                        try:
+                            after_click = await client.get_messages(chat_id, ids=info.id)
+                        except Exception:
+                            after_click = None
+                        full_text_norm = _normalize_fa(after_click.text if after_click else "")
+                        if any(marker in full_text_norm for marker in fallback_markers):
+                            sell_btn = _find_button(after_click, "فروش ماهی")
+                            if sell_btn:
+                                await safe_call(sell_btn.click)
                 elif "خواب" in normalized_text or "صبرکنی" in normalized_text:
                     # ماهی‌ها هنوز کول‌داون دارند؛ این خطا نیست، فقط باید صبر کرد.
                     # اگه زمان دقیق تو پیام باشه (مثل 33:01)، دقیقاً همون‌قدر می‌خوابیم
@@ -2075,22 +2202,13 @@ async def meowpoint_worker(user_id, client):
             user_data[user_id]["meowpoint_last_run_at"] = datetime.now()
             save_user(user_id, user_data[user_id])
 
-            reply = await _wait_for_bot_message(client, chat_id, sent.id, MEOWPOINT_RESPONSE_TIMEOUT)
-            if not reply:
+            info = await _wait_for_game_reply(
+                client, chat_id, sent.id, MEOWPOINT_RESPONSE_TIMEOUT,
+                is_ready=_is_meowpoint_text, is_valid=_is_meowpoint_text
+            )
+            if not info:
                 logging.warning(f"⚠️ کاربر {user_id}: ربات پیشی به‌موقع پاسخ نداد.")
             else:
-                # مثل ماهی، ممکنه پیام اول بدون دکمه باشه و چند ثانیه بعد ادیت بشه
-                info = reply
-                deadline = time.monotonic() + FISH_EDIT_WAIT_SECONDS
-                while time.monotonic() < deadline and not _find_button(info, "برداشت میو پوینت"):
-                    await asyncio.sleep(1.5)
-                    try:
-                        fresh = await client.get_messages(chat_id, ids=reply.id)
-                        if fresh:
-                            info = fresh
-                    except Exception:
-                        break
-
                 btn = _find_button(info, "برداشت میو پوینت")
                 if btn:
                     await safe_call(btn.click)
@@ -3225,6 +3343,21 @@ async def callback_handler(event):
         user["meowpoint_interval_seconds"] = max(INTERVAL_STEP_SECONDS, current - INTERVAL_STEP_SECONDS)
         save_user(user_id, user)
         log_settings_change(user_id, "meowpoint_interval_seconds", user["meowpoint_interval_seconds"])
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        return
+
+    if data == b"streetcat_toggle":
+        want_on = not user.get("streetcat_enabled", False)
+
+        if want_on and not user.get("meow_chat_id"):
+            await event.answer("❌ ابتدا از بخش میو یک گروه انتخاب کنید.", alert=True)
+            return
+
+        user["streetcat_enabled"] = want_on
+        save_user(user_id, user)
+        log_settings_change(user_id, "streetcat_enabled", want_on)
+        # این قابلیت رویدادمحوره (بدون تایمر)؛ هندلرش همیشه ثبت‌شده‌ست و فقط این
+        # فلگ رو چک می‌کنه، پس نیازی به استارت/استاپ Task نیست.
         await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
         return
 
