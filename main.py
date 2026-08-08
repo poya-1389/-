@@ -62,9 +62,36 @@ MEOWIEQBOT_USERNAME = "MeowieQBot"
 FISH_RESPONSE_TIMEOUT = 15            # حداکثر انتظار برای اولین پاسخ ربات ماهی
 FISH_EDIT_WAIT_SECONDS = 12           # حداکثر انتظار برای ادیت‌شدنِ پیام اولیه (استیکر) به متن اطلاعات
 FISH_NUTRITION_BY_RARITY = {"معمولی": 1, "کمیاب": 2, "حماسی": 3, "افسانه‌ای": 5}
+FISH_RARITY_TO_FIELD = {
+    "معمولی": "fish_operation_common",
+    "کمیاب": "fish_operation_rare",
+    "حماسی": "fish_operation_epic",
+    "افسانه‌ای": "fish_operation_legendary",
+}
+FISH_OPERATION_LABELS = {
+    "sell": "فروش ماهی",
+    "feed": "بده پیشی بخوره",
+    "fridge": "بندازش تو یخچال",
+}
+FISH_OPERATION_NAMES_FA = {
+    "sell": "فروش ماهی",
+    "feed": "دادن به پیشی",
+    "fridge": "انداختن تو یخچال",
+}
+FISH_OPERATION_FALLBACK_MARKERS = {
+    "feed": ("سیر",),
+    "fridge": ("یخچالجانداره", "یخچالپره"),
+    "sell": (),
+}
 MEOWPOINT_INTERVAL_SECONDS = 45 * 60  # فاصله‌ی پیش‌فرض ارسال پیام «پیشی» (۴۵ دقیقه)
 MEOWPOINT_RESPONSE_TIMEOUT = 15  # طبق تست واقعی، ۵ ثانیه کافی نبود و پاسخ ربات را از دست می‌داد
-INTERVAL_STEP_SECONDS = 5 * 60         # هر کلیک ➕/➖ (برای ماهی و میو پوینت) ۵ دقیقه تغییر می‌کند
+INTERVAL_STEP_SECONDS = 5 * 60         # هر کلیک ➕/➖ (برای ماهی، میو پوینت و یخچال) ۵ دقیقه تغییر می‌کند
+FRIDGE_INTERVAL_SECONDS = 30 * 60      # فاصله‌ی پیش‌فرض بررسی یخچال میویی (۳۰ دقیقه)
+GAMEBOT_ID = 8839105739                # آیدی عددی @MeowieQBot — برای تشخیص مطمئن‌تر پیام‌ها (بند ۳۸)
+
+# ---------- سیستم Delay/Retry مرکزی برای همه‌ی قابلیت‌های وابسته به MeowieQBot (بند ۵ و ۳۱) ----------
+GAME_CLICK_RETRY_DELAY = 3.0    # فاصله بین تلاش‌های مجدد کلیک روی یک دکمه
+GAME_CLICK_MAX_ATTEMPTS = 3     # حداکثر تلاش برای هر دکمه (چون سرور MeowieQBot ممکنه شلوغ باشه)
 
 def format_interval(total_seconds):
     """نمایش زمان به دقیقه (و ثانیه‌ی باقی‌مانده در صورت وجود)، مطابق درخواست بند ۷."""
@@ -205,6 +232,13 @@ def init_db():
             ("meowpoint_interval_seconds", "INTEGER DEFAULT 2700"),
             ("meowpoint_last_run_at", "TIMESTAMP"),
             ("streetcat_enabled", "INTEGER DEFAULT 0"),
+            ("fridge_enabled", "INTEGER DEFAULT 0"),
+            ("fridge_interval_seconds", "INTEGER DEFAULT 1800"),
+            ("fridge_last_run_at", "TIMESTAMP"),
+            ("fish_operation_common", "TEXT DEFAULT 'feed'"),
+            ("fish_operation_rare", "TEXT DEFAULT 'feed'"),
+            ("fish_operation_epic", "TEXT DEFAULT 'feed'"),
+            ("fish_operation_legendary", "TEXT DEFAULT 'fridge'"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -267,7 +301,9 @@ def get_all_users():
                    meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                    fish_enabled, fish_last_run_at, fish_interval_seconds,
                    meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
-                   streetcat_enabled
+                   streetcat_enabled,
+                   fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
+                   fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -309,13 +345,21 @@ def get_all_users():
                 "meowpoint_interval_seconds": row['meowpoint_interval_seconds'] if row['meowpoint_interval_seconds'] else MEOWPOINT_INTERVAL_SECONDS,
                 "meowpoint_last_run_at": row['meowpoint_last_run_at'],
                 "streetcat_enabled": bool(row['streetcat_enabled']) if row['streetcat_enabled'] is not None else False,
+                "fridge_enabled": bool(row['fridge_enabled']) if row['fridge_enabled'] is not None else False,
+                "fridge_interval_seconds": row['fridge_interval_seconds'] if row['fridge_interval_seconds'] else FRIDGE_INTERVAL_SECONDS,
+                "fridge_last_run_at": row['fridge_last_run_at'],
+                "fish_operation_common": row['fish_operation_common'] or "feed",
+                "fish_operation_rare": row['fish_operation_rare'] or "feed",
+                "fish_operation_epic": row['fish_operation_epic'] or "feed",
+                "fish_operation_legendary": row['fish_operation_legendary'] or "fridge",
                 "step": "managed",
                 "task": None,
                 "action_task": None,
                 "billing_task": None,
                 "meow_task": None,
                 "fish_task": None,
-                "meowpoint_task": None
+                "meowpoint_task": None,
+                "fridge_task": None
             }
         return data
     except Exception as e:
@@ -342,8 +386,10 @@ def save_user(user_id, user):
                  meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                  fish_enabled, fish_last_run_at, fish_interval_seconds,
                  meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
-                 streetcat_enabled)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 streetcat_enabled,
+                 fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
+                 fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -369,7 +415,14 @@ def save_user(user_id, user):
                 meowpoint_enabled = EXCLUDED.meowpoint_enabled,
                 meowpoint_interval_seconds = EXCLUDED.meowpoint_interval_seconds,
                 meowpoint_last_run_at = EXCLUDED.meowpoint_last_run_at,
-                streetcat_enabled = EXCLUDED.streetcat_enabled
+                streetcat_enabled = EXCLUDED.streetcat_enabled,
+                fridge_enabled = EXCLUDED.fridge_enabled,
+                fridge_interval_seconds = EXCLUDED.fridge_interval_seconds,
+                fridge_last_run_at = EXCLUDED.fridge_last_run_at,
+                fish_operation_common = EXCLUDED.fish_operation_common,
+                fish_operation_rare = EXCLUDED.fish_operation_rare,
+                fish_operation_epic = EXCLUDED.fish_operation_epic,
+                fish_operation_legendary = EXCLUDED.fish_operation_legendary
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -386,7 +439,11 @@ def save_user(user_id, user):
             user.get("fish_interval_seconds", FISH_INTERVAL_SECONDS),
             int(user.get("meowpoint_enabled", False)), user.get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS),
             user.get("meowpoint_last_run_at"),
-            int(user.get("streetcat_enabled", False))
+            int(user.get("streetcat_enabled", False)),
+            int(user.get("fridge_enabled", False)), user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS),
+            user.get("fridge_last_run_at"),
+            user.get("fish_operation_common", "feed"), user.get("fish_operation_rare", "feed"),
+            user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge")
         ))
         conn.commit()
         cursor.close()
@@ -836,12 +893,20 @@ def make_default_user(session=None, status=False, step="menu"):
         "meowpoint_interval_seconds": MEOWPOINT_INTERVAL_SECONDS,
         "meowpoint_last_run_at": None,
         "streetcat_enabled": False,
+        "fridge_enabled": False,
+        "fridge_interval_seconds": FRIDGE_INTERVAL_SECONDS,
+        "fridge_last_run_at": None,
+        "fish_operation_common": "feed",
+        "fish_operation_rare": "feed",
+        "fish_operation_epic": "feed",
+        "fish_operation_legendary": "fridge",
         "task": None,
         "action_task": None,
         "billing_task": None,
         "meow_task": None,
         "fish_task": None,
         "meowpoint_task": None,
+        "fridge_task": None,
         "step": step,
         "joined_at": datetime.now()
     }
@@ -1111,48 +1176,149 @@ def get_secretary_menu_text(user):
     )
 
 def get_meow_menu_text(user):
-    on = user.get("meow_enabled", False)
+    return "🐱 **بخش میو**\n\nیکی از قابلیت‌های زیر را برای مدیریت انتخاب کنید:"
+
+def get_meow_menu_keyboard(user):
+    return [
+        [toggle_button("🐱 میو", user.get("meow_enabled", False), b"meow_settings")],
+        [toggle_button("🐟 ماهی", user.get("fish_enabled", False), b"fish_settings")],
+        [toggle_button("🪙 میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_settings")],
+        [toggle_button("🐈 نجات پیشی", user.get("streetcat_enabled", False), b"streetcat_settings")],
+        [toggle_button("❄️ یخچال میویی", user.get("fridge_enabled", False), b"fridge_settings")],
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+    ]
+
+def get_meow_settings_text(user):
     chat_id = user.get("meow_chat_id")
     group_line = f"`{chat_id}`" if chat_id else "هنوز انتخاب نشده"
     last_sent = user.get("meow_last_sent_at")
     last_line = last_sent.strftime("%Y-%m-%d %H:%M:%S") if last_sent else "—"
     interval = user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
     return (
-        "🐱 **مدیریت میو**\n\n"
-        f"وضعیت میو: {status_icon(on)}\n"
-        f"گروه انتخاب‌شده (مشترک برای میو/ماهی/میو پوینت): {group_line}\n"
-        f"آخرین ارسال میو: {last_line}\n"
-        f"فاصله‌ی ارسال میو: {format_interval(interval)}"
+        "🐱 **تنظیمات میو**\n\n"
+        f"گروه انتخاب‌شده (مشترک برای همه‌ی قابلیت‌های میو): {group_line}\n"
+        f"آخرین ارسال: {last_line}\n"
+        f"فاصله‌ی ارسال: {format_interval(interval)}"
     )
 
-def get_meow_menu_keyboard(user):
-    on = user.get("meow_enabled", False)
-    meow_interval = user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
-    fish_interval = user.get("fish_interval_seconds", FISH_INTERVAL_SECONDS)
-    meowpoint_interval = user.get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS)
-
+def get_meow_settings_keyboard(user):
+    interval = user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
     return [
-        [toggle_button("میو", on, b"meow_toggle")],
+        [toggle_button("میو", user.get("meow_enabled", False), b"meow_toggle")],
         [styled_button("انتخاب گروه", b"meow_select_group", style=STYLE_INFO)],
         [
             styled_button("➖", b"meow_interval_dec", style=STYLE_OFF),
-            styled_button(f"⏱️ {format_interval(meow_interval)}", b"void", style=STYLE_INFO),
+            styled_button(f"⏱️ {format_interval(interval)}", b"void", style=STYLE_INFO),
             styled_button("➕", b"meow_interval_inc", style=STYLE_ON),
         ],
+        [styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)]
+    ]
+
+def get_fish_settings_text(user):
+    last_run = user.get("fish_last_run_at")
+    last_line = last_run.strftime("%Y-%m-%d %H:%M:%S") if last_run else "—"
+    interval = user.get("fish_interval_seconds", FISH_INTERVAL_SECONDS)
+    return (
+        "🐟 **تنظیمات ماهی**\n\n"
+        f"آخرین اجرا: {last_line}\n"
+        f"فاصله‌ی اجرا: {format_interval(interval)}"
+    )
+
+def get_fish_settings_keyboard(user):
+    interval = user.get("fish_interval_seconds", FISH_INTERVAL_SECONDS)
+    return [
         [toggle_button("ماهی", user.get("fish_enabled", False), b"fish_toggle")],
         [
             styled_button("➖", b"fish_interval_dec", style=STYLE_OFF),
-            styled_button(f"⏱️ {format_interval(fish_interval)}", b"void", style=STYLE_INFO),
+            styled_button(f"⏱️ {format_interval(interval)}", b"void", style=STYLE_INFO),
             styled_button("➕", b"fish_interval_inc", style=STYLE_ON),
         ],
+        [styled_button("⚙️ عملیات ماهی", b"fish_ops_menu", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)]
+    ]
+
+FISH_OPS_RARITY_LABELS = [
+    ("common", "معمولی"), ("rare", "کمیاب"), ("epic", "حماسی"), ("legendary", "افسانه‌ای"),
+]
+
+def get_fish_ops_menu_text(user):
+    lines = ["⚙️ **عملیات ماهی بر اساس سطح**\n"]
+    for key, label in FISH_OPS_RARITY_LABELS:
+        op = user.get(f"fish_operation_{key}") or ("fridge" if key == "legendary" else "feed")
+        lines.append(f"{label}: {FISH_OPERATION_NAMES_FA.get(op, op)}")
+    return "\n".join(lines)
+
+def get_fish_ops_menu_keyboard(user):
+    buttons = []
+    for key, label in FISH_OPS_RARITY_LABELS:
+        buttons.append([styled_button(label, f"fishop_rarity_{key}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"fish_settings", style=STYLE_OFF)])
+    return buttons
+
+def get_fish_op_rarity_keyboard(user, rarity_key):
+    current = user.get(f"fish_operation_{rarity_key}") or ("fridge" if rarity_key == "legendary" else "feed")
+    buttons = []
+    for op_key in ("sell", "feed", "fridge"):
+        selected = (op_key == current)
+        buttons.append([styled_button(
+            f"{status_icon(selected)} {FISH_OPERATION_NAMES_FA[op_key]}",
+            f"fishop_set_{rarity_key}_{op_key}".encode(),
+            style=STYLE_ON if selected else STYLE_OFF
+        )])
+    buttons.append([styled_button("➜ بازگشت", b"fish_ops_menu", style=STYLE_OFF)])
+    return buttons
+
+def get_meowpoint_settings_text(user):
+    last_run = user.get("meowpoint_last_run_at")
+    last_line = last_run.strftime("%Y-%m-%d %H:%M:%S") if last_run else "—"
+    interval = user.get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS)
+    return (
+        "🪙 **تنظیمات میو پوینت**\n\n"
+        f"آخرین اجرا: {last_line}\n"
+        f"فاصله‌ی اجرا: {format_interval(interval)}"
+    )
+
+def get_meowpoint_settings_keyboard(user):
+    interval = user.get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS)
+    return [
         [toggle_button("میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_toggle")],
         [
             styled_button("➖", b"meowpoint_interval_dec", style=STYLE_OFF),
-            styled_button(f"⏱️ {format_interval(meowpoint_interval)}", b"void", style=STYLE_INFO),
+            styled_button(f"⏱️ {format_interval(interval)}", b"void", style=STYLE_INFO),
             styled_button("➕", b"meowpoint_interval_inc", style=STYLE_ON),
         ],
-        [toggle_button("🐈 پیشی خیابونی", user.get("streetcat_enabled", False), b"streetcat_toggle")],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)]
+    ]
+
+def get_streetcat_settings_text(user):
+    return "🐈 **تنظیمات نجات پیشی**\n\nاین قابلیت رویدادمحوره (بدون زمان‌بندی) و به‌محض دیدن پیام مربوطه در گروه انتخاب‌شده، فعال می‌شود."
+
+def get_streetcat_settings_keyboard(user):
+    return [
+        [toggle_button("نجات پیشی", user.get("streetcat_enabled", False), b"streetcat_toggle")],
+        [styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)]
+    ]
+
+def get_fridge_settings_text(user):
+    last_run = user.get("fridge_last_run_at")
+    last_line = last_run.strftime("%Y-%m-%d %H:%M:%S") if last_run else "—"
+    interval = user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS)
+    return (
+        "❄️ **تنظیمات یخچال میویی**\n\n"
+        f"آخرین بررسی: {last_line}\n"
+        f"فاصله‌ی بررسی: {format_interval(interval)}"
+    )
+
+def get_fridge_settings_keyboard(user):
+    interval = user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS)
+    return [
+        [toggle_button("یخچال میویی", user.get("fridge_enabled", False), b"fridge_toggle")],
+        [
+            styled_button("➖", b"fridge_interval_dec", style=STYLE_OFF),
+            styled_button(f"⏱️ {format_interval(interval)}", b"void", style=STYLE_INFO),
+            styled_button("➕", b"fridge_interval_inc", style=STYLE_ON),
+        ],
+        [styled_button("➜ بازگشت", b"menu_meow", style=STYLE_OFF)]
     ]
 
 def get_meow_group_list_keyboard(groups, page, current_chat_id):
@@ -1683,9 +1849,13 @@ def _cleanup_secretary_state(user_id):
 
 def make_streetcat_handler(user_id):
     """
-    برخلاف میو/ماهی/میو‌پوینت، «پیشی خیابونی» تایمر ندارد (بند ۸) — چون پیام‌های
+    برخلاف میو/ماهی/میو‌پوینت/یخچال، «نجات پیشی» تایمر ندارد (بند ۸) — چون پیام‌های
     @MeowieQBot با فاصله‌ی نامشخص می‌آیند، این‌جا فقط منتظر پیام‌های جدیدِ همون
     گروهِ انتخاب‌شده می‌مانیم و هر پیام را با کلیدواژه/دکمه چک می‌کنیم.
+
+    مکانیزم جدید (بند ۲-۴): هر پیام تا ۳ «شانس» (دکمه‌ی نجات) دارد. برای هر شانس
+    تا ۳ بار تلاش می‌شود (چون سرور MeowieQBot ممکنه شلوغ باشه)، و به‌محض حذف‌شدنِ
+    آن شانس (دکمه دیگر نبود)، بدون تلاش اضافه سراغ شانس بعدی می‌رویم.
     """
     async def handler(event):
         try:
@@ -1703,35 +1873,54 @@ def make_streetcat_handler(user_id):
             message = event.message
             has_button = _find_streetcat_button(message) is not None
             if not has_button and not _is_streetcat_text(message.text or ""):
-                return  # این پیام ربطی به پیشی خیابونی نداشت
+                return  # این پیام ربطی به نجات پیشی نداشت
 
-            for attempt in range(3):
+            for chance_num in range(1, 4):  # حداکثر ۳ شانس
                 try:
                     fresh = await event.client.get_messages(chat_id, ids=message.id)
                 except Exception as e:
-                    logging.error(f"⚠️ خطا در خواندن مجدد پیام پیشی خیابونی برای کاربر {user_id}: {e}")
+                    logging.error(f"⚠️ خطا در خواندن پیام نجات پیشی برای کاربر {user_id}: {e}")
                     log_internal_error("streetcat_refetch_error", e)
-                    break
+                    return
 
-                btn = _find_streetcat_button(fresh) if fresh else None
-                if not btn:
-                    break  # دکمه دیگر وجود ندارد (حذف شده یا پیام تغییر کرده) — توقف طبق بند ۷
+                buttons_now = _find_all_streetcat_buttons(fresh) if fresh else []
+                if not buttons_now:
+                    return  # دیگه هیچ شانسی نمونده — کار تمومه (طبق بند ۴)
 
-                try:
-                    await safe_call(btn.click)
-                except FloodWaitError:
-                    raise
-                except Exception as e:
-                    logging.warning(f"⚠️ کاربر {user_id}: خطا در کلیک پیشی خیابونی (تلاش {attempt + 1}): {e}")
-                    log_internal_error("streetcat_click_error", e)
-                    break
+                count_before = len(buttons_now)
 
-                await asyncio.sleep(1.5)
+                for attempt in range(1, GAME_CLICK_MAX_ATTEMPTS + 1):
+                    try:
+                        current = await event.client.get_messages(chat_id, ids=message.id)
+                    except Exception as e:
+                        logging.error(f"⚠️ خطا در خواندن پیام نجات پیشی (تلاش {attempt}): {e}")
+                        return
 
-        except FloodWaitError as e:
-            logging.warning(f"⏳ FloodWait پیشی خیابونی برای کاربر {user_id}: {e.seconds} ثانیه")
+                    current_buttons = _find_all_streetcat_buttons(current) if current else []
+                    if len(current_buttons) < count_before:
+                        break  # این شانس با موفقیت حذف شد، برو سراغ شانس بعدی
+
+                    if not current_buttons:
+                        return  # دیگه هیچ دکمه‌ای نمونده
+
+                    try:
+                        await safe_call(current_buttons[0].click)
+                    except FloodWaitError as e:
+                        logging.warning(f"⏳ FloodWait نجات پیشی برای کاربر {user_id}: {e.seconds} ثانیه")
+                        await asyncio.sleep(e.seconds + 1)
+                        continue
+                    except Exception as e:
+                        logging.warning(
+                            f"⚠️ کاربر {user_id}: خطا در کلیک نجات پیشی (شانس {chance_num}، تلاش {attempt}): {e}"
+                        )
+                        log_internal_error("streetcat_click_error", e)
+
+                    await asyncio.sleep(GAME_CLICK_RETRY_DELAY)
+                # اگه بعد از GAME_CLICK_MAX_ATTEMPTS بار تلاش هم دکمه هنوز بود، طبق
+                # بند ۳ (مرحله‌ی ۶) باز هم سراغ شانس بعدی می‌ریم، نه که کل کار متوقف بشه.
+
         except Exception as e:
-            logging.error(f"⚠️ خطای غیرمنتظره در پیشی خیابونی برای کاربر {user_id}: {e}")
+            logging.error(f"⚠️ خطای غیرمنتظره در نجات پیشی برای کاربر {user_id}: {e}")
             log_internal_error("streetcat_unexpected_error", e)
 
     return handler
@@ -1750,7 +1939,7 @@ async def _teardown_existing_client(user_id):
     current = asyncio.current_task()
 
     if user:
-        for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task"):
+        for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task", "fridge_task"):
             t = user.get(key)
             if t and t is not current and not t.done():
                 t.cancel()
@@ -1784,6 +1973,9 @@ def register_active_client(user_id, client):
         # میو پوینت: همانند میو/ماهی
         if user_data[user_id].get("meowpoint_enabled") and user_data[user_id].get("meow_chat_id"):
             user_data[user_id]["meowpoint_task"] = loop.create_task(meowpoint_worker(user_id, client))
+        # یخچال میویی: همانند میو/ماهی/میو‌پوینت
+        if user_data[user_id].get("fridge_enabled") and user_data[user_id].get("meow_chat_id"):
+            user_data[user_id]["fridge_task"] = loop.create_task(fridge_worker(user_id, client))
 
 async def start_self_client(user_id, session_string):
     """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن (بعد از جمع‌کردن ایمن کلاینت قبلی در صورت وجود)."""
@@ -1816,7 +2008,7 @@ async def stop_self_client(user_id):
     current = asyncio.current_task()
 
     if user:
-        for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task"):
+        for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task", "fridge_task"):
             t = user.get(key)
             if t and t is not current:
                 t.cancel()
@@ -1996,6 +2188,18 @@ def _find_streetcat_button(message):
             return btn
     return None
 
+def _find_all_streetcat_buttons(message):
+    """همه‌ی دکمه‌های «نجات پیشی» باقی‌مانده در پیام را برمی‌گرداند (برای مکانیزم ۳ شانس)."""
+    if not message or not message.buttons:
+        return []
+    found = []
+    for row in message.buttons:
+        for btn in row:
+            normalized_btn = _normalize_fa(btn.text or "")
+            if any(_normalize_fa(label) in normalized_btn for label in STREETCAT_BUTTON_LABELS):
+                found.append(btn)
+    return found
+
 def _is_meowpoint_text(text):
     t = _normalize_fa(text)
     return "میوپوینت" in t or "شکمم" in t or "مقام" in t
@@ -2005,6 +2209,45 @@ def _is_fish_result_text(text):
         return False
     t = _normalize_fa(text)
     return "سطح" in t or "خواب" in t or "صبرکنی" in t
+
+async def _click_with_retry(client, chat_id, message_id, find_button_fn,
+                             max_attempts=GAME_CLICK_MAX_ATTEMPTS, retry_delay=GAME_CLICK_RETRY_DELAY):
+    """
+    سیستم مرکزی Delay/Retry برای کلیک روی دکمه‌های پیام‌های MeowieQBot (بند ۵ و ۳۱).
+    هر بار پیام را دوباره (تازه) می‌خواند، با find_button_fn دکمه‌ی مدنظر را پیدا
+    می‌کند و کلیک می‌کند. اگر در هر مرحله دکمه دیگر پیدا نشد، یعنی یا کلیک قبلی
+    جواب داده یا پیام/دکمه منقضی شده — در هر دو حالت True برمی‌گرداند و متوقف
+    می‌شود (بدون تلاش اضافه). اگر بعد از max_attempts هنوز دکمه بود، False
+    برمی‌گرداند. FloodWait به‌صورت خودکار مدیریت می‌شود.
+    """
+    for attempt in range(max_attempts):
+        try:
+            fresh = await client.get_messages(chat_id, ids=message_id)
+        except Exception as e:
+            logging.error(f"⚠️ خطا در خواندن پیام هنگام کلیک (تلاش {attempt + 1}): {e}")
+            log_internal_error("game_click_refetch_error", e)
+            return False
+
+        if not fresh:
+            return False
+
+        btn = find_button_fn(fresh)
+        if not btn:
+            return True  # دکمه دیگه نیست — یا موفق شده یا دیگه لازم نیست
+
+        try:
+            await safe_call(btn.click)
+        except FloodWaitError as e:
+            logging.warning(f"⏳ FloodWait حین کلیک: {e.seconds} ثانیه صبر می‌کنیم.")
+            await asyncio.sleep(e.seconds + 1)
+            continue
+        except Exception as e:
+            logging.warning(f"⚠️ خطا در کلیک (تلاش {attempt + 1}/{max_attempts}): {e}")
+            log_internal_error("game_click_error", e)
+
+        await asyncio.sleep(retry_delay)
+
+    return False
 
 async def _wait_for_game_reply(client, chat_id, after_id, timeout, is_ready, is_valid):
     """
@@ -2119,17 +2362,17 @@ async def fish_worker(user_id, client):
                 rarity = next((r for r in FISH_NUTRITION_BY_RARITY if _normalize_fa(r) in normalized_text), None)
 
                 if rarity:
-                    if rarity == "افسانه‌ای":
-                        target_label = "بندازش تو یخچال"
-                        fallback_markers = ("یخچالجانداره", "یخچالپره")
-                    else:
-                        target_label = "بده پیشی بخوره"
-                        fallback_markers = ("سیر",)
+                    field = FISH_RARITY_TO_FIELD[rarity]
+                    default_op = "fridge" if rarity == "افسانه‌ای" else "feed"
+                    operation = user_data.get(user_id, {}).get(field) or default_op
+                    target_label = FISH_OPERATION_LABELS.get(operation, "بده پیشی بخوره")
+                    fallback_markers = FISH_OPERATION_FALLBACK_MARKERS.get(operation, ())
 
-                    btn = _find_button(info, target_label)
-                    if btn:
-                        await safe_call(btn.click)
+                    clicked = await _click_with_retry(
+                        client, chat_id, info.id, lambda m, lbl=target_label: _find_button(m, lbl)
+                    )
 
+                    if clicked and fallback_markers:
                         # چک می‌کنیم به یه دلیلی (پیشی سیره / یخچال پره) عملیات رد نشده باشه
                         await asyncio.sleep(2.5)
                         try:
@@ -2138,9 +2381,9 @@ async def fish_worker(user_id, client):
                             after_click = None
                         full_text_norm = _normalize_fa(after_click.text if after_click else "")
                         if any(marker in full_text_norm for marker in fallback_markers):
-                            sell_btn = _find_button(after_click, "فروش ماهی")
-                            if sell_btn:
-                                await safe_call(sell_btn.click)
+                            await _click_with_retry(
+                                client, chat_id, info.id, lambda m: _find_button(m, "فروش ماهی")
+                            )
                 elif "خواب" in normalized_text or "صبرکنی" in normalized_text:
                     # ماهی‌ها هنوز کول‌داون دارند؛ این خطا نیست، فقط باید صبر کرد.
                     # اگه زمان دقیق تو پیام باشه (مثل 33:01)، دقیقاً همون‌قدر می‌خوابیم
@@ -2209,9 +2452,11 @@ async def meowpoint_worker(user_id, client):
             if not info:
                 logging.warning(f"⚠️ کاربر {user_id}: ربات پیشی به‌موقع پاسخ نداد.")
             else:
-                btn = _find_button(info, "برداشت میو پوینت")
-                if btn:
-                    await safe_call(btn.click)
+                has_btn = _find_button(info, "برداشت میو پوینت") is not None
+                if has_btn:
+                    await _click_with_retry(
+                        client, chat_id, info.id, lambda m: _find_button(m, "برداشت میو پوینت")
+                    )
                 else:
                     preview = (info.text or "(بدون متن)")[:300]
                     logging.warning(f"⚠️ کاربر {user_id}: دکمه‌ی برداشت میو پوینت پیدا نشد. متن دریافتی: {preview!r}")
@@ -2235,6 +2480,198 @@ async def meowpoint_worker(user_id, client):
             log_internal_error("meowpoint_cycle_error", e)
 
         interval = user_data.get(user_id, {}).get("meowpoint_interval_seconds", MEOWPOINT_INTERVAL_SECONDS)
+        await asyncio.sleep(interval)
+
+# ---------- یخچال میویی ----------
+def _is_fridge_text(text):
+    t = _normalize_fa(text)
+    return "یخچالمیویی" in t or ("یخچال" in t and "ظرفیتیخچال" in t)
+
+def _is_fridge_empty(text):
+    t = _normalize_fa(text)
+    return "یخچالخالیاست" in t or "یخچالخالیه" in t
+
+FISH_ENTRY_RE = re.compile(r'[^\n]*\|[^\n]*\|[^\n]*\([^\n]*\)')
+
+def _parse_fridge_fish_entries(text):
+    """هر ماهیِ داخل یخچال را از روی ساختار پیام (نه اعداد Hardcode‌شده) تشخیص می‌دهد."""
+    if not text:
+        return []
+    entries = []
+    for line in FISH_ENTRY_RE.findall(text):
+        is_raw = "خام" in line and "پخته" not in line
+        entries.append({"raw": is_raw, "line": line})
+    return entries
+
+def _flatten_buttons(message):
+    if not message or not message.buttons:
+        return []
+    flat = []
+    for row in message.buttons:
+        flat.extend(row)
+    return flat
+
+async def _wait_for_message_change(client, chat_id, message_id, is_target, timeout=FISH_RESPONSE_TIMEOUT):
+    """
+    منتظر می‌ماند تا پیامی با همین شناسه (که ادیت می‌شود، نه پیام جدید) به حالت
+    مدنظر برسد. این الگو برای فلوهای چندمرحله‌ایِ MeowieQBot (انتخاب ماهی → منوی
+    عملیات → تایید پخت) استفاده می‌شود، چون این ربات مراحل را با ادیت همان پیام
+    نشان می‌دهد، نه با پیام جدید.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            msg = await client.get_messages(chat_id, ids=message_id)
+        except Exception as e:
+            logging.error(f"⚠️ خطا در خواندن پیام: {e}")
+            return None
+        if msg and is_target(msg):
+            return msg
+        await asyncio.sleep(1.5)
+    return None
+
+def _pick_cook_button(message):
+    """دکمه‌ی پخت را با روش حذفی پیدا می‌کند (بند ۱۷): هر دکمه‌ای که فروش/دادن‌به‌پیشی نباشد."""
+    if not message or not message.buttons:
+        return None
+    for row in message.buttons:
+        for btn in row:
+            t = _normalize_fa(btn.text or "")
+            if _normalize_fa("فروش ماهی") in t or _normalize_fa("بده پیشی بخوره") in t:
+                continue
+            return btn
+    return None
+
+def _pick_confirm_button(message):
+    """دکمه‌ی تایید (✅) را پیدا می‌کند؛ چون ممکنه Premium Emoji بدون متن باشه، در
+    نبود تطبیق متنی، از موقعیت (اولین دکمه) به‌عنوان fallback استفاده می‌شود."""
+    if not message or not message.buttons:
+        return None
+    for row in message.buttons:
+        for btn in row:
+            if "✅" in (btn.text or "") or "تایید" in _normalize_fa(btn.text or ""):
+                return btn
+    first_row = message.buttons[0] if message.buttons else []
+    return first_row[0] if first_row else None
+
+async def _process_fridge_fish(client, chat_id, fish_message_id, fish_button, user_id):
+    """یک ماهیِ خامِ داخل یخچال را انتخاب، پخت، و تایید می‌کند؛ بدون منتظر ماندن تا پایان پخت (بند ۲۰)."""
+    try:
+        await safe_call(fish_button.click)
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        return
+    except Exception as e:
+        logging.warning(f"⚠️ خطا در انتخاب ماهی یخچال برای کاربر {user_id}: {e}")
+        log_internal_error("fridge_select_fish_error", e)
+        return
+
+    menu_msg = await _wait_for_message_change(
+        client, chat_id, fish_message_id,
+        is_target=lambda m: _find_button(m, "فروش ماهی") is not None
+    )
+    if not menu_msg:
+        logging.warning(f"⚠️ کاربر {user_id}: منوی عملیات ماهیِ یخچال به‌موقع ظاهر نشد.")
+        return
+
+    cook_btn = _pick_cook_button(menu_msg)
+    if not cook_btn:
+        logging.warning(f"⚠️ کاربر {user_id}: دکمه‌ی پخت برای ماهی یخچال پیدا نشد.")
+        return
+
+    try:
+        await safe_call(cook_btn.click)
+    except Exception as e:
+        logging.warning(f"⚠️ خطا در انتخاب گزینه‌ی پخت برای کاربر {user_id}: {e}")
+        log_internal_error("fridge_pick_cook_error", e)
+        return
+
+    confirm_msg = await _wait_for_message_change(
+        client, chat_id, fish_message_id,
+        is_target=lambda m: "اطمینان" in _normalize_fa(m.text or "") or bool(m.buttons)
+    )
+    if not confirm_msg:
+        logging.warning(f"⚠️ کاربر {user_id}: پیام تاییدِ پخت به‌موقع ظاهر نشد.")
+        return
+
+    confirm_btn = _pick_confirm_button(confirm_msg)
+    if not confirm_btn:
+        return
+
+    try:
+        await safe_call(confirm_btn.click)
+    except Exception as e:
+        logging.warning(f"⚠️ خطا در تایید پخت برای کاربر {user_id}: {e}")
+        log_internal_error("fridge_confirm_cook_error", e)
+        return
+
+    # طبق بند ۲۰: به‌محض دیدن «درحال پخیدن»، همین ماهی تمومه؛ منتظر پایان پخت نمی‌مانیم.
+    await _wait_for_message_change(
+        client, chat_id, fish_message_id,
+        is_target=lambda m: "درحالپخیدن" in _normalize_fa(m.text or ""),
+        timeout=10
+    )
+
+async def fridge_worker(user_id, client):
+    """
+    هر fridge_interval_seconds (پیش‌فرض ۳۰ دقیقه)، یخچال میویی را بررسی می‌کند:
+    اگر خالی بود کاری نمی‌کند (و دکمه‌ی «ارتقا سطح یخچال» را کلیک نمی‌کند - بند ۱۲)،
+    وگرنه هر ماهیِ خام را مستقل انتخاب/پخت/تایید می‌کند (بند ۱۰-۲۱).
+    """
+    while True:
+        if user_id not in user_data or not user_data[user_id].get("fridge_enabled"):
+            break
+
+        chat_id = user_data[user_id].get("meow_chat_id")
+        if not chat_id:
+            break
+
+        try:
+            sent = await safe_call(client.send_message, chat_id, "یخچال میویی")
+            user_data[user_id]["fridge_last_run_at"] = datetime.now()
+            save_user(user_id, user_data[user_id])
+
+            info = await _wait_for_game_reply(
+                client, chat_id, sent.id, FISH_RESPONSE_TIMEOUT,
+                is_ready=_is_fridge_text, is_valid=_is_fridge_text
+            )
+            if not info:
+                logging.warning(f"⚠️ کاربر {user_id}: MeowieQBot به یخچال پاسخ نداد.")
+            elif _is_fridge_empty(info.text):
+                logging.info(f"ℹ️ کاربر {user_id}: یخچال میویی خالیه.")
+            else:
+                entries = _parse_fridge_fish_entries(info.text)
+                buttons = _flatten_buttons(info)
+                for idx, entry in enumerate(entries):
+                    if not user_data.get(user_id, {}).get("fridge_enabled"):
+                        break  # اگه وسط کار خاموش شد، فوری متوقف شو
+                    if not entry["raw"] or idx >= len(buttons):
+                        continue
+                    try:
+                        await _process_fridge_fish(client, chat_id, info.id, buttons[idx], user_id)
+                    except Exception as e:
+                        logging.error(f"⚠️ خطا در پردازش ماهی یخچال (index {idx}) برای کاربر {user_id}: {e}")
+                        log_internal_error("fridge_fish_process_error", e)
+                    await asyncio.sleep(GAME_CLICK_RETRY_DELAY)
+
+        except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
+                UserNotParticipantError, ChatAdminRequiredError) as e:
+            logging.warning(f"⚠️ یخچال میویی برای کاربر {user_id} به‌دلیل عدم دسترسی در گروه {chat_id} غیرفعال شد: {e}")
+            log_internal_error("fridge_permission_lost", e)
+            if user_id in user_data:
+                user_data[user_id]["fridge_enabled"] = False
+                save_user(user_id, user_data[user_id])
+            try:
+                await bot.send_message(user_id, "⛔ **یخچال میویی غیرفعال شد.** دیگر دسترسی لازم در گروه انتخاب‌شده وجود ندارد.")
+            except Exception:
+                pass
+            break
+
+        except Exception as e:
+            logging.error(f"⚠️ خطا در چرخه‌ی یخچال میویی برای کاربر {user_id}: {e}")
+            log_internal_error("fridge_cycle_error", e)
+
+        interval = user_data.get(user_id, {}).get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS)
         await asyncio.sleep(interval)
 
 async def diamond_billing_worker(user_id, client):
@@ -3213,6 +3650,52 @@ async def callback_handler(event):
         await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
         return
 
+    if data == b"meow_settings":
+        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
+        return
+
+    if data == b"fish_settings":
+        await safe_edit(event, get_fish_settings_text(user), buttons=get_fish_settings_keyboard(user))
+        return
+
+    if data == b"meowpoint_settings":
+        await safe_edit(event, get_meowpoint_settings_text(user), buttons=get_meowpoint_settings_keyboard(user))
+        return
+
+    if data == b"streetcat_settings":
+        await safe_edit(event, get_streetcat_settings_text(user), buttons=get_streetcat_settings_keyboard(user))
+        return
+
+    if data == b"fridge_settings":
+        await safe_edit(event, get_fridge_settings_text(user), buttons=get_fridge_settings_keyboard(user))
+        return
+
+    if data == b"fish_ops_menu":
+        await safe_edit(event, get_fish_ops_menu_text(user), buttons=get_fish_ops_menu_keyboard(user))
+        return
+
+    if data.startswith(b"fishop_rarity_"):
+        rarity_key = data.decode().split("fishop_rarity_", 1)[1]
+        if rarity_key not in dict(FISH_OPS_RARITY_LABELS):
+            await event.answer("❌ سطح نامعتبر است.", alert=True)
+            return
+        label = dict(FISH_OPS_RARITY_LABELS)[rarity_key]
+        await safe_edit(event, f"⚙️ **عملیات ماهی — سطح {label}**", buttons=get_fish_op_rarity_keyboard(user, rarity_key))
+        return
+
+    if data.startswith(b"fishop_set_"):
+        remainder = data.decode().split("fishop_set_", 1)[1]
+        rarity_key, _, op_key = remainder.rpartition("_")
+        if rarity_key not in dict(FISH_OPS_RARITY_LABELS) or op_key not in ("sell", "feed", "fridge"):
+            await event.answer("❌ مقدار نامعتبر است.", alert=True)
+            return
+        user[f"fish_operation_{rarity_key}"] = op_key
+        save_user(user_id, user)
+        log_settings_change(user_id, f"fish_operation_{rarity_key}", op_key)
+        label = dict(FISH_OPS_RARITY_LABELS)[rarity_key]
+        await safe_edit(event, f"⚙️ **عملیات ماهی — سطح {label}**", buttons=get_fish_op_rarity_keyboard(user, rarity_key))
+        return
+
     if data == b"meow_toggle":
         want_on = not user.get("meow_enabled", False)
 
@@ -3239,7 +3722,7 @@ async def callback_handler(event):
                 save_user(user_id, user)
                 await event.answer("❌ ابتدا Self را روشن کنید.", alert=True)
 
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
         return
 
     if data == b"meow_interval_inc":
@@ -3247,7 +3730,7 @@ async def callback_handler(event):
         user["meow_interval_seconds"] = current + 5
         save_user(user_id, user)
         log_settings_change(user_id, "meow_interval_seconds", user["meow_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
         return
 
     if data == b"meow_interval_dec":
@@ -3255,7 +3738,7 @@ async def callback_handler(event):
         user["meow_interval_seconds"] = max(5, current - 5)
         save_user(user_id, user)
         log_settings_change(user_id, "meow_interval_seconds", user["meow_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
         return
 
     if data == b"fish_toggle":
@@ -3283,7 +3766,7 @@ async def callback_handler(event):
                 save_user(user_id, user)
                 await event.answer("❌ ابتدا Self را روشن کنید.", alert=True)
 
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_fish_settings_text(user), buttons=get_fish_settings_keyboard(user))
         return
 
     if data == b"fish_interval_inc":
@@ -3291,7 +3774,7 @@ async def callback_handler(event):
         user["fish_interval_seconds"] = current + INTERVAL_STEP_SECONDS
         save_user(user_id, user)
         log_settings_change(user_id, "fish_interval_seconds", user["fish_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_fish_settings_text(user), buttons=get_fish_settings_keyboard(user))
         return
 
     if data == b"fish_interval_dec":
@@ -3299,7 +3782,7 @@ async def callback_handler(event):
         user["fish_interval_seconds"] = max(INTERVAL_STEP_SECONDS, current - INTERVAL_STEP_SECONDS)
         save_user(user_id, user)
         log_settings_change(user_id, "fish_interval_seconds", user["fish_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_fish_settings_text(user), buttons=get_fish_settings_keyboard(user))
         return
 
     if data == b"meowpoint_toggle":
@@ -3327,7 +3810,7 @@ async def callback_handler(event):
                 save_user(user_id, user)
                 await event.answer("❌ ابتدا Self را روشن کنید.", alert=True)
 
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meowpoint_settings_text(user), buttons=get_meowpoint_settings_keyboard(user))
         return
 
     if data == b"meowpoint_interval_inc":
@@ -3335,7 +3818,7 @@ async def callback_handler(event):
         user["meowpoint_interval_seconds"] = current + INTERVAL_STEP_SECONDS
         save_user(user_id, user)
         log_settings_change(user_id, "meowpoint_interval_seconds", user["meowpoint_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meowpoint_settings_text(user), buttons=get_meowpoint_settings_keyboard(user))
         return
 
     if data == b"meowpoint_interval_dec":
@@ -3343,7 +3826,7 @@ async def callback_handler(event):
         user["meowpoint_interval_seconds"] = max(INTERVAL_STEP_SECONDS, current - INTERVAL_STEP_SECONDS)
         save_user(user_id, user)
         log_settings_change(user_id, "meowpoint_interval_seconds", user["meowpoint_interval_seconds"])
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meowpoint_settings_text(user), buttons=get_meowpoint_settings_keyboard(user))
         return
 
     if data == b"streetcat_toggle":
@@ -3358,7 +3841,51 @@ async def callback_handler(event):
         log_settings_change(user_id, "streetcat_enabled", want_on)
         # این قابلیت رویدادمحوره (بدون تایمر)؛ هندلرش همیشه ثبت‌شده‌ست و فقط این
         # فلگ رو چک می‌کنه، پس نیازی به استارت/استاپ Task نیست.
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_streetcat_settings_text(user), buttons=get_streetcat_settings_keyboard(user))
+        return
+
+    if data == b"fridge_toggle":
+        want_on = not user.get("fridge_enabled", False)
+
+        if want_on and not user.get("meow_chat_id"):
+            await event.answer("❌ ابتدا از بخش میو یک گروه انتخاب کنید.", alert=True)
+            return
+
+        user["fridge_enabled"] = want_on
+        save_user(user_id, user)
+        log_settings_change(user_id, "fridge_enabled", want_on)
+
+        old_task = user.get("fridge_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        user["fridge_task"] = None
+
+        if want_on:
+            client = active_clients.get(user_id)
+            if client:
+                user["fridge_task"] = asyncio.get_event_loop().create_task(fridge_worker(user_id, client))
+            else:
+                user["fridge_enabled"] = False
+                save_user(user_id, user)
+                await event.answer("❌ ابتدا Self را روشن کنید.", alert=True)
+
+        await safe_edit(event, get_fridge_settings_text(user), buttons=get_fridge_settings_keyboard(user))
+        return
+
+    if data == b"fridge_interval_inc":
+        current = user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS)
+        user["fridge_interval_seconds"] = current + INTERVAL_STEP_SECONDS
+        save_user(user_id, user)
+        log_settings_change(user_id, "fridge_interval_seconds", user["fridge_interval_seconds"])
+        await safe_edit(event, get_fridge_settings_text(user), buttons=get_fridge_settings_keyboard(user))
+        return
+
+    if data == b"fridge_interval_dec":
+        current = user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS)
+        user["fridge_interval_seconds"] = max(INTERVAL_STEP_SECONDS, current - INTERVAL_STEP_SECONDS)
+        save_user(user_id, user)
+        log_settings_change(user_id, "fridge_interval_seconds", user["fridge_interval_seconds"])
+        await safe_edit(event, get_fridge_settings_text(user), buttons=get_fridge_settings_keyboard(user))
         return
 
     if data == b"meow_select_group":
@@ -3419,7 +3946,7 @@ async def callback_handler(event):
                     user["meow_task"] = asyncio.get_event_loop().create_task(meow_worker(user_id, client))
 
         meow_group_cache.pop(user_id, None)
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
         return
 
     if data == b"secretary_toggle":
