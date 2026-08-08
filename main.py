@@ -2511,6 +2511,15 @@ def _flatten_buttons(message):
         flat.extend(row)
     return flat
 
+def _flatten_fridge_fish_buttons(message):
+    """
+    دکمه‌های مربوط به ماهی‌های داخل یخچال را برمی‌گرداند، بدون دکمه‌ی «ارتقا سطح
+    یخچال» (که همیشه ردیف اول است و نباید کلیک شود - بند ۱۲). ماهی‌ها از ردیف
+    دوم به بعد، هر ردیف حداکثر ۳ تا، می‌آیند.
+    """
+    upgrade_marker = _normalize_fa("ارتقا سطح یخچال")
+    return [b for b in _flatten_buttons(message) if upgrade_marker not in _normalize_fa(b.text or "")]
+
 async def _wait_for_message_change(client, chat_id, message_id, is_target, timeout=FISH_RESPONSE_TIMEOUT):
     """
     منتظر می‌ماند تا پیامی با همین شناسه (که ادیت می‌شود، نه پیام جدید) به حالت
@@ -2641,7 +2650,7 @@ async def fridge_worker(user_id, client):
                 logging.info(f"ℹ️ کاربر {user_id}: یخچال میویی خالیه.")
             else:
                 entries = _parse_fridge_fish_entries(info.text)
-                buttons = _flatten_buttons(info)
+                buttons = _flatten_fridge_fish_buttons(info)
                 for idx, entry in enumerate(entries):
                     if not user_data.get(user_id, {}).get("fridge_enabled"):
                         break  # اگه وسط کار خاموش شد، فوری متوقف شو
