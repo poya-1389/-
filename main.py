@@ -2,6 +2,8 @@ import asyncio
 import time
 import re
 import os
+import secrets
+import string
 import pytz
 import psycopg2
 import jdatetime
@@ -112,6 +114,7 @@ broadcast_data = {}
 secretary_state = {}   # {user_id: {peer_id: {"replied": bool, "task": Task}}}
 _auto_sent_marks = set()  # {(user_id, chat_id, message_id)} پیام‌هایی که خودمان خودکار فرستادیم (نباید توسط حالت متن ادیت شوند)
 transfer_data = {}     # {user_id: {"target_id":..., "amount":...}} وضعیت موقت انتقال الماس
+purchase_data = {}     # {user_id: {"buffer":..., "amount":..., "toman":..., "order_id":...}} وضعیت موقت خرید الماس
 meow_group_cache = {}  # {user_id: [(chat_id, title), ...]} کش موقت لیست گروه‌ها برای صفحه‌بندی انتخاب گروه میو
 admin_action_data = {} # {admin_id: {"type":..., "target_id":..., "step":...}} وضعیت موقت عملیات مدیریتی روی الماس/رفرال
 click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پردازش کلیک تکراری روی دکمه‌ها
@@ -239,6 +242,7 @@ def init_db():
             ("fish_operation_rare", "TEXT DEFAULT 'feed'"),
             ("fish_operation_epic", "TEXT DEFAULT 'feed'"),
             ("fish_operation_legendary", "TEXT DEFAULT 'fridge'"),
+            ("meow_chat_title", "TEXT"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -282,6 +286,55 @@ def init_db():
         ''')
         conn.commit()
 
+        # ---------- سفارش‌های خرید الماس (بخش خرید الماس / کارت‌به‌کارت) ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_orders (
+                order_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                amount_diamonds DOUBLE PRECISION NOT NULL,
+                amount_toman BIGINT NOT NULL,
+                payment_method TEXT DEFAULT 'card_to_card',
+                status TEXT DEFAULT 'invoice',
+                receipt_chat_id BIGINT,
+                receipt_message_id BIGINT,
+                receipt_file_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                approved_at TIMESTAMP,
+                approved_by BIGINT,
+                rejected_at TIMESTAMP,
+                rejected_by BIGINT,
+                rejection_reason TEXT
+            )
+        ''')
+        conn.commit()
+
+        # ---------- لاگ پیام‌های ارسالی ادمین (تکی/همگانی) برای مدیریت/حذف بعدی ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_broadcasts (
+                broadcast_id TEXT PRIMARY KEY,
+                admin_id BIGINT,
+                kind TEXT,
+                target_id BIGINT,
+                summary TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_broadcast_deliveries (
+                id SERIAL PRIMARY KEY,
+                broadcast_id TEXT REFERENCES novaself_broadcasts(broadcast_id) ON DELETE CASCADE,
+                user_id BIGINT,
+                chat_id BIGINT,
+                message_id BIGINT,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
         logging.info("✅ دیتابیس با موفقیت راه‌اندازی/بروزرسانی شد.")
         cursor.close()
         conn.close()
@@ -303,7 +356,8 @@ def get_all_users():
                    meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
                    streetcat_enabled,
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
-                   fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary
+                   fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
+                   meow_chat_title
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -352,6 +406,7 @@ def get_all_users():
                 "fish_operation_rare": row['fish_operation_rare'] or "feed",
                 "fish_operation_epic": row['fish_operation_epic'] or "feed",
                 "fish_operation_legendary": row['fish_operation_legendary'] or "fridge",
+                "meow_chat_title": row['meow_chat_title'],
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -388,8 +443,9 @@ def save_user(user_id, user):
                  meowpoint_enabled, meowpoint_interval_seconds, meowpoint_last_run_at,
                  streetcat_enabled,
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
-                 fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
+                 meow_chat_title)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -422,7 +478,8 @@ def save_user(user_id, user):
                 fish_operation_common = EXCLUDED.fish_operation_common,
                 fish_operation_rare = EXCLUDED.fish_operation_rare,
                 fish_operation_epic = EXCLUDED.fish_operation_epic,
-                fish_operation_legendary = EXCLUDED.fish_operation_legendary
+                fish_operation_legendary = EXCLUDED.fish_operation_legendary,
+                meow_chat_title = EXCLUDED.meow_chat_title
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -443,7 +500,8 @@ def save_user(user_id, user):
             int(user.get("fridge_enabled", False)), user.get("fridge_interval_seconds", FRIDGE_INTERVAL_SECONDS),
             user.get("fridge_last_run_at"),
             user.get("fish_operation_common", "feed"), user.get("fish_operation_rare", "feed"),
-            user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge")
+            user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
+            user.get("meow_chat_title")
         ))
         conn.commit()
         cursor.close()
@@ -748,6 +806,80 @@ def redeem_gift_code_db(code, user_id):
         if conn:
             conn.close()
 
+def get_gift_code_detail_db(code):
+    """جزئیات کامل یک کد هدیه به‌همراه تعداد دفعات استفاده (برای صفحه مدیریت کد)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_gift_codes WHERE code = %s", (code,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cursor.execute("SELECT COUNT(*) FROM novaself_gift_code_uses WHERE code = %s", (code,))
+        uses = cursor.fetchone()[0]
+        result = dict(row)
+        result["uses_count"] = uses
+        return result
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت جزئیات کد هدیه {code}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def update_gift_code_amount_db(code, new_diamonds):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_gift_codes SET diamonds = %s WHERE code = %s", (new_diamonds, code))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر مقدار الماس کد هدیه {code}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def update_gift_code_expiry_db(code, new_expires_at):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_gift_codes SET expires_at = %s WHERE code = %s", (new_expires_at, code))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر انقضای کد هدیه {code}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def delete_gift_code_db(code):
+    """حذف کامل کد هدیه (و رکوردهای استفاده‌ی مرتبط با آن، به‌واسطه‌ی CASCADE)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM novaself_gift_codes WHERE code = %s", (code,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف کد هدیه {code}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
 def admin_adjust_diamonds_db(target_id, amount):
     """
     افزایش/کاهش دستی موجودی الماس توسط ادمین (amount می‌تواند منفی باشد).
@@ -834,6 +966,288 @@ def get_live_balance_db(user_id):
         logging.error(f"❌ خطا در خواندن موجودی لحظه‌ای کاربر {user_id}: {e}")
         return None
 
+def _generate_unique_code(length=8, alphabet=string.ascii_uppercase + string.digits):
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+# ======================== سفارش‌های خرید الماس ========================
+def create_order_db(user_id, username, amount_diamonds, amount_toman, payment_method="card_to_card"):
+    """
+    ساخت یک سفارش جدید با Order ID یکتا. تلاش می‌شود تا در صورت برخورد نادر با
+    یک کد تکراری، دوباره یک کد جدید تولید و امتحان شود.
+    خروجی: order_id در صورت موفقیت، یا None در صورت خطا.
+    """
+    conn = None
+    for _ in range(5):
+        order_id = _generate_unique_code(8)
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO novaself_orders "
+                "(order_id, user_id, username, amount_diamonds, amount_toman, payment_method, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'invoice')",
+                (order_id, user_id, username, amount_diamonds, amount_toman, payment_method)
+            )
+            conn.commit()
+            return order_id
+        except psycopg2.errors.UniqueViolation:
+            if conn:
+                conn.rollback()
+            continue
+        except Exception as e:
+            logging.error(f"❌ خطا در ساخت سفارش برای کاربر {user_id}: {e}")
+            if conn:
+                conn.rollback()
+            return None
+        finally:
+            if conn:
+                conn.close()
+                conn = None
+    return None
+
+def get_order_db(order_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_orders WHERE order_id = %s", (order_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن سفارش {order_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def set_order_receipt_db(order_id, chat_id, message_id, file_id):
+    """
+    ثبت رسید و انتقال اتمیک سفارش از وضعیت 'invoice' به 'pending_review'.
+    اگر سفارش از قبل در همین وضعیت نباشد (مثلاً قبلاً رسید ارسال شده)، عملیات رد می‌شود
+    تا از ارسال چند رسید برای یک سفارش جلوگیری شود.
+    خروجی: (success, order_dict یا None)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_orders WHERE order_id = %s FOR UPDATE", (order_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, None
+        if row["status"] != "invoice":
+            conn.rollback()
+            return False, dict(row)
+
+        cursor.execute(
+            "UPDATE novaself_orders SET status = 'pending_review', receipt_chat_id = %s, "
+            "receipt_message_id = %s, receipt_file_id = %s, updated_at = %s WHERE order_id = %s",
+            (chat_id, message_id, file_id, datetime.now(), order_id)
+        )
+        conn.commit()
+        row = dict(row)
+        row["status"] = "pending_review"
+        return True, row
+    except Exception as e:
+        logging.error(f"❌ خطا در ثبت رسید سفارش {order_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False, None
+    finally:
+        if conn:
+            conn.close()
+
+def approve_order_db(order_id, admin_id):
+    """
+    تأیید اتمیک سفارش: فقط اگر سفارش دقیقاً در وضعیت 'pending_review' باشد پردازش می‌شود
+    (با قفل ردیف سفارش)، سپس موجودی کاربر با قفل جداگانه افزایش می‌یابد. اگر دو ادمین
+    همزمان تأیید کنند، دومی روی همین SELECT...FOR UPDATE بلاک شده و بعد از Commit اولی،
+    وضعیت را 'approved' می‌بیند و خروجی already_processed برمی‌گرداند.
+    خروجی: (success, status_code, order_dict)
+    status_code یکی از: 'ok', 'not_found', 'already_processed'
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_orders WHERE order_id = %s FOR UPDATE", (order_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, "not_found", None
+        if row["status"] != "pending_review":
+            conn.rollback()
+            return False, "already_processed", dict(row)
+
+        user_id = row["user_id"]
+        cursor.execute("SELECT diamonds FROM novaself_users WHERE user_id = %s FOR UPDATE", (user_id,))
+        user_row = cursor.fetchone()
+        if not user_row:
+            conn.rollback()
+            return False, "user_not_found", dict(row)
+
+        new_balance = float(user_row["diamonds"] or 0) + float(row["amount_diamonds"])
+        now = datetime.now()
+        cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_balance, user_id))
+        cursor.execute(
+            "UPDATE novaself_orders SET status = 'approved', approved_at = %s, approved_by = %s, "
+            "updated_at = %s WHERE order_id = %s",
+            (now, admin_id, now, order_id)
+        )
+        conn.commit()
+
+        result = dict(row)
+        result["status"] = "approved"
+        result["approved_at"] = now
+        result["approved_by"] = admin_id
+        result["_new_balance"] = new_balance
+        return True, "ok", result
+    except Exception as e:
+        logging.error(f"❌ خطا در تأیید سفارش {order_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False, "error", None
+    finally:
+        if conn:
+            conn.close()
+
+def reject_order_db(order_id, admin_id, reason):
+    """رد اتمیک سفارش؛ فقط اگر هنوز در وضعیت 'pending_review' باشد (مشابه approve_order_db)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_orders WHERE order_id = %s FOR UPDATE", (order_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False, "not_found", None
+        if row["status"] != "pending_review":
+            conn.rollback()
+            return False, "already_processed", dict(row)
+
+        now = datetime.now()
+        cursor.execute(
+            "UPDATE novaself_orders SET status = 'rejected', rejected_at = %s, rejected_by = %s, "
+            "rejection_reason = %s, updated_at = %s WHERE order_id = %s",
+            (now, admin_id, reason, now, order_id)
+        )
+        conn.commit()
+        result = dict(row)
+        result["status"] = "rejected"
+        result["rejection_reason"] = reason
+        return True, "ok", result
+    except Exception as e:
+        logging.error(f"❌ خطا در رد سفارش {order_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False, "error", None
+    finally:
+        if conn:
+            conn.close()
+
+# ======================== لاگ پیام‌های ادمین (تکی/همگانی) ========================
+def create_broadcast_record_db(admin_id, kind, target_id, summary):
+    conn = None
+    for _ in range(5):
+        broadcast_id = _generate_unique_code(10)
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO novaself_broadcasts (broadcast_id, admin_id, kind, target_id, summary) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (broadcast_id, admin_id, kind, target_id, (summary or "")[:200])
+            )
+            conn.commit()
+            return broadcast_id
+        except psycopg2.errors.UniqueViolation:
+            if conn:
+                conn.rollback()
+            continue
+        except Exception as e:
+            logging.error(f"❌ خطا در ثبت رکورد پیام ادمین: {e}")
+            if conn:
+                conn.rollback()
+            return None
+        finally:
+            if conn:
+                conn.close()
+                conn = None
+    return None
+
+def add_broadcast_delivery_db(broadcast_id, user_id, chat_id, message_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_broadcast_deliveries (broadcast_id, user_id, chat_id, message_id) "
+            "VALUES (%s, %s, %s, %s)",
+            (broadcast_id, user_id, chat_id, message_id)
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"❌ خطا در ثبت رسید ارسال پیام ({broadcast_id}): {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+def list_broadcasts_db(limit=15):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(
+            "SELECT broadcast_id, admin_id, kind, target_id, summary, created_at "
+            "FROM novaself_broadcasts ORDER BY created_at DESC LIMIT %s", (limit,)
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت لیست پیام‌های ارسالی: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_broadcast_deliveries_db(broadcast_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(
+            "SELECT user_id, chat_id, message_id FROM novaself_broadcast_deliveries WHERE broadcast_id = %s",
+            (broadcast_id,)
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت رسیدهای پیام {broadcast_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def delete_broadcast_record_db(broadcast_id):
+    """حذف رکورد پیام و همه‌ی رسیدهای مرتبط (CASCADE) بعد از حذف پیام‌ها از چت کاربران."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM novaself_broadcasts WHERE broadcast_id = %s", (broadcast_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف رکورد پیام {broadcast_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
 def format_diamonds(value):
     value = float(value or 0)
     if value == int(value):
@@ -884,6 +1298,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "last_charge_at": datetime.now(),
         "meow_enabled": False,
         "meow_chat_id": None,
+        "meow_chat_title": None,
         "meow_last_sent_at": None,
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
@@ -961,6 +1376,47 @@ def build_format_entities(text, mode):
     if mode == 8:
         return [MessageEntityCode(offset, length)]
     return None
+
+def _describe_message_kind(msg):
+    """برچسب فارسیِ نوع محتوای پیام (برای پیش‌نمایش تایید ارسال و لیست پیام‌های ادمین)."""
+    if getattr(msg, "photo", None):
+        return "🖼 عکس"
+    if getattr(msg, "video", None):
+        return "🎥 ویدیو"
+    if getattr(msg, "voice", None):
+        return "🎙 پیام صوتی"
+    if getattr(msg, "video_note", None):
+        return "⭕ Video Note"
+    if getattr(msg, "gif", None):
+        return "🌀 GIF/انیمیشن"
+    if getattr(msg, "sticker", None):
+        return "🌀 استیکر"
+    if getattr(msg, "audio", None):
+        return "🎵 موزیک"
+    if getattr(msg, "document", None):
+        return "📄 فایل"
+    if getattr(msg, "poll", None):
+        return "📊 نظرسنجی"
+    if getattr(msg, "contact", None):
+        return "👤 مخاطب"
+    if getattr(msg, "geo", None):
+        return "📍 موقعیت مکانی"
+    return "📝 متن"
+
+async def _copy_message_to(client, target_id, src_msg):
+    """
+    یک نسخه‌ی کامل از پیام (متن + Formatting + هر نوع رسانه: عکس/ویدیو/فایل/ویس/
+    Video Note/استیکر/GIF/موزیک/Poll/Contact/Location) را برای target_id ارسال می‌کند.
+    اگر پیام مبدا خودش Forward بوده، با forward_messages به‌صورت Forward واقعی
+    (حفظ هدر «Forwarded from») ارسال می‌شود؛ در غیر این صورت با پاس‌دادن مستقیمِ شیء
+    Message به send_message، Telethon خودش متن/Entityها/رسانه را کپی می‌کند (بدون
+    هدر Forward) — این رفتار رسمیِ Telethon برای «کپی پیام» است و متن را Plain نمی‌کند.
+    خروجی: شیء Message ارسال‌شده (برای ثبت message_id جهت حذف بعدی).
+    """
+    if getattr(src_msg, "forward", None):
+        result = await client.forward_messages(target_id, messages=src_msg.id, from_peer=src_msg.chat_id)
+        return result[0] if isinstance(result, list) else result
+    return await client.send_message(target_id, src_msg)
 
 async def safe_edit(event, text, buttons=None):
     """
@@ -1179,7 +1635,10 @@ def get_meow_menu_text(user):
     return "🐱 **بخش میو**\n\nیکی از قابلیت‌های زیر را برای مدیریت انتخاب کنید:"
 
 def get_meow_menu_keyboard(user):
+    group_title = user.get("meow_chat_title")
+    group_label = f"📍 گروه: {group_title[:28]}" if group_title else "📍 گروه: انتخاب نشده"
     return [
+        [styled_button(group_label, b"meow_select_group", style=STYLE_INFO if group_title else STYLE_OFF)],
         [toggle_button("🐱 میو", user.get("meow_enabled", False), b"meow_settings")],
         [toggle_button("🐟 ماهی", user.get("fish_enabled", False), b"fish_settings")],
         [toggle_button("🪙 میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_settings")],
@@ -1190,7 +1649,8 @@ def get_meow_menu_keyboard(user):
 
 def get_meow_settings_text(user):
     chat_id = user.get("meow_chat_id")
-    group_line = f"`{chat_id}`" if chat_id else "هنوز انتخاب نشده"
+    group_title = user.get("meow_chat_title")
+    group_line = (group_title or f"`{chat_id}`") if chat_id else "هنوز انتخاب نشده"
     last_sent = user.get("meow_last_sent_at")
     last_line = last_sent.strftime("%Y-%m-%d %H:%M:%S") if last_sent else "—"
     interval = user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
@@ -1205,7 +1665,6 @@ def get_meow_settings_keyboard(user):
     interval = user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS)
     return [
         [toggle_button("میو", user.get("meow_enabled", False), b"meow_toggle")],
-        [styled_button("انتخاب گروه", b"meow_select_group", style=STYLE_INFO)],
         [
             styled_button("➖", b"meow_interval_dec", style=STYLE_OFF),
             styled_button(f"⏱️ {format_interval(interval)}", b"void", style=STYLE_INFO),
@@ -1413,6 +1872,99 @@ def get_code_keyboard(current_code=""):
         ]
     ]
 
+# ======================== خرید الماس (کیبورد عددی + State Machine) ========================
+MAX_BUY_DIAMONDS_DIGITS = 7  # جلوگیری از وارد کردن اعداد نجومی/بی‌معنی
+
+def get_buy_amount_keyboard(buffer_str):
+    display = buffer_str if buffer_str else "0"
+    try:
+        preview_toman = f"{int(buffer_str) * DIAMOND_PRICE_TOMAN:,}" if buffer_str else "0"
+    except ValueError:
+        preview_toman = "0"
+    return [
+        [Button.inline(f"💎 تعداد: {display}  |  💰 {preview_toman} تومان", b"void")],
+        [Button.inline("1", b"buy_k_1"), Button.inline("2", b"buy_k_2"), Button.inline("3", b"buy_k_3")],
+        [Button.inline("4", b"buy_k_4"), Button.inline("5", b"buy_k_5"), Button.inline("6", b"buy_k_6")],
+        [Button.inline("7", b"buy_k_7"), Button.inline("8", b"buy_k_8"), Button.inline("9", b"buy_k_9")],
+        [
+            styled_button("⌫", b"buy_k_back", style=STYLE_OFF),
+            Button.inline("0", b"buy_k_0"),
+            styled_button("✅ تأیید", b"buy_k_submit", style=STYLE_ON),
+        ],
+        [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]
+    ]
+
+def get_buy_confirm_text(amount):
+    toman = amount * DIAMOND_PRICE_TOMAN
+    return (
+        "💎 **تأیید مقدار خرید**\n\n"
+        f"💎 تعداد الماس:\n{format_diamonds(amount)}\n\n"
+        f"💰 مبلغ قابل پرداخت:\n{toman:,.0f} تومان"
+    )
+
+def get_buy_confirm_keyboard():
+    return [
+        [styled_button("✅ تأیید", b"buy_amount_confirm", style=STYLE_ON)],
+        [styled_button("➜ بازگشت", b"buy_amount_back", style=STYLE_OFF)]
+    ]
+
+def get_buy_payment_text(amount):
+    toman = amount * DIAMOND_PRICE_TOMAN
+    return (
+        "💳 **انتخاب روش پرداخت**\n\n"
+        f"تعداد الماس:\n{format_diamonds(amount)}\n\n"
+        f"مبلغ قابل پرداخت:\n{toman:,.0f} تومان\n\n"
+        "یکی از روش‌های پرداخت زیر را انتخاب کنید."
+    )
+
+def get_buy_payment_keyboard():
+    return [
+        [
+            styled_button("💳 کارت به کارت", b"buy_pay_card", style=STYLE_ON),
+            styled_button("🔒 درگاه پرداخت", b"buy_pay_gateway", style=STYLE_OFF),
+        ],
+        [styled_button("➜ بازگشت", b"buy_payment_back", style=STYLE_OFF)]
+    ]
+
+def get_buy_invoice_text(order_id, user_id, username, amount, toman, created_at):
+    username_display = f"@{username}" if username else "ثبت نشده"
+    return (
+        "🧾 **فاکتور خرید الماس**\n\n"
+        f"👤 نام کاربر:\n{username_display}\n\n"
+        f"🆔 آیدی عددی:\n{user_id}\n\n"
+        f"💎 تعداد الماس:\n{format_diamonds(amount)}\n\n"
+        f"💰 مبلغ:\n{toman:,.0f} تومان\n\n"
+        f"🧾 کد سفارش:\n{order_id}\n\n"
+        f"⏱ زمان ایجاد:\n{created_at.strftime('%Y/%m/%d %H:%M')}\n\n"
+        "📌 وضعیت:\nدر انتظار پرداخت"
+    )
+
+def get_buy_invoice_keyboard():
+    return [
+        [styled_button("✅ تأیید فاکتور", b"buy_invoice_confirm", style=STYLE_ON)],
+        [styled_button("➜ بازگشت", b"buy_invoice_back", style=STYLE_OFF)]
+    ]
+
+CARD_TO_CARD_NUMBER = "6219861854957841"
+CARD_TO_CARD_OWNER = "محمدپویا حیدری‌فتسمی"
+
+def get_buy_waiting_receipt_text(toman):
+    # شماره کارت به‌صورت مونواسپیس (`...`) نمایش داده می‌شود چون در همه‌ی کلاینت‌های
+    # رسمی تلگرام، متن با فرمت Code به‌صورت خودکار با یک لمس قابل کپی‌شدن است —
+    # نیازی به دکمه‌ی مجزا برای Copy نیست (سازگار با همه‌ی نسخه‌های Telethon/کلاینت).
+    return (
+        "💳 **کارت به کارت**\n\n"
+        f"مبلغ {toman:,.0f} تومان رو به کارت زیر واریز کن:\n\n"
+        f"💳 شماره کارت (برای کپی لمس کنید):\n`{CARD_TO_CARD_NUMBER}`\n\n"
+        f"👤 به نام:\n{CARD_TO_CARD_OWNER}\n\n"
+        "بعد از واریز، عکس رسید رو همینجا بفرست تا بررسی و تأیید بشه ✅"
+    )
+
+def get_buy_waiting_receipt_keyboard():
+    return [
+        [styled_button("➜ بازگشت", b"buy_receipt_back", style=STYLE_OFF)]
+    ]
+
 # ======================== منوهای ادمین ========================
 def get_admin_main_menu():
     total, active = get_user_stats()
@@ -1422,6 +1974,7 @@ def get_admin_main_menu():
         [styled_button("📨 ارسال پیام همگانی", b"admin_broadcast", style=STYLE_INFO)],
         [styled_button("🔍 جستجوی کاربر", b"admin_search_user", style=STYLE_INFO)],
         [styled_button("🎁 مدیریت کدهای هدیه", b"admin_giftcodes", style=STYLE_INFO)],
+        [styled_button("🧾 پیام‌های ارسالی", b"admin_messages_list", style=STYLE_INFO)],
         [styled_button("📜 لاگ‌های مدیریتی اخیر", b"admin_logs", style=STYLE_INFO)],
         [styled_button("🔄 بروزرسانی همه کاربران", b"admin_refresh_all", style=STYLE_INFO)]
     ]
@@ -1429,9 +1982,9 @@ def get_admin_main_menu():
 def get_giftcodes_admin_text():
     codes = list_gift_codes_db()
     if not codes:
-        return "🎁 **مدیریت کدهای هدیه**\n\nهنوز هیچ کدی ساخته نشده است."
+        return "🎁 **مدیریت کدهای هدیه**\n\nهنوز هیچ کدی ساخته نشده است.\n\nبرای مدیریت هر کد، روی آن کلیک کنید."
 
-    lines = ["🎁 **مدیریت کدهای هدیه**\n"]
+    lines = ["🎁 **مدیریت کدهای هدیه**\n\nبرای مدیریت هر کد (تغییر مقدار/انقضا/فعال‌سازی/حذف)، روی آن کلیک کنید:\n"]
     for c in codes:
         state = status_icon(bool(c["is_active"]))
         expiry = c["expires_at"].strftime("%Y-%m-%d") if c["expires_at"] else "بدون انقضا"
@@ -1444,15 +1997,84 @@ def get_giftcodes_admin_keyboard():
 
     for c in codes:
         active = bool(c["is_active"])
-        toggle_data = f"admin_giftcode_toggle_{c['code']}".encode()
         buttons.append([styled_button(
-            f"{c['code']} — {'غیرفعال‌سازی' if active else 'فعال‌سازی'}",
-            toggle_data,
+            f"{status_icon(active)} {c['code']} — {format_diamonds(c['diamonds'])} 💎",
+            f"admin_giftcode_manage_{c['code']}".encode(),
             style=STYLE_ON if active else STYLE_OFF
         )])
 
     buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
     return buttons
+
+def get_giftcode_manage_text(detail):
+    state = status_icon(bool(detail["is_active"]))
+    expiry = detail["expires_at"].strftime("%Y-%m-%d %H:%M") if detail["expires_at"] else "بدون انقضا"
+    created = detail["created_at"].strftime("%Y-%m-%d %H:%M") if detail["created_at"] else "—"
+    return (
+        f"🎁 **مدیریت کد هدیه** `{detail['code']}`\n\n"
+        f"💎 مقدار الماس: {format_diamonds(detail['diamonds'])}\n"
+        f"👥 تعداد استفاده: {detail['uses_count']}\n"
+        f"📌 وضعیت: {state} {'فعال' if detail['is_active'] else 'غیرفعال'}\n"
+        f"⏱ تاریخ ایجاد: {created}\n"
+        f"📅 تاریخ انقضا: {expiry}"
+    )
+
+def get_giftcode_manage_keyboard(detail):
+    code = detail["code"]
+    active = bool(detail["is_active"])
+    return [
+        [styled_button("💎 تغییر مقدار الماس", f"admin_giftcode_editamount_{code}".encode(), style=STYLE_INFO)],
+        [styled_button("⏱ تغییر انقضا", f"admin_giftcode_editexpiry_{code}".encode(), style=STYLE_INFO)],
+        [styled_button(
+            "✕ غیرفعال کردن" if active else "✓ فعال کردن",
+            f"admin_giftcode_toggle_{code}".encode(),
+            style=STYLE_OFF if active else STYLE_ON
+        )],
+        [styled_button("🗑 حذف کد", f"admin_giftcode_delete_{code}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"admin_giftcodes", style=STYLE_OFF)]
+    ]
+
+def get_giftcode_delete_confirm_keyboard(code):
+    return [
+        [styled_button("🗑 بله، حذف شود", f"admin_giftcode_delete_confirm_{code}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", f"admin_giftcode_manage_{code}".encode(), style=STYLE_OFF)]
+    ]
+
+# ======================== لیست پیام‌های ارسالی توسط ادمین (تکی/همگانی) ========================
+def get_broadcasts_admin_text():
+    rows = list_broadcasts_db()
+    if not rows:
+        return "🧾 **پیام‌های ارسالی**\n\nهنوز هیچ پیامی از این بخش ارسال نشده است."
+    return "🧾 **پیام‌های ارسالی اخیر**\n\nبرای مشاهده‌ی وضعیت یا حذف هر پیام، روی آن کلیک کنید:"
+
+def get_broadcasts_admin_keyboard():
+    rows = list_broadcasts_db()
+    buttons = []
+    for r in rows:
+        kind_label = "همگانی" if r["kind"] == "broadcast" else f"تکی ← {r['target_id']}"
+        ts = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else "؟"
+        label = f"📨 [{kind_label}] {ts}"
+        buttons.append([styled_button(label, f"admin_message_view_{r['broadcast_id']}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
+    return buttons
+
+def get_broadcast_detail_text(record, deliveries_count):
+    kind_label = "ارسال همگانی" if record["kind"] == "broadcast" else f"ارسال تکی به کاربر {record['target_id']}"
+    ts = record["created_at"].strftime("%Y-%m-%d %H:%M") if record["created_at"] else "؟"
+    summary = record["summary"] or "(بدون متن / رسانه)"
+    return (
+        f"🧾 **جزئیات پیام ارسالی**\n\n"
+        f"نوع: {kind_label}\n"
+        f"زمان ارسال: {ts}\n"
+        f"تعداد گیرندگانِ موفق: {deliveries_count}\n\n"
+        f"پیش‌نمایش متن:\n{summary[:300]}"
+    )
+
+def get_broadcast_detail_keyboard(broadcast_id):
+    return [
+        [styled_button("🗑 حذف این پیام از چت کاربران", f"admin_message_delete_{broadcast_id}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"admin_messages_list", style=STYLE_OFF)]
+    ]
 
 def get_users_list_page(page=0, per_page=10):
     try:
@@ -2921,6 +3543,65 @@ async def callback_handler(event):
             )
             return
 
+        # صفحه‌ی مدیریت یک کد هدیه‌ی خاص
+        if data.startswith(b"admin_giftcode_manage_"):
+            code = data.decode().split("admin_giftcode_manage_", 1)[1]
+            detail = get_gift_code_detail_db(code)
+            if not detail:
+                await event.answer("❌ کد پیدا نشد.", alert=True)
+                await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
+                return
+            await safe_edit(event, get_giftcode_manage_text(detail), buttons=get_giftcode_manage_keyboard(detail))
+            return
+
+        if data.startswith(b"admin_giftcode_editamount_"):
+            code = data.decode().split("admin_giftcode_editamount_", 1)[1]
+            if not get_gift_code_detail_db(code):
+                await event.answer("❌ کد پیدا نشد.", alert=True)
+                return
+            admin_action_data[user_id] = {"type": "giftcode_edit_amount", "code": code, "step": "get_value"}
+            await safe_edit(event,
+                f"💎 **تغییر مقدار الماس کد** `{code}`\n\nمقدار جدید الماس را وارد کنید (عدد بزرگ‌تر از صفر):",
+                buttons=[[styled_button("➜ بازگشت", f"admin_giftcode_manage_{code}".encode(), style=STYLE_OFF)]]
+            )
+            return
+
+        if data.startswith(b"admin_giftcode_editexpiry_"):
+            code = data.decode().split("admin_giftcode_editexpiry_", 1)[1]
+            if not get_gift_code_detail_db(code):
+                await event.answer("❌ کد پیدا نشد.", alert=True)
+                return
+            admin_action_data[user_id] = {"type": "giftcode_edit_expiry", "code": code, "step": "get_value"}
+            await safe_edit(event,
+                f"⏱ **تغییر انقضای کد** `{code}`\n\n"
+                "چند روز دیگر این کد منقضی شود؟ (برای بدون انقضا عدد ۰ را ارسال کنید):",
+                buttons=[[styled_button("➜ بازگشت", f"admin_giftcode_manage_{code}".encode(), style=STYLE_OFF)]]
+            )
+            return
+
+        if data.startswith(b"admin_giftcode_delete_confirm_"):
+            code = data.decode().split("admin_giftcode_delete_confirm_", 1)[1]
+            success = delete_gift_code_db(code)
+            if success:
+                log_admin_action(user_id, 0, "delete_giftcode", f"code={code}")
+                await event.answer("✅ کد هدیه حذف شد.", alert=True)
+            else:
+                await event.answer("❌ کد پیدا نشد یا قبلاً حذف شده.", alert=True)
+            await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
+            return
+
+        if data.startswith(b"admin_giftcode_delete_"):
+            code = data.decode().split("admin_giftcode_delete_", 1)[1]
+            if not get_gift_code_detail_db(code):
+                await event.answer("❌ کد پیدا نشد.", alert=True)
+                return
+            await safe_edit(event,
+                f"⚠️ **حذف کد هدیه** `{code}`\n\n"
+                "این عملیات غیرقابل بازگشت است. آیا مطمئن هستید؟",
+                buttons=get_giftcode_delete_confirm_keyboard(code)
+            )
+            return
+
         if data.startswith(b"admin_giftcode_toggle_"):
             code = data.decode().split("admin_giftcode_toggle_", 1)[1]
             codes = {c["code"]: c for c in list_gift_codes_db()}
@@ -2931,7 +3612,82 @@ async def callback_handler(event):
             new_state = not bool(current["is_active"])
             set_gift_code_active_db(code, new_state)
             log_admin_action(user_id, 0, "toggle_giftcode", f"code={code} active={new_state}")
-            await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
+            detail = get_gift_code_detail_db(code)
+            if detail:
+                await safe_edit(event, get_giftcode_manage_text(detail), buttons=get_giftcode_manage_keyboard(detail))
+            else:
+                await safe_edit(event, get_giftcodes_admin_text(), buttons=get_giftcodes_admin_keyboard())
+            return
+
+        # ====================================================================
+        # ================ تأیید/رد سفارش‌های خرید الماس (توسط ادمین) ========
+        # ====================================================================
+        if data.startswith(b"order_approve_"):
+            order_id = data.decode().split("order_approve_", 1)[1]
+            success, status_code, order = approve_order_db(order_id, user_id)
+
+            if status_code == "not_found":
+                await event.answer("❌ سفارش پیدا نشد.", alert=True)
+                return
+            if status_code == "already_processed":
+                state = order.get("status") if order else "?"
+                await event.answer(f"⚠️ این سفارش قبلاً پردازش شده است (وضعیت فعلی: {state}).", alert=True)
+                return
+            if status_code == "user_not_found":
+                await event.answer("❌ کاربر مربوط به این سفارش پیدا نشد.", alert=True)
+                return
+            if not success:
+                await event.answer("❌ خطای دیتابیس رخ داد. دوباره تلاش کنید.", alert=True)
+                return
+
+            buyer_id = order["user_id"]
+            if buyer_id in user_data:
+                user_data[buyer_id]["diamonds"] = order["_new_balance"]
+
+            log_diamond_transfer("PURCHASE", buyer_id, order["amount_diamonds"])
+            log_admin_action(user_id, buyer_id, "approve_order", f"order={order_id} amount={order['amount_diamonds']}")
+
+            await event.answer("✅ سفارش تأیید شد و الماس به حساب کاربر اضافه شد.", alert=True)
+            try:
+                await event.reply(
+                    f"✅ سفارش `{order_id}` توسط ادمین تأیید و {format_diamonds(order['amount_diamonds'])} 💎 به کاربر اضافه شد."
+                )
+            except Exception:
+                pass
+
+            try:
+                await safe_call(bot.send_message, buyer_id,
+                    "✅ **سفارش شما با موفقیت تأیید شد.**\n\n"
+                    f"💎 الماس دریافت شده:\n{format_diamonds(order['amount_diamonds'])}\n\n"
+                    f"🧾 کد سفارش:\n{order_id}\n\n"
+                    f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
+                    "موجودی الماس شما با موفقیت شارژ شد."
+                )
+            except Exception as e:
+                log_internal_error("notify_order_approved", e)
+            return
+
+        if data.startswith(b"order_reject_cancel"):
+            admin_action_data.pop(user_id, None)
+            await event.answer("عملیات لغو‌کردن سفارش خودش لغو شد.", alert=True)
+            return
+
+        if data.startswith(b"order_reject_"):
+            order_id = data.decode().split("order_reject_", 1)[1]
+            order = get_order_db(order_id)
+            if not order:
+                await event.answer("❌ سفارش پیدا نشد.", alert=True)
+                return
+            if order["status"] != "pending_review":
+                await event.answer(f"⚠️ این سفارش قبلاً پردازش شده است (وضعیت فعلی: {order['status']}).", alert=True)
+                return
+
+            admin_action_data[user_id] = {"type": "reject_order", "order_id": order_id, "step": "get_reason"}
+            await event.respond(
+                "❌ **لغو سفارش**\n\n"
+                "لطفاً دلیل لغو سفارش را به‌صورت متن ارسال کنید:",
+                buttons=[[styled_button("➜ بازگشت", b"order_reject_cancel", style=STYLE_OFF)]]
+            )
             return
 
         # لیست کاربران
@@ -3177,7 +3933,8 @@ async def callback_handler(event):
             }
             await safe_edit(event,
                 f"📨 **ارسال پیام به کاربر {target_id}**\n\n"
-                "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
+                "لطفاً پیام خود را ارسال کنید (متن، عکس، ویدیو، فایل، ویس، Video Note، استیکر، GIF، "
+                "Poll، Contact، Location یا یک پیام Forward‌شده — همه پشتیبانی می‌شوند).\n"
                 "برای لغو عملیات، /cancel را بفرستید."
             )
             return
@@ -3191,7 +3948,8 @@ async def callback_handler(event):
             await safe_edit(event,
                 "📨 **ارسال پیام همگانی**\n\n"
                 "⚠️ این پیام برای **همه کاربران** ارسال خواهد شد!\n\n"
-                "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
+                "لطفاً پیام خود را ارسال کنید (متن، عکس، ویدیو، فایل، ویس، Video Note، استیکر، GIF، "
+                "Poll، Contact، Location یا یک پیام Forward‌شده — همه پشتیبانی می‌شوند).\n"
                 "برای لغو عملیات، /cancel را بفرستید."
             )
             return
@@ -3220,6 +3978,62 @@ async def callback_handler(event):
                     lines.append(f"▫️ [{ts}] ادمین {admin_id_l} ← کاربر {target_id_l} | {action_l} {details_l}")
                 log_text = "\n".join(lines)
             await safe_edit(event, log_text, buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
+            return
+
+        # ====================================================================
+        # ============ مدیریت پیام‌های ارسال‌شده توسط ادمین (بخش دوازدهم) ====
+        # ====================================================================
+        if data == b"admin_messages_list":
+            await safe_edit(event, get_broadcasts_admin_text(), buttons=get_broadcasts_admin_keyboard())
+            return
+
+        if data.startswith(b"admin_message_view_"):
+            broadcast_id = data.decode().split("admin_message_view_", 1)[1]
+            rows = {r["broadcast_id"]: r for r in list_broadcasts_db(limit=100)}
+            record = rows.get(broadcast_id)
+            if not record:
+                await event.answer("❌ این پیام پیدا نشد (شاید قبلاً حذف شده).", alert=True)
+                await safe_edit(event, get_broadcasts_admin_text(), buttons=get_broadcasts_admin_keyboard())
+                return
+            deliveries = get_broadcast_deliveries_db(broadcast_id)
+            await safe_edit(event, get_broadcast_detail_text(record, len(deliveries)),
+                             buttons=get_broadcast_detail_keyboard(broadcast_id))
+            return
+
+        if data.startswith(b"admin_message_delete_"):
+            broadcast_id = data.decode().split("admin_message_delete_", 1)[1]
+            deliveries = get_broadcast_deliveries_db(broadcast_id)
+
+            if not deliveries:
+                delete_broadcast_record_db(broadcast_id)
+                await event.answer("این پیام دیگر گیرنده‌ای ندارد؛ رکورد حذف شد.", alert=True)
+                await safe_edit(event, get_broadcasts_admin_text(), buttons=get_broadcasts_admin_keyboard())
+                return
+
+            await safe_edit(event, "⏳ در حال حذف پیام از چت کاربران...")
+
+            deleted_count = 0
+            failed_count = 0
+            for d in deliveries:
+                # هر خطا (کاربر پیام را قبلاً حذف کرده، بلاک کرده، ربات دسترسی حذف ندارد،
+                # پیام قدیمی است و ...) فقط برای همان کاربر ثبت می‌شود و ادامه‌ی حذف بقیه
+                # را متوقف نمی‌کند (بند ۲۷ آپدیت).
+                try:
+                    await bot.delete_messages(d["chat_id"], [d["message_id"]])
+                    deleted_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    log_internal_error("delete_broadcast_message", f"broadcast={broadcast_id} chat={d['chat_id']} err={e}")
+
+            delete_broadcast_record_db(broadcast_id)
+            log_admin_action(user_id, 0, "delete_broadcast", f"broadcast={broadcast_id} deleted={deleted_count} failed={failed_count}")
+
+            await safe_edit(event,
+                "🗑 **حذف پیام کامل شد.**\n\n"
+                f"✅ حذف‌شده از چت کاربران: {deleted_count}\n"
+                f"❌ ناموفق (قبلاً حذف‌شده/بلاک/دسترسی نبود): {failed_count}",
+                buttons=[styled_button("➜ بازگشت", b"admin_messages_list", style=STYLE_OFF)]
+            )
             return
 
         # افزایش الماس
@@ -3538,12 +4352,132 @@ async def callback_handler(event):
         await safe_edit(event, get_account_text(user_id, user), buttons=get_account_keyboard())
         return
 
+    # ====================================================================
+    # ====================== سیستم خرید الماس (State Machine) ==========
+    # ====================================================================
     if data == b"account_buy_diamond":
+        purchase_data[user_id] = {"buffer": ""}
+        user["step"] = "buy_amount"
         await safe_edit(event,
             "💎 **خرید الماس**\n\n"
-            "در حال حاضر درگاه پرداخت فعال نیست.\n\n"
-            f"جهت خرید الماس با {SUPPORT_USERNAME} در تماس باشید.",
-            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
+            "تعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+            buttons=get_buy_amount_keyboard("")
+        )
+        return
+
+    # این هندلر فقط باید وقتی که کاربر واقعاً در مرحله‌ی وارد کردن مقدار خرید است
+    # به کلیک‌های کیپد واکنش نشان بدهد؛ در غیر این صورت (مثلاً اگر کاربر از یک پیام
+    # قدیمی روی این دکمه‌ها بزند) بی‌صدا نادیده گرفته می‌شود تا با Stateهای دیگر تداخل نکند.
+    if data.startswith(b"buy_k_") and user.get("step") == "buy_amount":
+        pending = purchase_data.setdefault(user_id, {"buffer": ""})
+        buffer_str = pending.get("buffer", "")
+        action = data.decode().split("buy_k_", 1)[1]
+
+        if action == "back":
+            buffer_str = buffer_str[:-1]
+        elif action == "submit":
+            try:
+                amount = int(buffer_str)
+                if amount <= 0:
+                    raise ValueError
+            except ValueError:
+                await event.answer("❌ لطفاً یک عدد معتبر و بزرگ‌تر از صفر وارد کنید.", alert=True)
+                return
+
+            pending["amount"] = amount
+            pending["toman"] = amount * DIAMOND_PRICE_TOMAN
+            user["step"] = "buy_confirm"
+            await safe_edit(event, get_buy_confirm_text(amount), buttons=get_buy_confirm_keyboard())
+            return
+        elif action.isdigit() and len(buffer_str) < MAX_BUY_DIAMONDS_DIGITS:
+            buffer_str += action
+
+        pending["buffer"] = buffer_str
+        await safe_edit(event, "💎 **خرید الماس**\n\nتعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+                         buttons=get_buy_amount_keyboard(buffer_str))
+        return
+
+    if data == b"buy_amount_back" and user.get("step") == "buy_confirm":
+        pending = purchase_data.setdefault(user_id, {"buffer": ""})
+        user["step"] = "buy_amount"
+        await safe_edit(event, "💎 **خرید الماس**\n\nتعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+                         buttons=get_buy_amount_keyboard(pending.get("buffer", "")))
+        return
+
+    if data == b"buy_amount_confirm" and user.get("step") == "buy_confirm":
+        pending = purchase_data.get(user_id)
+        if not pending or "amount" not in pending:
+            user["step"] = "managed"
+            await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
+                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+            return
+        user["step"] = "buy_payment"
+        await safe_edit(event, get_buy_payment_text(pending["amount"]), buttons=get_buy_payment_keyboard())
+        return
+
+    if data == b"buy_payment_back" and user.get("step") == "buy_payment":
+        pending = purchase_data.get(user_id) or {}
+        user["step"] = "buy_confirm"
+        await safe_edit(event, get_buy_confirm_text(pending.get("amount", 0)), buttons=get_buy_confirm_keyboard())
+        return
+
+    if data == b"buy_pay_gateway" and user.get("step") == "buy_payment":
+        await event.answer("🔒 درگاه پرداخت در حال حاضر فعال نیست. لطفاً از «کارت به کارت» استفاده کنید.", alert=True)
+        return
+
+    if data == b"buy_pay_card" and user.get("step") == "buy_payment":
+        pending = purchase_data.get(user_id)
+        if not pending or "amount" not in pending:
+            user["step"] = "managed"
+            await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
+                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+            return
+        pending["payment_method"] = "card_to_card"
+        pending["invoice_created_at"] = datetime.now()
+        user["step"] = "buy_invoice"
+        await safe_edit(event,
+            get_buy_invoice_text("(بعد از تأیید ساخته می‌شود)", user_id, user.get("username"),
+                                  pending["amount"], pending["toman"], pending["invoice_created_at"]),
+            buttons=get_buy_invoice_keyboard()
+        )
+        return
+
+    if data == b"buy_invoice_back" and user.get("step") == "buy_invoice":
+        pending = purchase_data.get(user_id) or {}
+        user["step"] = "buy_payment"
+        await safe_edit(event, get_buy_payment_text(pending.get("amount", 0)), buttons=get_buy_payment_keyboard())
+        return
+
+    if data == b"buy_invoice_confirm" and user.get("step") == "buy_invoice":
+        pending = purchase_data.get(user_id)
+        if not pending or "amount" not in pending:
+            user["step"] = "managed"
+            await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
+                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+            return
+
+        # اگر سفارش قبلاً ساخته شده (مثلاً کاربر چندبار روی تأیید زده)، دوباره ساخته نمی‌شود
+        if not pending.get("order_id"):
+            order_id = create_order_db(user_id, user.get("username"), pending["amount"], pending["toman"], "card_to_card")
+            if not order_id:
+                await event.answer("❌ خطا در ساخت سفارش. دوباره تلاش کنید.", alert=True)
+                return
+            pending["order_id"] = order_id
+            logging.info(f"🧾 سفارش جدید {order_id} توسط کاربر {user_id} (مقدار: {pending['amount']} الماس)")
+
+        user["step"] = "buy_receipt"
+        await safe_edit(event, get_buy_waiting_receipt_text(pending["toman"]), buttons=get_buy_waiting_receipt_keyboard())
+        return
+
+    if data == b"buy_receipt_back" and user.get("step") == "buy_receipt":
+        pending = purchase_data.get(user_id) or {}
+        user["step"] = "buy_invoice"
+        order = get_order_db(pending.get("order_id")) if pending.get("order_id") else None
+        created_at = order["created_at"] if order else pending.get("invoice_created_at", datetime.now())
+        await safe_edit(event,
+            get_buy_invoice_text(pending.get("order_id", "—"), user_id, user.get("username"),
+                                  pending.get("amount", 0), pending.get("toman", 0), created_at),
+            buttons=get_buy_invoice_keyboard()
         )
         return
 
@@ -3940,22 +4874,36 @@ async def callback_handler(event):
 
     if data.startswith(b"meow_setgroup_"):
         chat_id = int(data.decode().split("meow_setgroup_", 1)[1])
+        title = None
+        for gid, gtitle in (meow_group_cache.get(user_id) or []):
+            if gid == chat_id:
+                title = gtitle
+                break
+
         user["meow_chat_id"] = chat_id
+        user["meow_chat_title"] = title
         save_user(user_id, user)
         log_settings_change(user_id, "meow_chat_id", chat_id)
 
-        # اگر میو از قبل روشن بوده ولی هنوز گروهی نداشت (Task متوقف شده بود)، حالا با
-        # گروه جدید دوباره راه‌اندازی می‌شود؛ اگر Task زنده‌ای هم در حال اجرا باشد،
-        # خودش با خواندن meow_chat_id تازه از user_data در چرخه‌ی بعدی هماهنگ می‌شود.
-        if user.get("meow_enabled"):
-            old_task = user.get("meow_task")
-            if not old_task or old_task.done():
-                client = active_clients.get(user_id)
-                if client:
-                    user["meow_task"] = asyncio.get_event_loop().create_task(meow_worker(user_id, client))
+        # این گروه برای همه‌ی قابلیت‌های میو (میو/ماهی/میو‌پوینت/یخچال) مشترک است؛
+        # اگر هرکدام از قبل روشن بوده ولی هنوز گروهی نداشت (Task متوقف شده بود)، حالا
+        # با گروه جدید دوباره راه‌اندازی می‌شود. Task‌های زنده خودشان با خواندن
+        # meow_chat_id تازه از user_data در چرخه‌ی بعدی هماهنگ می‌شوند.
+        client = active_clients.get(user_id)
+        if client:
+            for enabled_key, task_key, worker_fn in (
+                ("meow_enabled", "meow_task", meow_worker),
+                ("fish_enabled", "fish_task", fish_worker),
+                ("meowpoint_enabled", "meowpoint_task", meowpoint_worker),
+                ("fridge_enabled", "fridge_task", fridge_worker),
+            ):
+                if user.get(enabled_key):
+                    old_task = user.get(task_key)
+                    if not old_task or old_task.done():
+                        user[task_key] = asyncio.get_event_loop().create_task(worker_fn(user_id, client))
 
         meow_group_cache.pop(user_id, None)
-        await safe_edit(event, get_meow_settings_text(user), buttons=get_meow_settings_keyboard(user))
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
         return
 
     if data == b"secretary_toggle":
@@ -4054,19 +5002,92 @@ async def message_handler(event):
     # لغو عملیات
     _pending_steps = {
         "transfer_get_target", "transfer_get_amount", "transfer_confirm",
-        "secretary_get_text", "secretary_get_time", "giftcode_get_code"
+        "secretary_get_text", "secretary_get_time", "giftcode_get_code",
+        "buy_amount", "buy_confirm", "buy_payment", "buy_invoice", "buy_receipt",
     }
     _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
 
     if text == "/cancel" and (user_id in broadcast_data or user_id in admin_action_data or _has_pending_step):
+        # لغو یک خرید در حالِ انتظارِ رسید فقط State را ریست می‌کند؛ سفارشی که از قبل
+        # در دیتابیس با وضعیت 'invoice' ثبت شده دست‌نخورده می‌ماند (کاربر می‌تواند بعداً
+        # دوباره از حساب کاربری وارد بخش خرید شود، البته سفارش قدیمی دیگر از UI قابل
+        # دسترسی نیست مگر مستقیماً توسط ادمین در دیتابیس بررسی شود).
         broadcast_data.pop(user_id, None)
         admin_action_data.pop(user_id, None)
         transfer_data.pop(user_id, None)
+        purchase_data.pop(user_id, None)
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
         await event.respond("❌ عملیات لغو شد.")
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
+        return
+
+    # ====== مرحله‌ی انتظار برای عکس رسید خرید الماس ======
+    # این بلوک عمداً خیلی زودتر از هندلر عمومی متن قرار گرفته تا با هیچ قابلیت دیگری
+    # (منشی خودکار، حالت متن و ...) تداخل نکند و روی این State قفل بماند.
+    if user_id in user_data and user_data[user_id].get("step") == "buy_receipt":
+        pending = purchase_data.get(user_id)
+        order_id = pending.get("order_id") if pending else None
+        order = get_order_db(order_id) if order_id else None
+
+        if not order:
+            user_data[user_id]["step"] = "managed"
+            purchase_data.pop(user_id, None)
+            await event.respond("❌ سفارش پیدا نشد یا منقضی شده. دوباره از «حساب کاربری ← خرید الماس» اقدام کنید.")
+            return
+
+        if not event.photo:
+            await event.respond(
+                "📸 فقط **عکس رسید پرداخت** پذیرفته می‌شود.\n\n"
+                "لطفاً فقط تصویر رسید را ارسال کنید (نه متن، فایل، ویس، ویدیو یا استیکر).",
+                buttons=get_buy_waiting_receipt_keyboard()
+            )
+            return
+
+        success, updated_order = set_order_receipt_db(order_id, event.chat_id, event.id, str(event.photo.id))
+        if not success:
+            if updated_order and updated_order.get("status") != "invoice":
+                await event.respond("❌ برای این سفارش قبلاً رسید ارسال شده و در حال بررسی است.")
+            else:
+                await event.respond("❌ خطا در ثبت رسید. دوباره تلاش کنید.")
+            return
+
+        user_data[user_id]["step"] = "managed"
+        username = user_data[user_id].get("username")
+
+        await event.respond(
+            "✅ **رسید شما دریافت شد.**\n\n"
+            f"🧾 کد سفارش: `{order_id}`\n"
+            "📌 وضعیت: در انتظار بررسی ادمین\n\n"
+            "نتیجه‌ی بررسی به‌محض تأیید یا رد توسط ادمین برای شما ارسال می‌شود.",
+            buttons=[[styled_button("➜ بازگشت به منو", b"menu_account", style=STYLE_OFF)]]
+        )
+
+        # ارسال سفارش کامل + عکس رسید برای همه‌ی ادمین‌ها
+        admin_caption = (
+            "🧾 **سفارش جدید خرید الماس**\n\n"
+            f"👤 نام:\n{username or '—'}\n\n"
+            f"🆔 آیدی عددی:\n{user_id}\n\n"
+            f"🔹 Username:\n{('@' + username) if username else 'ندارد'}\n\n"
+            f"💎 تعداد الماس:\n{format_diamonds(order['amount_diamonds'])}\n\n"
+            f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
+            f"🧾 کد سفارش:\n{order_id}\n\n"
+            f"⏱ زمان ثبت سفارش:\n{order['created_at'].strftime('%Y/%m/%d %H:%M')}\n\n"
+            "📌 وضعیت:\nدر انتظار بررسی\n\n"
+            "📱 روش پرداخت:\nکارت به کارت"
+        )
+        admin_buttons = [
+            [
+                styled_button("✅ تأیید", f"order_approve_{order_id}".encode(), style=STYLE_ON),
+                styled_button("❌ لغو", f"order_reject_{order_id}".encode(), style=STYLE_OFF),
+            ]
+        ]
+        for admin_id in ADMIN_IDS:
+            try:
+                await safe_call(bot.send_file, admin_id, event.photo, caption=admin_caption, buttons=admin_buttons)
+            except Exception as e:
+                log_internal_error("send_order_to_admin", e)
         return
 
     # ====== ساخت کد هدیه توسط ادمین (چندمرحله‌ای، قبل از هندلر عمومی عددی) ======
@@ -4120,6 +5141,94 @@ async def message_handler(event):
                 buttons=get_giftcodes_admin_keyboard()
             )
             return
+
+    # ====== ویرایش مقدار الماس / انقضای یک کد هدیه‌ی موجود ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") in (
+        "giftcode_edit_amount", "giftcode_edit_expiry"
+    ):
+        action = admin_action_data[user_id]
+        code = action["code"]
+        cancel_kb = [[styled_button("➜ بازگشت", f"admin_giftcode_manage_{code}".encode(), style=STYLE_OFF)]]
+
+        if action["type"] == "giftcode_edit_amount":
+            try:
+                new_amount = float(text)
+                if new_amount <= 0:
+                    raise ValueError
+            except ValueError:
+                await event.respond("❌ لطفاً یک عدد معتبر و بزرگ‌تر از صفر ارسال کنید.", buttons=cancel_kb)
+                return
+            success = update_gift_code_amount_db(code, new_amount)
+            del admin_action_data[user_id]
+            if not success:
+                await event.respond("❌ کد پیدا نشد یا خطایی رخ داد.", buttons=get_giftcodes_admin_keyboard())
+                return
+            log_admin_action(user_id, 0, "edit_giftcode_amount", f"code={code} new_amount={new_amount}")
+            detail = get_gift_code_detail_db(code)
+            await event.respond(
+                f"✅ مقدار الماس کد `{code}` به {format_diamonds(new_amount)} تغییر یافت.",
+                buttons=get_giftcode_manage_keyboard(detail) if detail else get_giftcodes_admin_keyboard()
+            )
+            return
+
+        if action["type"] == "giftcode_edit_expiry":
+            try:
+                days = int(text)
+                if days < 0:
+                    raise ValueError
+            except ValueError:
+                await event.respond("❌ لطفاً یک عدد صحیح و غیرمنفی ارسال کنید.", buttons=cancel_kb)
+                return
+            new_expiry = (datetime.now() + timedelta(days=days)) if days > 0 else None
+            success = update_gift_code_expiry_db(code, new_expiry)
+            del admin_action_data[user_id]
+            if not success:
+                await event.respond("❌ کد پیدا نشد یا خطایی رخ داد.", buttons=get_giftcodes_admin_keyboard())
+                return
+            log_admin_action(user_id, 0, "edit_giftcode_expiry", f"code={code} days={days}")
+            detail = get_gift_code_detail_db(code)
+            await event.respond(
+                f"✅ انقضای کد `{code}` بروزرسانی شد.",
+                buttons=get_giftcode_manage_keyboard(detail) if detail else get_giftcodes_admin_keyboard()
+            )
+            return
+
+    # ====== دریافت دلیل لغو سفارش خرید الماس ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "reject_order":
+        action = admin_action_data[user_id]
+        order_id = action["order_id"]
+        reason = text.strip()
+
+        if not reason:
+            await event.respond("❌ لطفاً دلیل لغو را به‌صورت متن ارسال کنید.",
+                                 buttons=[[styled_button("➜ بازگشت", b"order_reject_cancel", style=STYLE_OFF)]])
+            return
+
+        success, status_code, order = reject_order_db(order_id, user_id, reason)
+        del admin_action_data[user_id]
+
+        if not success:
+            if status_code == "already_processed":
+                state = order.get("status") if order else "?"
+                await event.respond(f"⚠️ این سفارش قبلاً پردازش شده است (وضعیت فعلی: {state}).")
+            else:
+                await event.respond("❌ سفارش پیدا نشد یا خطایی رخ داد.")
+            return
+
+        log_admin_action(user_id, order["user_id"], "reject_order", f"order={order_id} reason={reason}")
+        await event.respond(f"✅ سفارش `{order_id}` رد شد و دلیل برای کاربر ارسال شد.")
+
+        try:
+            await safe_call(bot.send_message, order["user_id"],
+                "❌ **سفارش شما رد شد.**\n\n"
+                f"🧾 کد سفارش:\n{order_id}\n\n"
+                f"💎 تعداد الماس:\n{format_diamonds(order['amount_diamonds'])}\n\n"
+                f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
+                f"دلیل:\n{reason}"
+            )
+        except Exception as e:
+            log_internal_error("notify_order_rejected", e)
+        return
 
     # ====== پردازش عملیات مدیریتی الماس/رفرال ======
     if user_id in admin_action_data and is_admin(user_id):
@@ -4203,15 +5312,17 @@ async def message_handler(event):
             return
 
         if broadcast.get("step") == "get_message":
-            broadcast["message"] = text
+            broadcast["src_chat_id"] = event.chat_id
+            broadcast["src_message_id"] = event.id
+            preview = text if text else _describe_message_kind(event.message)
+            broadcast["summary"] = preview
             broadcast["step"] = "confirm"
 
             if broadcast["type"] == "single":
                 target_id = broadcast["target_id"]
                 await event.respond(
                     f"📨 **تایید ارسال پیام به کاربر {target_id}**\n\n"
-                    f"📝 متن پیام:\n"
-                    f"---\n{text}\n---\n\n"
+                    f"📝 پیش‌نمایش:\n---\n{preview}\n---\n\n"
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
                         [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
@@ -4223,8 +5334,7 @@ async def message_handler(event):
                 await event.respond(
                     f"📨 **تایید ارسال پیام همگانی**\n\n"
                     f"⚠️ این پیام برای **{total_users} نفر** ارسال خواهد شد!\n\n"
-                    f"📝 متن پیام:\n"
-                    f"---\n{text}\n---\n\n"
+                    f"📝 پیش‌نمایش:\n---\n{preview}\n---\n\n"
                     "آیا از ارسال این پیام مطمئن هستید؟",
                     buttons=[
                         [styled_button("✅ بله، ارسال کن", b"broadcast_confirm", style=STYLE_ON)],
@@ -4467,12 +5577,29 @@ async def broadcast_callback_handler(event):
     if data == b"broadcast_confirm":
         await safe_edit(event, "⏳ در حال ارسال پیام...")
 
-        message = broadcast["message"]
+        src_chat_id = broadcast.get("src_chat_id")
+        src_message_id = broadcast.get("src_message_id")
+        try:
+            src_msg = await bot.get_messages(src_chat_id, ids=src_message_id)
+        except Exception as e:
+            log_internal_error("broadcast_fetch_src_message", e)
+            src_msg = None
+
+        if not src_msg:
+            await safe_edit(event,
+                "❌ **پیام مبدا دیگر در دسترس نیست (شاید حذف شده).**\n\nعملیات لغو شد.",
+                buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
+            )
+            del broadcast_data[user_id]
+            return
 
         if broadcast["type"] == "single":
             target_id = broadcast["target_id"]
+            broadcast_id = create_broadcast_record_db(user_id, "single", target_id, broadcast.get("summary", ""))
             try:
-                await bot.send_message(target_id, message)
+                sent = await _copy_message_to(bot, target_id, src_msg)
+                if broadcast_id and sent:
+                    add_broadcast_delivery_db(broadcast_id, target_id, target_id, sent.id)
                 await safe_edit(event,
                     f"✅ **پیام با موفقیت به کاربر {target_id} ارسال شد!**",
                     buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
@@ -4487,11 +5614,14 @@ async def broadcast_callback_handler(event):
             total_users = len(user_data)
             success_count = 0
             fail_count = 0
+            broadcast_id = create_broadcast_record_db(user_id, "broadcast", None, broadcast.get("summary", ""))
 
-            for uid in user_data.keys():
+            for uid in list(user_data.keys()):
                 try:
-                    await bot.send_message(uid, message)
+                    sent = await _copy_message_to(bot, uid, src_msg)
                     success_count += 1
+                    if broadcast_id and sent:
+                        add_broadcast_delivery_db(broadcast_id, uid, uid, sent.id)
                     await asyncio.sleep(0.1)
                 except Exception as e:
                     fail_count += 1
@@ -4551,3 +5681,4 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
+
