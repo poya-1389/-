@@ -4,6 +4,8 @@ import re
 import os
 import secrets
 import string
+import pickle
+import io
 import pytz
 import psycopg2
 import jdatetime
@@ -19,13 +21,15 @@ from telethon.errors import (
 )
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
     SendMessageGamePlayAction, SendMessageChooseStickerAction,
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
-    MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName
+    MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
+    DocumentAttributeAnimated,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -119,9 +123,34 @@ meow_group_cache = {}  # {user_id: [(chat_id, title), ...]} کش موقت لیس
 admin_action_data = {} # {admin_id: {"type":..., "target_id":..., "step":...}} وضعیت موقت عملیات مدیریتی روی الماس/رفرال
 click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پردازش کلیک تکراری روی دکمه‌ها
 
+reaction_targets = {}   # {owner_id: {target_user_id: {"emoji":..., "username":...}}} کش ریکت (بند ۳-۴)
+autoreply_cache = {}    # {owner_id: [{"local_id":..., "trigger_text":..., "response_text":..., "entities":..., "media_kind":..., "media_bytes":..., "media_filename":..., "media_mime":...}, ...]} کش پاسخ خودکار (بند ۵-۹)
+autoreply_draft = {}    # {owner_id: {"trigger_text":...}} وضعیت موقت افزودن پاسخ خودکار (دو مرحله‌ای)
+_background_tasks = set()  # نگه‌داشتن رفرنس Taskهای پس‌زمینه‌ی کوتاه‌مدت تا با GC زودهنگام لغو نشوند
+
+def _spawn_background_task(coro):
+    """
+    اجرای یک Task پس‌زمینه (مثلاً تأخیر ۱ ثانیه‌ای قبل از ریکت) با نگه‌داشتن یک
+    رفرنس قوی به آن؛ بدون این کار، asyncio ممکن است در میانه‌ی اجرا Task را
+    Garbage Collect و بی‌صدا لغو کند (یک نکته‌ی شناخته‌شده در مستندات asyncio).
+    بعد از پایان Task، رفرنس خودش از مجموعه پاک می‌شود تا حافظه بی‌نهایت رشد نکند.
+    """
+    task = asyncio.get_event_loop().create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 TAG_ADMIN_TRIGGERS = {".تگ ادمین", ".تگادمین", ".tagadmins"}
 TAG_MEMBERS_TRIGGERS = {".تگ اعضا", ".تگاعضا", ".tagall"}
 PANEL_TRIGGERS = {".پنل", ".panel"}
+PING_TRIGGERS = {".پینگ", ".ping"}
+WHOIS_TRIGGERS = {".آیدی", ".id"}
+REACTION_SET_PREFIXES = (".ریکت ", ".react ")
+REACTION_REMOVE_TRIGGERS = {".حذف ریکت", ".remove react"}
+REACTION_APPLY_DELAY = 1.0  # طبق بند «اجرای خودکار»: حدود ۱ ثانیه تأخیر قبل از ریکت
+AUTOREPLY_MATCH_TYPES = {"exact": "برابر", "prefix": "پیشوند", "contains": "شامل"}
+MAX_AUTOREPLY_MEDIA_MB = 15
+MAX_AUTOREPLY_MEDIA_BYTES = MAX_AUTOREPLY_MEDIA_MB * 1024 * 1024
 
 # ======================== فونت‌های کامل ========================
 FONTS = {
@@ -243,6 +272,9 @@ def init_db():
             ("fish_operation_epic", "TEXT DEFAULT 'feed'"),
             ("fish_operation_legendary", "TEXT DEFAULT 'fridge'"),
             ("meow_chat_title", "TEXT"),
+            ("reaction_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("autoreply_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("autoreply_match_type", "TEXT DEFAULT 'exact'"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -335,6 +367,38 @@ def init_db():
         ''')
         conn.commit()
 
+        # ---------- قابلیت ریکت (بند ۳-۴) ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_reactions (
+                owner_id BIGINT NOT NULL,
+                target_user_id BIGINT NOT NULL,
+                target_username TEXT,
+                emoji TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (owner_id, target_user_id)
+            )
+        ''')
+        conn.commit()
+
+        # ---------- قابلیت پاسخ خودکار (بند ۵-۱۰) ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_autoreplies (
+                id SERIAL PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                local_id INTEGER NOT NULL,
+                trigger_text TEXT NOT NULL,
+                response_text TEXT,
+                response_entities BYTEA,
+                response_media_kind TEXT,
+                response_media_bytes BYTEA,
+                response_media_filename TEXT,
+                response_media_mime TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (owner_id, local_id)
+            )
+        ''')
+        conn.commit()
+
         logging.info("✅ دیتابیس با موفقیت راه‌اندازی/بروزرسانی شد.")
         cursor.close()
         conn.close()
@@ -357,7 +421,7 @@ def get_all_users():
                    streetcat_enabled,
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                    fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
-                   meow_chat_title
+                   meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -407,6 +471,9 @@ def get_all_users():
                 "fish_operation_epic": row['fish_operation_epic'] or "feed",
                 "fish_operation_legendary": row['fish_operation_legendary'] or "fridge",
                 "meow_chat_title": row['meow_chat_title'],
+                "reaction_enabled": bool(row['reaction_enabled']),
+                "autoreply_enabled": bool(row['autoreply_enabled']),
+                "autoreply_match_type": row['autoreply_match_type'] or "exact",
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -444,8 +511,8 @@ def save_user(user_id, user):
                  streetcat_enabled,
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
-                 meow_chat_title)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -479,7 +546,10 @@ def save_user(user_id, user):
                 fish_operation_rare = EXCLUDED.fish_operation_rare,
                 fish_operation_epic = EXCLUDED.fish_operation_epic,
                 fish_operation_legendary = EXCLUDED.fish_operation_legendary,
-                meow_chat_title = EXCLUDED.meow_chat_title
+                meow_chat_title = EXCLUDED.meow_chat_title,
+                reaction_enabled = EXCLUDED.reaction_enabled,
+                autoreply_enabled = EXCLUDED.autoreply_enabled,
+                autoreply_match_type = EXCLUDED.autoreply_match_type
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -501,7 +571,9 @@ def save_user(user_id, user):
             user.get("fridge_last_run_at"),
             user.get("fish_operation_common", "feed"), user.get("fish_operation_rare", "feed"),
             user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
-            user.get("meow_chat_title")
+            user.get("meow_chat_title"),
+            user.get("reaction_enabled", False), user.get("autoreply_enabled", False),
+            user.get("autoreply_match_type", "exact")
         ))
         conn.commit()
         cursor.close()
@@ -1248,6 +1320,189 @@ def delete_broadcast_record_db(broadcast_id):
         if conn:
             conn.close()
 
+# ======================== قابلیت ریکت (ذخیره‌سازی) ========================
+def get_user_reactions_db(owner_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(
+            "SELECT target_user_id, target_username, emoji FROM novaself_reactions WHERE owner_id = %s ORDER BY created_at",
+            (owner_id,)
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن لیست ریکت کاربر {owner_id}: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_all_reactions_db():
+    """برای بارگذاری کش تمام کاربران در استارتاپ."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT owner_id, target_user_id, target_username, emoji FROM novaself_reactions")
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در بارگذاری اولیه‌ی ریکت‌ها: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def set_user_reaction_db(owner_id, target_user_id, target_username, emoji):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO novaself_reactions (owner_id, target_user_id, target_username, emoji)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (owner_id, target_user_id) DO UPDATE SET
+                target_username = EXCLUDED.target_username,
+                emoji = EXCLUDED.emoji
+        ''', (owner_id, target_user_id, target_username, emoji))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"❌ خطا در ذخیره ریکت (owner={owner_id} target={target_user_id}): {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def remove_user_reaction_db(owner_id, target_user_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM novaself_reactions WHERE owner_id = %s AND target_user_id = %s",
+            (owner_id, target_user_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف ریکت (owner={owner_id} target={target_user_id}): {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def load_reactions_cache():
+    """بارگذاری کش ریکت‌ها در استارتاپ (بند «Restart نباید تنظیمات را از بین ببرد»)."""
+    global reaction_targets
+    fresh = {}
+    for row in get_all_reactions_db():
+        fresh.setdefault(row["owner_id"], {})[row["target_user_id"]] = {
+            "emoji": row["emoji"], "username": row["target_username"]
+        }
+    reaction_targets = fresh
+    logging.info(f"👍 کش ریکت بارگذاری شد: {sum(len(v) for v in fresh.values())} کاربر هدف در {len(fresh)} حساب.")
+
+# ======================== قابلیت پاسخ خودکار (ذخیره‌سازی) ========================
+def add_autoreply_db(owner_id, trigger_text, response_text, entities, media_kind, media_bytes, media_filename, media_mime):
+    """
+    یک پاسخ خودکار جدید ذخیره می‌کند و شماره‌ی نمایشیِ بعدیِ (local_id) مخصوصِ همان
+    کاربر را برمی‌گرداند (۱، ۲، ۳ ...). Entityهای Formatting با pickle سریالایز
+    می‌شوند چون این‌ها اشیاء TL تلگرام هستند نه دیتای ساده — pickle این‌جا امن است
+    چون فقط توسط خودِ سرور نوشته و خوانده می‌شود (نه ورودی خارجی/غیرقابل‌اعتماد).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(MAX(local_id), 0) + 1 FROM novaself_autoreplies WHERE owner_id = %s", (owner_id,))
+        local_id = cursor.fetchone()[0]
+
+        entities_blob = psycopg2.Binary(pickle.dumps(entities)) if entities else None
+        media_blob = psycopg2.Binary(media_bytes) if media_bytes else None
+
+        cursor.execute('''
+            INSERT INTO novaself_autoreplies
+                (owner_id, local_id, trigger_text, response_text, response_entities,
+                 response_media_kind, response_media_bytes, response_media_filename, response_media_mime)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (owner_id, local_id, trigger_text, response_text, entities_blob,
+              media_kind, media_blob, media_filename, media_mime))
+        conn.commit()
+        return local_id
+    except Exception as e:
+        logging.error(f"❌ خطا در ذخیره پاسخ خودکار برای کاربر {owner_id}: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def delete_autoreply_db(owner_id, local_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM novaself_autoreplies WHERE owner_id = %s AND local_id = %s",
+            (owner_id, local_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف پاسخ خودکار (owner={owner_id} local_id={local_id}): {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_all_autoreplies_db():
+    """برای بارگذاری کش تمام کاربران در استارتاپ."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_autoreplies ORDER BY owner_id, local_id")
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در بارگذاری اولیه‌ی پاسخ‌های خودکار: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def load_autoreplies_cache():
+    """بارگذاری کش پاسخ‌های خودکار در استارتاپ، شامل Unpickle کردن Entityها."""
+    global autoreply_cache
+    fresh = {}
+    for row in get_all_autoreplies_db():
+        entities = None
+        if row["response_entities"]:
+            try:
+                entities = pickle.loads(bytes(row["response_entities"]))
+            except Exception as e:
+                log_internal_error("unpickle_autoreply_entities", f"owner={row['owner_id']} local_id={row['local_id']} err={e}")
+        media_bytes = bytes(row["response_media_bytes"]) if row["response_media_bytes"] else None
+        fresh.setdefault(row["owner_id"], []).append({
+            "local_id": row["local_id"],
+            "trigger_text": row["trigger_text"],
+            "response_text": row["response_text"],
+            "entities": entities,
+            "media_kind": row["response_media_kind"],
+            "media_bytes": media_bytes,
+            "media_filename": row["response_media_filename"],
+            "media_mime": row["response_media_mime"],
+        })
+    autoreply_cache = fresh
+    logging.info(f"🤖 کش پاسخ خودکار بارگذاری شد: {sum(len(v) for v in fresh.values())} پاسخ در {len(fresh)} حساب.")
+
 def format_diamonds(value):
     value = float(value or 0)
     if value == int(value):
@@ -1300,6 +1555,9 @@ def make_default_user(session=None, status=False, step="menu"):
         "meow_chat_id": None,
         "meow_chat_title": None,
         "meow_last_sent_at": None,
+        "reaction_enabled": False,
+        "autoreply_enabled": False,
+        "autoreply_match_type": "exact",
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
         "fish_last_run_at": None,
@@ -1403,6 +1661,26 @@ def _describe_message_kind(msg):
         return "📍 موقعیت مکانی"
     return "📝 متن"
 
+def _media_kind_key(msg):
+    """کلید داخلی (نه لیبل فارسی) برای نوع رسانه‌ی پیام — برای تصمیم‌گیری در ارسال مجدد پاسخ خودکار."""
+    if getattr(msg, "voice", None):
+        return "voice"
+    if getattr(msg, "video_note", None):
+        return "video_note"
+    if getattr(msg, "gif", None):
+        return "gif"
+    if getattr(msg, "sticker", None):
+        return "sticker"
+    if getattr(msg, "video", None):
+        return "video"
+    if getattr(msg, "audio", None):
+        return "audio"
+    if getattr(msg, "photo", None):
+        return "photo"
+    if getattr(msg, "document", None):
+        return "document"
+    return None
+
 async def _copy_message_to(client, target_id, src_msg):
     """
     یک نسخه‌ی کامل از پیام (متن + Formatting + هر نوع رسانه: عکس/ویدیو/فایل/ویس/
@@ -1467,6 +1745,134 @@ def get_main_menu_keyboard(user):
             styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
             styled_button("🐱 میو", b"menu_meow", style=STYLE_INFO),
         ],
+        [
+            styled_button("🏓 پینگ", b"menu_ping", style=STYLE_INFO),
+            styled_button("🪪 اطلاعات", b"menu_whois", style=STYLE_INFO),
+        ],
+        [toggle_button("👍 ریکت", user.get("reaction_enabled", False), b"menu_reaction")],
+        [toggle_button("🤖 پاسخ خودکار", user.get("autoreply_enabled", False), b"menu_autoreply")],
+    ]
+
+def get_ping_menu_text():
+    return (
+        "قابلیت پینگ\n"
+        "▫️ `.پینگ`\n"
+        "— نمایش پینگ سرور سلف شما"
+    )
+
+def get_ping_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
+
+def get_whois_menu_text():
+    return (
+        "قابلیت اطلاعات\n"
+        "▫️ `.آیدی`\n"
+        "— برای نمایش اطلاعات شخص روی پیام او ریپلای کن"
+    )
+
+def get_whois_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
+
+# ======================== منوی ریکت ========================
+def get_reaction_menu_text(user_id, user):
+    count = len(reaction_targets.get(user_id, {}))
+    return (
+        f"👍 **قابلیت ریکت** ({status_icon(user.get('reaction_enabled', False))})\n\n"
+        f"تعداد کاربران دارای ریکت: {count}\n\n"
+        "برای تنظیم ریکت روی یک کاربر، در هر چتی روی پیام او Reply کنید و بفرستید:\n"
+        "`.ریکت 🤣`\n\n"
+        "برای حذف ریکت آن کاربر، روی پیامش Reply کنید و بفرستید:\n"
+        "`.حذف ریکت`"
+    )
+
+def get_reaction_menu_keyboard(user):
+    return [
+        [toggle_button("ریکت", user.get("reaction_enabled", False), b"reaction_toggle")],
+        [styled_button("لیست ریکت", b"reaction_list", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+    ]
+
+def get_reaction_list_text(user_id):
+    targets = reaction_targets.get(user_id, {})
+    if not targets:
+        return "👍 **لیست ریکت**\n\nهنوز هیچ کاربری اضافه نشده است."
+    lines = ["👍 **لیست ریکت**\n"]
+    for i, (target_id, info) in enumerate(targets.items(), start=1):
+        username = info.get("username")
+        label = f"@{username}" if username else str(target_id)
+        lines.append(f"{i}. {label} ← {info.get('emoji')}")
+    lines.append("\nبرای حذف هرکدام، روی پیام همان شخص Reply کنید و `.حذف ریکت` را بفرستید.")
+    return "\n".join(lines)
+
+def get_reaction_list_keyboard():
+    return [[styled_button("➜ بازگشت", b"menu_reaction", style=STYLE_OFF)]]
+
+# ======================== منوی پاسخ خودکار ========================
+def get_autoreply_menu_text(user_id, user):
+    count = len(autoreply_cache.get(user_id, []))
+    match_label = AUTOREPLY_MATCH_TYPES.get(user.get("autoreply_match_type", "exact"), "برابر")
+    return (
+        "قابلیت پاسخ خودکار\n\n"
+        f"وضعیت: {status_icon(user.get('autoreply_enabled', False))}\n\n"
+        f"لیست پاسخ‌ها: {count}\n\n"
+        f"نوع تطبیق: {match_label}"
+    )
+
+def get_autoreply_menu_keyboard(user):
+    match_type = user.get("autoreply_match_type", "exact")
+    match_label = AUTOREPLY_MATCH_TYPES.get(match_type, "برابر")
+    return [
+        [toggle_button("پاسخ خودکار", user.get("autoreply_enabled", False), b"autoreply_toggle")],
+        [styled_button("افزودن پاسخ خودکار", b"autoreply_add", style=STYLE_ON)],
+        [styled_button("حذف پاسخ خودکار", b"autoreply_remove", style=STYLE_OFF)],
+        [styled_button("لیست پاسخ‌های خودکار", b"autoreply_list", style=STYLE_INFO)],
+        [styled_button(f"نوع تطبیق: {match_label}", b"autoreply_matchtype", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+    ]
+
+def get_autoreply_matchtype_text():
+    return "🔠 **نوع تطبیق Trigger**\n\nفقط یکی از این حالت‌ها می‌تواند فعال باشد:"
+
+def get_autoreply_matchtype_keyboard(current):
+    buttons = []
+    for key, label in AUTOREPLY_MATCH_TYPES.items():
+        selected = (key == current)
+        buttons.append([styled_button(f"{status_icon(selected)} {label}", f"autoreply_setmatch_{key}".encode(),
+                                       style=STYLE_ON if selected else STYLE_OFF)])
+    buttons.append([styled_button("➜ بازگشت", b"menu_autoreply", style=STYLE_OFF)])
+    return buttons
+
+def get_autoreply_list_text(user_id):
+    items = autoreply_cache.get(user_id, [])
+    if not items:
+        return "📋 **لیست پاسخ‌های خودکار**\n\nهنوز هیچ پاسخی اضافه نشده است."
+    lines = ["📋 **لیست پاسخ‌های خودکار**\n\nبرای مشاهده/حذف هرکدام، روی آن کلیک کنید:"]
+    return "\n".join(lines)
+
+def get_autoreply_list_keyboard(user_id):
+    items = autoreply_cache.get(user_id, [])
+    buttons = []
+    for item in items:
+        label = f"{item['local_id']}. {item['trigger_text'][:30]}"
+        buttons.append([styled_button(label, f"autoreply_view_{item['local_id']}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"menu_autoreply", style=STYLE_OFF)])
+    return buttons
+
+def get_autoreply_view_text(item):
+    kind = item.get("media_kind")
+    media_line = f"\n\n📎 نوع پاسخ: {kind}" if kind else ""
+    resp_preview = (item.get("response_text") or "")[:200]
+    return (
+        f"🔹 **پاسخ خودکار شماره {item['local_id']}**\n\n"
+        f"Trigger:\n{item['trigger_text']}\n\n"
+        f"پیش‌نمایش پاسخ:\n{resp_preview or '(فقط رسانه، بدون متن)'}"
+        f"{media_line}"
+    )
+
+def get_autoreply_view_keyboard(local_id):
+    return [
+        [styled_button("🗑 حذف این پاسخ", f"autoreply_delete_{local_id}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"autoreply_list", style=STYLE_OFF)]
     ]
 
 def get_time_menu_keyboard(user):
@@ -2354,6 +2760,171 @@ async def handle_panel_command(event, user_id):
     except Exception as e:
         logging.error(f"⚠️ خطا در ساخت پنل درون‌چتی برای کاربر {user_id}: {e}")
 
+# ======================== دستور .پینگ ========================
+async def handle_ping_command(event, user_id):
+    """
+    تأخیر واقعیِ سرور Self با زمان‌سنجیِ یک RPC واقعی (get_me) اندازه‌گیری می‌شود
+    (رایج‌ترین و دقیق‌ترین روش سنجش Ping در پروژه‌های مبتنی بر Telethon)، سپس همان
+    پیام دستور با نتیجه ویرایش و به‌صورت Blockquote (نقل‌قول تلگرامی) نمایش داده می‌شود.
+    """
+    try:
+        client = event.client
+        t0 = time.monotonic()
+        await client.get_me()
+        elapsed_ms = (time.monotonic() - t0) * 1000
+
+        result_text = f"پینگ : {elapsed_ms:.0f} ms"
+        surrogated = helpers.add_surrogate(result_text)
+        entities = [make_blockquote_entity(0, len(surrogated))]
+
+        await asyncio.sleep(0.2)
+        await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
+    except MessageNotModifiedError:
+        pass
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("ping_command", e)
+
+# ======================== دستور .آیدی ========================
+async def handle_whois_command(event, user_id):
+    """فقط زمانی کار می‌کند که دستور روی پیام یک کاربر Reply شده باشد."""
+    try:
+        if not event.is_reply:
+            await event.reply("❌ برای استفاده از `.آیدی` باید روی پیام یک کاربر Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not reply.sender_id:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        client = event.client
+        try:
+            target = await reply.get_sender()
+        except Exception as e:
+            log_internal_error("whois_get_sender", e)
+            target = None
+
+        if not target:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        bio = ""
+        try:
+            full = await client(GetFullUserRequest(target.id))
+            bio = getattr(full.full_user, "about", "") or ""
+        except Exception as e:
+            log_internal_error("whois_get_full_user", e)
+
+        photo_count = 0
+        try:
+            photos = await client.get_profile_photos(target, limit=1)
+            photo_count = getattr(photos, "total", None)
+            if photo_count is None:
+                photo_count = len(photos)
+        except Exception as e:
+            log_internal_error("whois_get_profile_photos", e)
+
+        name = " ".join(filter(None, [getattr(target, "first_name", None), getattr(target, "last_name", None)])) or "—"
+        username = f"@{target.username}" if getattr(target, "username", None) else "ندارد"
+
+        caption = (
+            "🪪 **اطلاعات کاربر**\n\n"
+            f"• نام کاربر:\n{name}\n\n"
+            f"• بیوگرافی:\n{bio or 'ندارد'}\n\n"
+            f"• آیدی عددی:\n{target.id}\n\n"
+            f"• یوزرنیم:\n{username}\n\n"
+            f"• تعداد تصاویر پروفایل:\n{photo_count}"
+        )
+
+        photo_bytes = None
+        try:
+            photo_bytes = await client.download_profile_photo(target, file=bytes)
+        except Exception as e:
+            log_internal_error("whois_download_photo", e)
+
+        if photo_bytes:
+            file_obj = io.BytesIO(photo_bytes)
+            file_obj.name = "profile.jpg"
+            await safe_call(client.send_file, event.chat_id, file_obj, caption=caption, reply_to=reply.id)
+        else:
+            # طبق نکته‌ی «اگر کاربر عکس پروفایل نداشت، بدون خطا کار کند»
+            await safe_call(client.send_message, event.chat_id, caption, reply_to=reply.id)
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("whois_command", e)
+        try:
+            await event.reply("❌ خطا در دریافت اطلاعات کاربر.")
+        except Exception:
+            pass
+
+# ======================== دستورات .ریکت و .حذف ریکت ========================
+async def handle_set_reaction_command(event, user_id):
+    """کاربر فقط زمانی وارد لیست ریکت می‌شود که دستور روی پیام خودش Reply شده باشد."""
+    try:
+        parts = event.raw_text.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await event.reply("❌ فرمت صحیح: `.ریکت 🤣` (با Reply روی پیام کاربر موردنظر)")
+            return
+        emoji = parts[1].strip()
+
+        if not event.is_reply:
+            await event.reply("❌ برای تنظیم ریکت باید روی پیام همان کاربر Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not reply.sender_id:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        target_id = reply.sender_id
+        username = None
+        try:
+            target = await reply.get_sender()
+            username = getattr(target, "username", None) if target else None
+        except Exception:
+            pass
+
+        if not set_user_reaction_db(user_id, target_id, username, emoji):
+            await event.reply("❌ خطا در ذخیره‌سازی. دوباره تلاش کنید.")
+            return
+
+        reaction_targets.setdefault(user_id, {})[target_id] = {"emoji": emoji, "username": username}
+        log_settings_change(user_id, "reaction_target", f"{target_id}={emoji}")
+        await event.reply(f"✅ از این به بعد پیام‌های این کاربر به‌صورت خودکار با {emoji} ریکت می‌شوند.")
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("set_reaction_command", e)
+
+async def handle_remove_reaction_command(event, user_id):
+    try:
+        if not event.is_reply:
+            await event.reply("❌ برای حذف ریکت باید روی پیام همان کاربر Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not reply.sender_id:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        target_id = reply.sender_id
+        removed = remove_user_reaction_db(user_id, target_id)
+        if user_id in reaction_targets:
+            reaction_targets[user_id].pop(target_id, None)
+
+        if removed:
+            log_settings_change(user_id, "reaction_target_removed", str(target_id))
+            await event.reply("✅ ریکت این کاربر حذف شد.")
+        else:
+            await event.reply("❌ این کاربر در لیست ریکت شما نبود.")
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("remove_reaction_command", e)
+
 def make_outgoing_handler(user_id):
     async def handler(event):
         try:
@@ -2371,6 +2942,26 @@ def make_outgoing_handler(user_id):
             if text_stripped and text_stripped.lower() in PANEL_TRIGGERS:
                 await handle_panel_command(event, user_id)
                 return
+
+            # --- پینگ (در هر نوع چتی) ---
+            if text_stripped and text_stripped.lower() in PING_TRIGGERS:
+                await handle_ping_command(event, user_id)
+                return
+
+            # --- اطلاعات/آیدی (در هر نوع چتی، فقط با Reply) ---
+            if text_stripped and text_stripped.lower() in WHOIS_TRIGGERS:
+                await handle_whois_command(event, user_id)
+                return
+
+            # --- تنظیم/حذف ریکت (در هر نوع چتی، فقط با Reply) ---
+            if text_stripped:
+                lowered_cmd = text_stripped.lower()
+                if lowered_cmd.startswith(REACTION_SET_PREFIXES):
+                    await handle_set_reaction_command(event, user_id)
+                    return
+                if lowered_cmd in REACTION_REMOVE_TRIGGERS:
+                    await handle_remove_reaction_command(event, user_id)
+                    return
 
             # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
             if text_stripped and not event.is_private:
@@ -2547,6 +3138,146 @@ def make_streetcat_handler(user_id):
 
     return handler
 
+# ======================== قابلیت ریکت (اجرای خودکار) ========================
+def make_reaction_handler(user_id):
+    """
+    وقتی یکی از کاربران داخل «لیست ریکت» در گروهی که Self هم عضو آن است پیام
+    جدیدی بفرستد، بعد از ~۱ ثانیه Delay، همان ایموجی روی پیامش ریکت زده می‌شود.
+    طبق بند «ریکت در چت‌هایی اجرا شود که Self و کاربر هدف هر دو در آن حضور دارند»
+    (یعنی گروه/سوپرگروه مشترک)، در پیوی اجرا نمی‌شود. هر کاربر مستقل مدیریت می‌شود؛
+    چون Delay فقط ۱ ثانیه است، برای هر پیام یک Task کوتاه‌مدت جدید ساخته می‌شود
+    (نه یک Task دائمی) تا با پیام‌های پی‌درپی تداخل/تجمع پیدا نکند.
+    """
+    async def handler(event):
+        try:
+            if event.out or event.is_private:
+                return
+
+            user = user_data.get(user_id)
+            if not user or not user.get("status") or not user.get("reaction_enabled"):
+                return
+
+            sender_id = event.sender_id
+            if not sender_id:
+                return
+
+            targets = reaction_targets.get(user_id)
+            if not targets or sender_id not in targets:
+                return
+
+            emoji = targets[sender_id]["emoji"]
+            chat_id = event.chat_id
+            message_id = event.id
+
+            async def _delayed_react():
+                try:
+                    await asyncio.sleep(REACTION_APPLY_DELAY)
+                    cur_user = user_data.get(user_id)
+                    if not cur_user or not cur_user.get("status") or not cur_user.get("reaction_enabled"):
+                        return
+                    cur_targets = reaction_targets.get(user_id)
+                    if not cur_targets or sender_id not in cur_targets:
+                        return  # ریکت این کاربر بین این فاصله حذف شده
+                    client = active_clients.get(user_id)
+                    if not client:
+                        return
+                    await safe_call(client.send_reaction, chat_id, message_id, reaction=cur_targets[sender_id]["emoji"])
+                except asyncio.CancelledError:
+                    pass
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds)
+                except Exception as e:
+                    log_internal_error("apply_reaction", f"user={user_id} target={sender_id} err={e}")
+
+            _spawn_background_task(_delayed_react())
+        except Exception as e:
+            logging.error(f"⚠️ خطای هندلر ریکت برای کاربر {user_id}: {e}")
+            log_internal_error("reaction_handler_unexpected", e)
+
+    return handler
+
+# ======================== قابلیت پاسخ خودکار (اجرای خودکار) ========================
+def make_autoreply_handler(user_id):
+    """پیام‌های متنیِ دریافتی در هر چتی بررسی و در صورت تطبیق Trigger، پاسخ ارسال می‌شود."""
+    async def handler(event):
+        try:
+            if event.out:
+                return
+
+            user = user_data.get(user_id)
+            if not user or not user.get("status") or not user.get("autoreply_enabled"):
+                return
+
+            text = (event.raw_text or "").strip()
+            if not text:
+                return  # فقط پیام‌های متنی به‌عنوان Trigger در نظر گرفته می‌شوند
+
+            items = autoreply_cache.get(user_id)
+            if not items:
+                return
+
+            match_type = user.get("autoreply_match_type", "exact")
+            matched = None
+            for item in items:
+                trig = item.get("trigger_text") or ""
+                if not trig:
+                    continue
+                if match_type == "exact" and text == trig:
+                    matched = item
+                    break
+                if match_type == "prefix" and text.startswith(trig):
+                    matched = item
+                    break
+                if match_type == "contains" and trig in text:
+                    matched = item
+                    break
+
+            if not matched:
+                return
+
+            client = event.client
+            caption = matched.get("response_text") or ""
+            entities = matched.get("entities")
+            media_bytes = matched.get("media_bytes")
+
+            if media_bytes:
+                file_obj = io.BytesIO(media_bytes)
+                file_obj.name = matched.get("media_filename") or "file"
+                send_kwargs = {
+                    "caption": caption,
+                    "formatting_entities": entities,
+                    "reply_to": event.id,
+                }
+                kind = matched.get("media_kind")
+                if kind == "voice":
+                    send_kwargs["voice_note"] = True
+                elif kind == "video_note":
+                    send_kwargs["video_note"] = True
+                elif kind == "gif":
+                    send_kwargs["attributes"] = [DocumentAttributeAnimated()]
+                # نکته: استیکر از بایت خام (بدون stickerset اصلی) به‌صورت عکس/فایل معمولی
+                # دوباره ارسال می‌شود؛ حفظ کامل خاصیت «استیکر» چون از یک حساب دیگر
+                # (پنل بات) دانلود و توسط اکانت Self دوباره آپلود می‌شود، ممکن نیست.
+                sent = await safe_call(client.send_file, event.chat_id, file_obj, **send_kwargs)
+            elif caption:
+                sent = await safe_call(client.send_message, event.chat_id, caption,
+                                        formatting_entities=entities, reply_to=event.id)
+            else:
+                sent = None
+
+            # علامت‌گذاری پیام ارسالی به‌عنوان «خودکار» تا make_outgoing_handler دوباره
+            # آن را پردازش نکند (مثلاً حالت متن روی متنِ ذخیره‌شده‌ی پاسخ خودکار اعمال
+            # نشود) — دقیقاً همان مکانیزم استفاده‌شده در قابلیت منشی.
+            if sent:
+                _mark_auto_sent(user_id, sent.chat_id, sent.id)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logging.error(f"⚠️ خطای پاسخ خودکار برای کاربر {user_id}: {e}")
+            log_internal_error("autoreply_handler_unexpected", e)
+
+    return handler
+
 # ======================== مدیریت چرخه حیات کلاینت سلف ========================
 async def _teardown_existing_client(user_id):
     """
@@ -2580,6 +3311,8 @@ def register_active_client(user_id, client):
     client.add_event_handler(make_outgoing_handler(user_id), events.NewMessage(outgoing=True))
     client.add_event_handler(make_secretary_incoming_handler(user_id), events.NewMessage(incoming=True))
     client.add_event_handler(make_streetcat_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_reaction_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_autoreply_handler(user_id), events.NewMessage(incoming=True))
 
     loop = asyncio.get_event_loop()
     if user_id in user_data:
@@ -4584,6 +5317,117 @@ async def callback_handler(event):
         await safe_edit(event, get_tag_menu_text(), buttons=get_tag_menu_keyboard())
         return
 
+    if data == b"menu_ping":
+        await safe_edit(event, get_ping_menu_text(), buttons=get_ping_menu_keyboard())
+        return
+
+    if data == b"menu_whois":
+        await safe_edit(event, get_whois_menu_text(), buttons=get_whois_menu_keyboard())
+        return
+
+    # ====================================================================
+    # ============================== ریکت ================================
+    # ====================================================================
+    if data == b"menu_reaction":
+        await safe_edit(event, get_reaction_menu_text(user_id, user), buttons=get_reaction_menu_keyboard(user))
+        return
+
+    if data == b"reaction_toggle":
+        user["reaction_enabled"] = not user.get("reaction_enabled", False)
+        save_user(user_id, user)
+        log_settings_change(user_id, "reaction_enabled", user["reaction_enabled"])
+        await safe_edit(event, get_reaction_menu_text(user_id, user), buttons=get_reaction_menu_keyboard(user))
+        return
+
+    if data == b"reaction_list":
+        await safe_edit(event, get_reaction_list_text(user_id), buttons=get_reaction_list_keyboard())
+        return
+
+    # ====================================================================
+    # ========================== پاسخ خودکار ==============================
+    # ====================================================================
+    if data == b"menu_autoreply":
+        await safe_edit(event, get_autoreply_menu_text(user_id, user), buttons=get_autoreply_menu_keyboard(user))
+        return
+
+    if data == b"autoreply_toggle":
+        user["autoreply_enabled"] = not user.get("autoreply_enabled", False)
+        save_user(user_id, user)
+        log_settings_change(user_id, "autoreply_enabled", user["autoreply_enabled"])
+        await safe_edit(event, get_autoreply_menu_text(user_id, user), buttons=get_autoreply_menu_keyboard(user))
+        return
+
+    if data == b"autoreply_matchtype":
+        await safe_edit(event, get_autoreply_matchtype_text(),
+                         buttons=get_autoreply_matchtype_keyboard(user.get("autoreply_match_type", "exact")))
+        return
+
+    if data.startswith(b"autoreply_setmatch_"):
+        key = data.decode().split("autoreply_setmatch_", 1)[1]
+        if key not in AUTOREPLY_MATCH_TYPES:
+            await event.answer("❌ نوع تطبیق نامعتبر است.", alert=True)
+            return
+        user["autoreply_match_type"] = key
+        save_user(user_id, user)
+        log_settings_change(user_id, "autoreply_match_type", key)
+        await safe_edit(event, get_autoreply_menu_text(user_id, user), buttons=get_autoreply_menu_keyboard(user))
+        return
+
+    if data == b"autoreply_add":
+        autoreply_draft[user_id] = {}
+        user["step"] = "autoreply_get_trigger"
+        await safe_edit(event,
+            "کلمه یا جمله‌ای که می‌خواهی به آن پاسخ داده شود را ارسال کن.",
+            buttons=[[styled_button("➜ بازگشت", b"menu_autoreply", style=STYLE_OFF)]]
+        )
+        return
+
+    if data == b"autoreply_remove":
+        if not autoreply_cache.get(user_id):
+            await event.answer("❌ هنوز هیچ پاسخ خودکاری اضافه نکرده‌اید.", alert=True)
+            return
+        user["step"] = "autoreply_get_delete_id"
+        await safe_edit(event,
+            "شماره پاسخ موردنظر را وارد کنید:",
+            buttons=[[styled_button("➜ بازگشت", b"menu_autoreply", style=STYLE_OFF)]]
+        )
+        return
+
+    if data == b"autoreply_list":
+        await safe_edit(event, get_autoreply_list_text(user_id), buttons=get_autoreply_list_keyboard(user_id))
+        return
+
+    if data.startswith(b"autoreply_view_"):
+        try:
+            local_id = int(data.decode().split("autoreply_view_", 1)[1])
+        except ValueError:
+            await event.answer("❌ شناسه نامعتبر است.", alert=True)
+            return
+        item = next((i for i in autoreply_cache.get(user_id, []) if i["local_id"] == local_id), None)
+        if not item:
+            await event.answer("❌ این پاسخ پیدا نشد (شاید قبلاً حذف شده).", alert=True)
+            await safe_edit(event, get_autoreply_list_text(user_id), buttons=get_autoreply_list_keyboard(user_id))
+            return
+        await safe_edit(event, get_autoreply_view_text(item), buttons=get_autoreply_view_keyboard(local_id))
+        return
+
+    if data.startswith(b"autoreply_delete_"):
+        try:
+            local_id = int(data.decode().split("autoreply_delete_", 1)[1])
+        except ValueError:
+            await event.answer("❌ شناسه نامعتبر است.", alert=True)
+            return
+        removed = delete_autoreply_db(user_id, local_id)
+        if user_id in autoreply_cache:
+            autoreply_cache[user_id] = [i for i in autoreply_cache[user_id] if i["local_id"] != local_id]
+        if removed:
+            log_settings_change(user_id, "autoreply_deleted", str(local_id))
+            await event.answer("✅ پاسخ خودکار حذف شد.", alert=True)
+        else:
+            await event.answer("❌ این پاسخ پیدا نشد.", alert=True)
+        await safe_edit(event, get_autoreply_list_text(user_id), buttons=get_autoreply_list_keyboard(user_id))
+        return
+
     if data == b"menu_secretary":
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
@@ -5004,6 +5848,7 @@ async def message_handler(event):
         "transfer_get_target", "transfer_get_amount", "transfer_confirm",
         "secretary_get_text", "secretary_get_time", "giftcode_get_code",
         "buy_amount", "buy_confirm", "buy_payment", "buy_invoice", "buy_receipt",
+        "autoreply_get_trigger", "autoreply_get_response", "autoreply_get_delete_id",
     }
     _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
 
@@ -5016,11 +5861,118 @@ async def message_handler(event):
         admin_action_data.pop(user_id, None)
         transfer_data.pop(user_id, None)
         purchase_data.pop(user_id, None)
+        autoreply_draft.pop(user_id, None)
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
         await event.respond("❌ عملیات لغو شد.")
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
+        return
+
+    # ====== افزودن پاسخ خودکار (دو مرحله‌ای: Trigger سپس Response) ======
+    if user_id in user_data and user_data[user_id].get("step") == "autoreply_get_trigger":
+        trigger_text = text.strip()
+        if not trigger_text:
+            await event.respond("❌ لطفاً یک متن معتبر ارسال کنید.",
+                                 buttons=[[styled_button("➜ بازگشت", b"menu_autoreply", style=STYLE_OFF)]])
+            return
+        autoreply_draft[user_id] = {"trigger_text": trigger_text}
+        user_data[user_id]["step"] = "autoreply_get_response"
+        await event.respond(
+            "حالا پیام پاسخ خودکار را ارسال کن.\n\n"
+            "می‌تواند متن، عکس، GIF، استیکر، ویدیو، فایل یا Voice باشد؛ با همان Formatting ذخیره می‌شود."
+        )
+        return
+
+    if user_id in user_data and user_data[user_id].get("step") == "autoreply_get_response":
+        draft = autoreply_draft.get(user_id)
+        if not draft:
+            user_data[user_id]["step"] = "managed"
+            await event.respond("❌ عملیات منقضی شده. دوباره از «افزودن پاسخ خودکار» اقدام کنید.")
+            return
+
+        msg = event.message
+        media_kind = _media_kind_key(msg)
+        media_bytes = None
+        media_filename = None
+        media_mime = None
+
+        if media_kind:
+            size = getattr(event.file, "size", None) if event.file else None
+            if size and size > MAX_AUTOREPLY_MEDIA_BYTES:
+                await event.respond(
+                    f"❌ حجم این فایل بیش از حد مجاز است (حداکثر {MAX_AUTOREPLY_MEDIA_MB} مگابایت). "
+                    "فایل کوچک‌تری بفرست یا پیام دیگری ارسال کن."
+                )
+                return
+            try:
+                media_bytes = await event.download_media(file=bytes)
+            except Exception as e:
+                log_internal_error("autoreply_download_media", e)
+                await event.respond("❌ خطا در دریافت فایل. دوباره تلاش کنید.")
+                return
+            media_filename = getattr(event.file, "name", None) if event.file else None
+            media_mime = getattr(event.file, "mime_type", None) if event.file else None
+
+        response_text = text if text else None
+        if not response_text and not media_bytes:
+            await event.respond("❌ پیام خالی قابل ذخیره نیست. یک متن یا رسانه ارسال کن.")
+            return
+
+        entities = msg.entities
+
+        local_id = add_autoreply_db(
+            user_id, draft["trigger_text"], response_text, entities,
+            media_kind, media_bytes, media_filename, media_mime
+        )
+        autoreply_draft.pop(user_id, None)
+        user_data[user_id]["step"] = "managed"
+
+        if local_id is None:
+            await event.respond("❌ خطا در ذخیره‌سازی پاسخ خودکار. دوباره تلاش کنید.")
+            return
+
+        autoreply_cache.setdefault(user_id, []).append({
+            "local_id": local_id,
+            "trigger_text": draft["trigger_text"],
+            "response_text": response_text,
+            "entities": entities,
+            "media_kind": media_kind,
+            "media_bytes": media_bytes,
+            "media_filename": media_filename,
+            "media_mime": media_mime,
+        })
+
+        await event.respond(
+            f"✅ پاسخ خودکار شماره {local_id} با موفقیت ذخیره شد.",
+            buttons=get_autoreply_menu_keyboard(user_data[user_id])
+        )
+        return
+
+    # ====== حذف پاسخ خودکار (دریافت شماره) ======
+    if user_id in user_data and user_data[user_id].get("step") == "autoreply_get_delete_id":
+        try:
+            local_id = int(text.strip())
+        except ValueError:
+            await event.respond("❌ لطفاً فقط شماره‌ی پاسخ را ارسال کنید (مثلاً 2).")
+            return
+
+        exists = any(i["local_id"] == local_id for i in autoreply_cache.get(user_id, []))
+        if not exists:
+            await event.respond(f"❌ پاسخ خودکار شماره {local_id} پیدا نشد.")
+            return
+
+        removed = delete_autoreply_db(user_id, local_id)
+        if user_id in autoreply_cache:
+            autoreply_cache[user_id] = [i for i in autoreply_cache[user_id] if i["local_id"] != local_id]
+        user_data[user_id]["step"] = "managed"
+
+        if removed:
+            log_settings_change(user_id, "autoreply_deleted", str(local_id))
+            await event.respond(f"✅ پاسخ خودکار شماره {local_id} حذف شد.",
+                                 buttons=get_autoreply_menu_keyboard(user_data[user_id]))
+        else:
+            await event.respond("❌ خطا در حذف. دوباره تلاش کنید.")
         return
 
     # ====== مرحله‌ی انتظار برای عکس رسید خرید الماس ======
@@ -5653,6 +6605,8 @@ if __name__ == "__main__":
     init_db()
     user_data = get_all_users()
     logging.info(f"📊 تعداد کاربران بارگذاری شده: {len(user_data)}")
+    load_reactions_cache()
+    load_autoreplies_cache()
 
     loop = asyncio.get_event_loop()
 
@@ -5681,4 +6635,3 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
-
