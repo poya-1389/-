@@ -108,6 +108,18 @@ def format_interval(total_seconds):
     return f"{minutes} دقیقه و {secs} ثانیه"
 SUPPORT_USERNAME = "@SayPouYa"
 
+TEHRAN_TZ = pytz.timezone("Asia/Tehran")
+
+def tehran_now():
+    """
+    اکنون بر حسب ساعت تهران — عمداً Naive برگردانده می‌شود (بدون tzinfo) تا با
+    بقیه‌ی Datetimeهای پروژه (ستون‌های TIMESTAMP دیتابیس که با تنظیم Timezone نشست
+    در get_db_connection همسو شده‌اند، و محاسبات قبلی پروژه) سازگار بماند و ریسک
+    خطای «مقایسه Naive با Aware» پیش نیاید. این تابع جایگزین همه‌ی tehran_now()
+    شد که در نمایش تاریخ/ساعت یا ثبت زمان به کاربر تأثیر می‌گذاشت.
+    """
+    return datetime.now(TEHRAN_TZ).replace(tzinfo=None)
+
 # ======================== دیکشنری‌های عمومی ========================
 active_clients = {}
 BOT_USERNAME = None  # موقع اجرای برنامه از get_me() پر می‌شود (برای پنل درون‌چتی لازم است)
@@ -219,7 +231,20 @@ TEXTMODE_NAMES = {
 
 # ======================== مدیریت دیتابیس ========================
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    """
+    اتصال جدید به Postgres. بلافاصله بعد از اتصال، Timezone نشست روی Asia/Tehran
+    تنظیم می‌شود تا مقادیر CURRENT_TIMESTAMP/NOW() که در ستون‌های TIMESTAMP (بدون
+    Timezone) ذخیره می‌شوند، بر حسب ساعت تهران محاسبه شوند — نه ساعت سرور (که روی
+    Railway معمولاً UTC است). این باگِ «تایم/تاریخ اشتباه در بعضی قسمت‌ها» را حل می‌کند.
+    """
+    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SET TIME ZONE 'Asia/Tehran'")
+        conn.commit()
+    except Exception as e:
+        logging.error(f"⚠️ خطا در تنظیم Timezone اتصال دیتابیس: {e}")
+    return conn
 
 def init_db():
     """ایجاد جدول و افزودن ستون‌های جدید در صورت نیاز (idempotent و امن برای ری‌استارت)."""
@@ -450,8 +475,8 @@ def get_all_users():
                 "diamonds": float(row['diamonds']) if row['diamonds'] is not None else 0.0,
                 "referral_count": row['referral_count'] if row['referral_count'] is not None else 0,
                 "username": row['username'],
-                "last_charge_at": row['last_charge_at'] or datetime.now(),
-                "joined_at": row['joined_at'] or datetime.now(),
+                "last_charge_at": row['last_charge_at'] or tehran_now(),
+                "joined_at": row['joined_at'] or tehran_now(),
                 "meow_enabled": bool(row['meow_enabled']) if row['meow_enabled'] is not None else False,
                 "meow_chat_id": row['meow_chat_id'],
                 "meow_last_sent_at": row['meow_last_sent_at'],
@@ -559,7 +584,7 @@ def save_user(user_id, user):
             int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
             user.get("secretary_delay", 60),
             user.get("diamonds", 0), user.get("referral_count", 0), user.get("username"),
-            user.get("last_charge_at", datetime.now()),
+            user.get("last_charge_at", tehran_now()),
             int(user.get("meow_enabled", False)), user.get("meow_chat_id"), user.get("meow_last_sent_at"),
             user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS),
             int(user.get("fish_enabled", False)), user.get("fish_last_run_at"),
@@ -687,7 +712,7 @@ def charge_diamonds_db(user_id, cost):
 
         cursor.execute(
             "UPDATE novaself_users SET diamonds = %s, last_charge_at = %s WHERE user_id = %s",
-            (new_balance, datetime.now(), user_id)
+            (new_balance, tehran_now(), user_id)
         )
         conn.commit()
         return (not insufficient), new_balance
@@ -846,7 +871,7 @@ def redeem_gift_code_db(code, user_id):
         if not row["is_active"]:
             conn.rollback()
             return False, "❌ این کد غیرفعال شده است.", None
-        if row["expires_at"] and row["expires_at"] < datetime.now():
+        if row["expires_at"] and row["expires_at"] < tehran_now():
             conn.rollback()
             return False, "❌ این کد منقضی شده است.", None
 
@@ -1115,7 +1140,7 @@ def set_order_receipt_db(order_id, chat_id, message_id, file_id):
         cursor.execute(
             "UPDATE novaself_orders SET status = 'pending_review', receipt_chat_id = %s, "
             "receipt_message_id = %s, receipt_file_id = %s, updated_at = %s WHERE order_id = %s",
-            (chat_id, message_id, file_id, datetime.now(), order_id)
+            (chat_id, message_id, file_id, tehran_now(), order_id)
         )
         conn.commit()
         row = dict(row)
@@ -1160,7 +1185,7 @@ def approve_order_db(order_id, admin_id):
             return False, "user_not_found", dict(row)
 
         new_balance = float(user_row["diamonds"] or 0) + float(row["amount_diamonds"])
-        now = datetime.now()
+        now = tehran_now()
         cursor.execute("UPDATE novaself_users SET diamonds = %s WHERE user_id = %s", (new_balance, user_id))
         cursor.execute(
             "UPDATE novaself_orders SET status = 'approved', approved_at = %s, approved_by = %s, "
@@ -1199,7 +1224,7 @@ def reject_order_db(order_id, admin_id, reason):
             conn.rollback()
             return False, "already_processed", dict(row)
 
-        now = datetime.now()
+        now = tehran_now()
         cursor.execute(
             "UPDATE novaself_orders SET status = 'rejected', rejected_at = %s, rejected_by = %s, "
             "rejection_reason = %s, updated_at = %s WHERE order_id = %s",
@@ -1550,7 +1575,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "diamonds": 0.0,
         "referral_count": 0,
         "username": None,
-        "last_charge_at": datetime.now(),
+        "last_charge_at": tehran_now(),
         "meow_enabled": False,
         "meow_chat_id": None,
         "meow_chat_title": None,
@@ -1581,7 +1606,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "meowpoint_task": None,
         "fridge_task": None,
         "step": step,
-        "joined_at": datetime.now()
+        "joined_at": tehran_now()
     }
 
 def format_date(dt, date_type):
@@ -1733,24 +1758,24 @@ def get_main_menu_keyboard(user):
         [toggle_button(f"وضعیت سلف  |  ⏳ {expiry_text}", user["status"], b"toggle_status")],
         [styled_button("👤 حساب کاربری", b"menu_account", style=STYLE_INFO)],
         [
-            styled_button("📅 تاریخ", b"menu_date", style=STYLE_INFO),
-            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
             styled_button("⌚ ساعت", b"menu_time", style=STYLE_INFO),
+            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
+            styled_button("📅 تاریخ", b"menu_date", style=STYLE_INFO),
         ],
         [
-            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
             styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
+            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
         ],
         [
-            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
             styled_button("🐱 میو", b"menu_meow", style=STYLE_INFO),
+            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
+            styled_button("🏓 پینگ", b"menu_ping", style=STYLE_INFO),
         ],
         [
-            styled_button("🏓 پینگ", b"menu_ping", style=STYLE_INFO),
             styled_button("🪪 اطلاعات", b"menu_whois", style=STYLE_INFO),
+            styled_button("👍 ریکت", b"menu_reaction", style=STYLE_INFO),
+            styled_button("🤖 پاسخ خودکار", b"menu_autoreply", style=STYLE_INFO),
         ],
-        [toggle_button("👍 ریکت", user.get("reaction_enabled", False), b"menu_reaction")],
-        [toggle_button("🤖 پاسخ خودکار", user.get("autoreply_enabled", False), b"menu_autoreply")],
     ]
 
 def get_ping_menu_text():
@@ -1885,7 +1910,7 @@ def get_time_menu_keyboard(user):
 
 def get_time_menu_text(user):
     font_name = FONT_NAMES.get(user["font_id"], "بولد")
-    preview = build_clock_preview(apply_font, user["font_id"])
+    preview = build_clock_preview(apply_font, user["font_id"], now=tehran_now())
     return (
         "⌚ **تنظیمات ساعت**\n\n"
         f"فونت ساعت: {font_name}\n\n"
@@ -1894,7 +1919,7 @@ def get_time_menu_text(user):
 
 def get_fonts_menu_text(user):
     font_name = FONT_NAMES.get(user["font_id"], "بولد")
-    preview = build_clock_preview(apply_font, user["font_id"])
+    preview = build_clock_preview(apply_font, user["font_id"], now=tehran_now())
     return (
         "🔤 **انتخاب فونت ساعت**\n\n"
         f"فونت ساعت: {font_name}\n\n"
@@ -1956,7 +1981,7 @@ def get_date_menu_keyboard(user):
     ]
 
 def get_date_menu_text(user):
-    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"))
+    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"), now=tehran_now())
     return (
         "📅 **تنظیمات تاریخ**\n\n"
         f"{preview}"
@@ -1983,7 +2008,7 @@ def get_date_fonts_menu_keyboard(current_font_id):
 
 def get_date_fonts_menu_text(user):
     font_name = FONT_NAMES.get(user.get("date_font", 1), "بولد")
-    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"))
+    preview = build_date_preview(apply_font, format_date, user.get("date_font", 1), user.get("date_type", "shamsi"), now=tehran_now())
     return (
         "🔤 **انتخاب فونت تاریخ**\n\n"
         f"فونت تاریخ: {font_name}\n\n"
@@ -2304,8 +2329,8 @@ def get_buy_confirm_text(amount):
     toman = amount * DIAMOND_PRICE_TOMAN
     return (
         "💎 **تأیید مقدار خرید**\n\n"
-        f"💎 تعداد الماس:\n{format_diamonds(amount)}\n\n"
-        f"💰 مبلغ قابل پرداخت:\n{toman:,.0f} تومان"
+        f"💎 تعداد الماس : {format_diamonds(amount)}\n"
+        f"💰 مبلغ قابل پرداخت : {toman:,.0f} تومان"
     )
 
 def get_buy_confirm_keyboard():
@@ -2318,8 +2343,8 @@ def get_buy_payment_text(amount):
     toman = amount * DIAMOND_PRICE_TOMAN
     return (
         "💳 **انتخاب روش پرداخت**\n\n"
-        f"تعداد الماس:\n{format_diamonds(amount)}\n\n"
-        f"مبلغ قابل پرداخت:\n{toman:,.0f} تومان\n\n"
+        f"تعداد الماس : {format_diamonds(amount)}\n"
+        f"مبلغ قابل پرداخت : {toman:,.0f} تومان\n\n"
         "یکی از روش‌های پرداخت زیر را انتخاب کنید."
     )
 
@@ -2336,13 +2361,13 @@ def get_buy_invoice_text(order_id, user_id, username, amount, toman, created_at)
     username_display = f"@{username}" if username else "ثبت نشده"
     return (
         "🧾 **فاکتور خرید الماس**\n\n"
-        f"👤 نام کاربر:\n{username_display}\n\n"
-        f"🆔 آیدی عددی:\n{user_id}\n\n"
-        f"💎 تعداد الماس:\n{format_diamonds(amount)}\n\n"
-        f"💰 مبلغ:\n{toman:,.0f} تومان\n\n"
-        f"🧾 کد سفارش:\n{order_id}\n\n"
-        f"⏱ زمان ایجاد:\n{created_at.strftime('%Y/%m/%d %H:%M')}\n\n"
-        "📌 وضعیت:\nدر انتظار پرداخت"
+        f"👤 نام کاربر : {username_display}\n"
+        f"🆔 آیدی عددی : {user_id}\n"
+        f"💎 تعداد الماس : {format_diamonds(amount)}\n"
+        f"💰 مبلغ : {toman:,.0f} تومان\n"
+        f"🧾 کد سفارش : {order_id}\n"
+        f"⏱ زمان ایجاد : {created_at.strftime('%Y/%m/%d %H:%M')}\n"
+        "📌 وضعیت : در انتظار پرداخت"
     )
 
 def get_buy_invoice_keyboard():
@@ -2361,8 +2386,8 @@ def get_buy_waiting_receipt_text(toman):
     return (
         "💳 **کارت به کارت**\n\n"
         f"مبلغ {toman:,.0f} تومان رو به کارت زیر واریز کن:\n\n"
-        f"💳 شماره کارت (برای کپی لمس کنید):\n`{CARD_TO_CARD_NUMBER}`\n\n"
-        f"👤 به نام:\n{CARD_TO_CARD_OWNER}\n\n"
+        f"💳 شماره کارت (برای کپی لمس کنید) : `{CARD_TO_CARD_NUMBER}`\n"
+        f"👤 به نام : {CARD_TO_CARD_OWNER}\n\n"
         "بعد از واریز، عکس رسید رو همینجا بفرست تا بررسی و تأیید بشه ✅"
     )
 
@@ -2831,11 +2856,11 @@ async def handle_whois_command(event, user_id):
 
         caption = (
             "🪪 **اطلاعات کاربر**\n\n"
-            f"• نام کاربر:\n{name}\n\n"
-            f"• بیوگرافی:\n{bio or 'ندارد'}\n\n"
-            f"• آیدی عددی:\n{target.id}\n\n"
-            f"• یوزرنیم:\n{username}\n\n"
-            f"• تعداد تصاویر پروفایل:\n{photo_count}"
+            f"• نام کاربر : {name}\n"
+            f"• بیوگرافی : {bio or 'ندارد'}\n"
+            f"• آیدی عددی : {target.id}\n"
+            f"• یوزرنیم : {username}\n"
+            f"• تعداد تصاویر پروفایل : {photo_count}"
         )
 
         photo_bytes = None
@@ -2893,7 +2918,20 @@ async def handle_set_reaction_command(event, user_id):
 
         reaction_targets.setdefault(user_id, {})[target_id] = {"emoji": emoji, "username": username}
         log_settings_change(user_id, "reaction_target", f"{target_id}={emoji}")
-        await event.reply(f"✅ از این به بعد پیام‌های این کاربر به‌صورت خودکار با {emoji} ریکت می‌شوند.")
+
+        # اگر قابلیت ریکت هنوز از پنل روشن نشده، همین‌جا خودکار روشن می‌شود — چون
+        # ثبت یک ریکت با دستور یعنی قصد استفاده از قابلیت را دارد؛ این باگ اصلیِ
+        # «ثبت می‌شود ولی ریکت اعمال نمی‌شود» را حل می‌کند (اکثر مواقع علتش همین
+        # روشن‌نبودنِ سوییچِ اصلیِ قابلیت در منو بوده، نه خرابی خودِ ثبت).
+        owner = user_data.get(user_id)
+        note = ""
+        if owner and not owner.get("reaction_enabled"):
+            owner["reaction_enabled"] = True
+            save_user(user_id, owner)
+            log_settings_change(user_id, "reaction_enabled", True)
+            note = "\n\n(قابلیت ریکت هم به‌صورت خودکار فعال شد.)"
+
+        await event.reply(f"✅ از این به بعد پیام‌های این کاربر به‌صورت خودکار با {emoji} ریکت می‌شوند.{note}")
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -3181,7 +3219,16 @@ def make_reaction_handler(user_id):
                     client = active_clients.get(user_id)
                     if not client:
                         return
-                    await safe_call(client.send_reaction, chat_id, message_id, reaction=cur_targets[sender_id]["emoji"])
+
+                    emoji = cur_targets[sender_id]["emoji"]
+                    # روی نسخه‌های مختلف Telethon، پارامتر reaction گاهی یک رشته و
+                    # گاهی لیستی از رشته/ReactionEmoji قبول می‌کند؛ برای اطمینان از کار
+                    # کردن ریکت (باگ گزارش‌شده: «ثبت می‌شود ولی ریکت اعمال نمی‌شود»)،
+                    # اول به شکل رشته‌ی تکی امتحان می‌شود و در صورت خطا، به شکل لیست.
+                    try:
+                        await safe_call(client.send_reaction, chat_id, message_id, reaction=emoji)
+                    except TypeError:
+                        await safe_call(client.send_reaction, chat_id, message_id, reaction=[emoji])
                 except asyncio.CancelledError:
                     pass
                 except FloodWaitError as e:
@@ -3497,7 +3544,7 @@ async def meow_worker(user_id, client):
 
         try:
             await safe_call(client.send_message, chat_id, "میو")
-            user_data[user_id]["meow_last_sent_at"] = datetime.now()
+            user_data[user_id]["meow_last_sent_at"] = tehran_now()
             save_user(user_id, user_data[user_id])
 
         except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
@@ -3703,7 +3750,7 @@ async def fish_worker(user_id, client):
 
         try:
             sent = await safe_call(client.send_message, chat_id, "ماهی")
-            user_data[user_id]["fish_last_run_at"] = datetime.now()
+            user_data[user_id]["fish_last_run_at"] = tehran_now()
             save_user(user_id, user_data[user_id])
 
             info = await _wait_for_game_reply(
@@ -3797,7 +3844,7 @@ async def meowpoint_worker(user_id, client):
 
         try:
             sent = await safe_call(client.send_message, chat_id, "پیشی")
-            user_data[user_id]["meowpoint_last_run_at"] = datetime.now()
+            user_data[user_id]["meowpoint_last_run_at"] = tehran_now()
             save_user(user_id, user_data[user_id])
 
             info = await _wait_for_game_reply(
@@ -3992,7 +4039,7 @@ async def fridge_worker(user_id, client):
 
         try:
             sent = await safe_call(client.send_message, chat_id, "یخچال میویی")
-            user_data[user_id]["fridge_last_run_at"] = datetime.now()
+            user_data[user_id]["fridge_last_run_at"] = tehran_now()
             save_user(user_id, user_data[user_id])
 
             info = await _wait_for_game_reply(
@@ -4141,7 +4188,7 @@ async def inline_panel_handler(event):
     keyboard = wrap_panel_buttons(get_main_menu_keyboard(user), owner_id)
     result = builder.article(
         "🔗 پنل NovaSelf",
-        text="🔗 **پنل مدیریت NovaSelf**\nاز طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+        text="🔘 **پنـل مدیریـت نـوا سـلف**\nاز طریق منوی زیر سلف خود را مدیریت کنید:",
         buttons=keyboard,
     )
     await event.answer([result], cache_time=0)
@@ -4169,8 +4216,8 @@ async def start_handler(event):
         )
     else:
         await event.respond(
-            "🔗 **پنل مدیریت NovaSelf**\n"
-            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
+            "از طریق منوی زیر سلف خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
 
@@ -4257,7 +4304,7 @@ async def callback_handler(event):
                 f"👥 تعداد کل کاربران: {total}\n"
                 f"🟢 کاربران فعال: {active}\n"
                 f"🔴 کاربران غیرفعال: {total - active}\n\n"
-                f"🕐 آخرین بروزرسانی: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"🕐 آخرین بروزرسانی: {tehran_now().strftime('%Y-%m-%d %H:%M:%S')}",
                 buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
             )
             return
@@ -4391,9 +4438,9 @@ async def callback_handler(event):
             try:
                 await safe_call(bot.send_message, buyer_id,
                     "✅ **سفارش شما با موفقیت تأیید شد.**\n\n"
-                    f"💎 الماس دریافت شده:\n{format_diamonds(order['amount_diamonds'])}\n\n"
-                    f"🧾 کد سفارش:\n{order_id}\n\n"
-                    f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
+                    f"💎 الماس دریافت شده : {format_diamonds(order['amount_diamonds'])}\n"
+                    f"🧾 کد سفارش : {order_id}\n"
+                    f"💰 مبلغ : {order['amount_toman']:,.0f} تومان\n\n"
                     "موجودی الماس شما با موفقیت شارژ شد."
                 )
             except Exception as e:
@@ -4904,8 +4951,8 @@ async def callback_handler(event):
 
     if data == b"back_to_main":
         await safe_edit(event,
-            "🔗 **پنل مدیریت NovaSelf**\n"
-            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
+            "از طریق منوی زیر سلف خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
         return
@@ -5053,8 +5100,8 @@ async def callback_handler(event):
         log_self_toggle(user_id, user["status"])
 
         await safe_edit(event,
-            "🔗 **پنل مدیریت NovaSelf**\n"
-            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
+            "از طریق منوی زیر سلف خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user)
         )
         return
@@ -5166,7 +5213,7 @@ async def callback_handler(event):
                              buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
             return
         pending["payment_method"] = "card_to_card"
-        pending["invoice_created_at"] = datetime.now()
+        pending["invoice_created_at"] = tehran_now()
         user["step"] = "buy_invoice"
         await safe_edit(event,
             get_buy_invoice_text("(بعد از تأیید ساخته می‌شود)", user_id, user.get("username"),
@@ -5206,7 +5253,7 @@ async def callback_handler(event):
         pending = purchase_data.get(user_id) or {}
         user["step"] = "buy_invoice"
         order = get_order_db(pending.get("order_id")) if pending.get("order_id") else None
-        created_at = order["created_at"] if order else pending.get("invoice_created_at", datetime.now())
+        created_at = order["created_at"] if order else pending.get("invoice_created_at", tehran_now())
         await safe_edit(event,
             get_buy_invoice_text(pending.get("order_id", "—"), user_id, user.get("username"),
                                   pending.get("amount", 0), pending.get("toman", 0), created_at),
@@ -5282,7 +5329,7 @@ async def callback_handler(event):
             user["step"] = "managed"
             log_diamond_transfer(user_id, target_id, amount)
 
-            when = datetime.now()
+            when = tehran_now()
             sender_username = user.get("username")
             sender_label = f"@{sender_username}" if sender_username else f"`{user_id}`"
             receiver_user = user_data.get(target_id, {})
@@ -5815,8 +5862,8 @@ async def process_code_signin(event, user_id, code):
             del active_signins[user_id]
 
         await event.respond(
-            "🔗 **پنل مدیریت NovaSelf**\n"
-            "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
+            "از طریق منوی زیر سلف خود را مدیریت کنید:",
             buttons=get_main_menu_keyboard(user_data[user_id])
         )
 
@@ -6019,15 +6066,15 @@ async def message_handler(event):
         # ارسال سفارش کامل + عکس رسید برای همه‌ی ادمین‌ها
         admin_caption = (
             "🧾 **سفارش جدید خرید الماس**\n\n"
-            f"👤 نام:\n{username or '—'}\n\n"
-            f"🆔 آیدی عددی:\n{user_id}\n\n"
-            f"🔹 Username:\n{('@' + username) if username else 'ندارد'}\n\n"
-            f"💎 تعداد الماس:\n{format_diamonds(order['amount_diamonds'])}\n\n"
-            f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
-            f"🧾 کد سفارش:\n{order_id}\n\n"
-            f"⏱ زمان ثبت سفارش:\n{order['created_at'].strftime('%Y/%m/%d %H:%M')}\n\n"
-            "📌 وضعیت:\nدر انتظار بررسی\n\n"
-            "📱 روش پرداخت:\nکارت به کارت"
+            f"👤 نام : {username or '—'}\n"
+            f"🆔 آیدی عددی : {user_id}\n"
+            f"🔹 Username : {('@' + username) if username else 'ندارد'}\n"
+            f"💎 تعداد الماس : {format_diamonds(order['amount_diamonds'])}\n"
+            f"💰 مبلغ : {order['amount_toman']:,.0f} تومان\n"
+            f"🧾 کد سفارش : {order_id}\n"
+            f"⏱ زمان ثبت سفارش : {order['created_at'].strftime('%Y/%m/%d %H:%M')}\n"
+            "📌 وضعیت : در انتظار بررسی\n"
+            "📱 روش پرداخت : کارت به کارت"
         )
         admin_buttons = [
             [
@@ -6079,7 +6126,7 @@ async def message_handler(event):
                 await event.respond("❌ لطفاً یک عدد صحیح و غیرمنفی ارسال کنید.", buttons=cancel_kb)
                 return
 
-            expires_at = (datetime.now() + timedelta(days=days)) if days > 0 else None
+            expires_at = (tehran_now() + timedelta(days=days)) if days > 0 else None
             success, error = create_gift_code_db(action["code"], action["diamonds"], expires_at, user_id)
             del admin_action_data[user_id]
 
@@ -6131,7 +6178,7 @@ async def message_handler(event):
             except ValueError:
                 await event.respond("❌ لطفاً یک عدد صحیح و غیرمنفی ارسال کنید.", buttons=cancel_kb)
                 return
-            new_expiry = (datetime.now() + timedelta(days=days)) if days > 0 else None
+            new_expiry = (tehran_now() + timedelta(days=days)) if days > 0 else None
             success = update_gift_code_expiry_db(code, new_expiry)
             del admin_action_data[user_id]
             if not success:
@@ -6173,10 +6220,10 @@ async def message_handler(event):
         try:
             await safe_call(bot.send_message, order["user_id"],
                 "❌ **سفارش شما رد شد.**\n\n"
-                f"🧾 کد سفارش:\n{order_id}\n\n"
-                f"💎 تعداد الماس:\n{format_diamonds(order['amount_diamonds'])}\n\n"
-                f"💰 مبلغ:\n{order['amount_toman']:,.0f} تومان\n\n"
-                f"دلیل:\n{reason}"
+                f"🧾 کد سفارش : {order_id}\n"
+                f"💎 تعداد الماس : {format_diamonds(order['amount_diamonds'])}\n"
+                f"💰 مبلغ : {order['amount_toman']:,.0f} تومان\n\n"
+                f"دلیل : {reason}"
             )
         except Exception as e:
             log_internal_error("notify_order_rejected", e)
@@ -6363,8 +6410,8 @@ async def message_handler(event):
                     del active_signins[user_id]
 
                 await event.respond(
-                    "🔗 **پنل مدیریت NovaSelf**\n"
-                    "از طریق منوی زیر می‌توانید تنظیمات خود را مدیریت کنید:",
+                    "🔘 **پنـل مدیریـت نـوا سـلف**\n"
+                    "از طریق منوی زیر سلف خود را مدیریت کنید:",
                     buttons=get_main_menu_keyboard(user_data[user_id])
                 )
             except Exception as e:
