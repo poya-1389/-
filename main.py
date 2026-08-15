@@ -120,6 +120,66 @@ def tehran_now():
     """
     return datetime.now(TEHRAN_TZ).replace(tzinfo=None)
 
+_PHONE_DIGIT_TRANSLATION = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹" + "٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789"
+)
+
+def normalize_phone_number(raw):
+    """
+    نرمال‌سازی هوشمند شماره تلفن قبل از ارسال به تلگرام: اعداد فارسی/عربی به
+    انگلیسی، حذف فاصله/نیم‌فاصله/خط‌تیره/پرانتز، تشخیص صفر ابتدایی و حالت بدون
+    +۹۸، و افزودن خودکار +۹۸. تمام حالت‌های 0912x../912x../+98912x../۰۹۱۲x../۹۱۲x..
+    پشتیبانی می‌شوند. هرگز Exception نمی‌دهد — همیشه (normalized یا None, پیام خطا یا None)
+    برمی‌گرداند.
+    خروجی: (normalized: str|None, error_message: str|None)
+    """
+    try:
+        if not raw or not raw.strip():
+            return None, "❌ شماره تلفن نامعتبر است. لطفاً دوباره ارسال کنید."
+
+        cleaned = raw.strip().translate(_PHONE_DIGIT_TRANSLATION)
+        for ch in (" ", "\u200c", "\u200f", "\u200e", "-", "(", ")"):
+            cleaned = cleaned.replace(ch, "")
+
+        if not cleaned:
+            return None, "❌ شماره تلفن نامعتبر است. لطفاً دوباره ارسال کنید."
+
+        if not re.fullmatch(r"\+?\d+", cleaned):
+            return None, "❌ شماره تلفن فقط باید شامل عدد باشد. لطفاً دوباره ارسال کنید."
+
+        has_plus = cleaned.startswith("+")
+        digits = cleaned[1:] if has_plus else cleaned
+
+        example_error = (
+            "❌ فرمت شماره تشخیص داده نشد.\n"
+            "نمونه‌های معتبر: `0912xxxxxxx` یا `+98912xxxxxxx`"
+        )
+
+        if digits.startswith("0098"):
+            digits = digits[4:]
+        elif digits.startswith("98") and len(digits) == 12:
+            pass
+        elif digits.startswith("0") and len(digits) == 11:
+            digits = digits[1:]
+        elif len(digits) == 10 and digits.startswith("9"):
+            pass
+        else:
+            return None, example_error
+
+        if not digits.startswith("98"):
+            digits = "98" + digits
+
+        normalized = "+" + digits
+
+        if not re.fullmatch(r"\+989\d{9}", normalized):
+            return None, example_error
+
+        return normalized, None
+    except Exception as e:
+        logging.error(f"⚠️ خطا در نرمال‌سازی شماره تلفن: {e}")
+        return None, "❌ خطا در پردازش شماره تلفن. لطفاً دوباره ارسال کنید."
+
 # ======================== دیکشنری‌های عمومی ========================
 active_clients = {}
 BOT_USERNAME = None  # موقع اجرای برنامه از get_me() پر می‌شود (برای پنل درون‌چتی لازم است)
@@ -1752,30 +1812,80 @@ async def safe_edit(event, text, buttons=None):
         pass
 
 # ======================== منوهای کاربر ========================
-def get_main_menu_keyboard(user):
+PANEL_TEXT = "🔘 **پنـل مدیریـت نـوا سـلف**\nاز طریق منوی زیر سلف خود را مدیریت کنید:"
+
+def get_panel_root_keyboard(user):
+    """
+    ریشه‌ی پنل خصوصی (`.پنل`). دکمه‌ی «✕ بستن پنل» نیازی به افزودن دستی ندارد چون
+    این پنل همیشه در بستر Inline (wrap_panel_buttons) رندر می‌شود و آن دکمه خودش
+    به‌صورت خودکار اضافه می‌شود؛ چون این صفحه ریشه است، «➜ بازگشت» ندارد.
+    """
     expiry_text = format_expiry(user.get("diamonds", 0))
     return [
         [toggle_button(f"وضعیت سلف  |  ⏳ {expiry_text}", user["status"], b"toggle_status")],
-        [styled_button("👤 حساب کاربری", b"menu_account", style=STYLE_INFO)],
         [
-            styled_button("⌚ ساعت", b"menu_time", style=STYLE_INFO),
-            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
+            styled_button("⚙ تنظیمات سلف", b"settings_root", style=STYLE_INFO),
+            styled_button("👤 حساب کاربری", b"panel_account", style=STYLE_INFO),
+        ],
+    ]
+
+def get_settings_root_keyboard():
+    """صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی."""
+    return [
+        [
             styled_button("📅 تاریخ", b"menu_date", style=STYLE_INFO),
+            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
+            styled_button("⌚ ساعت", b"menu_time", style=STYLE_INFO),
+        ],
+        [
+            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
+            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
         ],
         [
             styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
-            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
-        ],
-        [
             styled_button("🐱 میو", b"menu_meow", style=STYLE_INFO),
-            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
             styled_button("🏓 پینگ", b"menu_ping", style=STYLE_INFO),
         ],
         [
-            styled_button("🪪 اطلاعات", b"menu_whois", style=STYLE_INFO),
-            styled_button("👍 ریکت", b"menu_reaction", style=STYLE_INFO),
             styled_button("🤖 پاسخ خودکار", b"menu_autoreply", style=STYLE_INFO),
+            styled_button("👍 ریکت", b"menu_reaction", style=STYLE_INFO),
+            styled_button("🪪 اطلاعات", b"menu_whois", style=STYLE_INFO),
         ],
+        [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
+    ]
+
+def get_panel_account_text(user_id, user):
+    username = user.get("username")
+    header = f" @{username}" if username else ""
+    return f"👤 **حساب کاربری**{header}"
+
+def get_panel_account_keyboard(user_id, user):
+    """
+    صفحه‌ی نمایشیِ حساب کاربری در `.پنل`: هر ردیف یک جفت دکمه (برچسب + مقدار) است،
+    هر دو آبی و غیرفعال (callback=void) — طبق درخواست «فقط نمایشی، با کلیک هیچ
+    اتفاقی نیفتد».
+    """
+    username = user.get("username")
+    username_display = username if username else "ثبت نشده"
+    diamonds = format_diamonds(user.get("diamonds", 0))
+    toman = format_toman(user.get("diamonds", 0))
+    expiry = format_expiry(user.get("diamonds", 0))
+
+    def info_row(label, value):
+        return [
+            styled_button(label, b"void", style=STYLE_INFO),
+            styled_button(str(value), b"void", style=STYLE_INFO),
+        ]
+
+    return [
+        info_row("👤 نام کاربری:", username_display),
+        info_row("🆔 آیدی عددی:", user_id),
+        info_row("👥 تعداد رفرال:", user.get("referral_count", 0)),
+        info_row("💎 موجودی الماس:", diamonds),
+        info_row("💰 معادل تومانی:", f"{toman} تومان"),
+        info_row("💱 نرخ فعلی:", f"{DIAMOND_RATE_PER_HOUR} الماس در ساعت"),
+        info_row("⏳ انقضای تخمینی:", expiry),
+        [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
 
 def get_ping_menu_text():
@@ -1786,7 +1896,7 @@ def get_ping_menu_text():
     )
 
 def get_ping_menu_keyboard():
-    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 def get_whois_menu_text():
     return (
@@ -1796,7 +1906,7 @@ def get_whois_menu_text():
     )
 
 def get_whois_menu_keyboard():
-    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 # ======================== منوی ریکت ========================
 def get_reaction_menu_text(user_id, user):
@@ -1814,7 +1924,7 @@ def get_reaction_menu_keyboard(user):
     return [
         [toggle_button("ریکت", user.get("reaction_enabled", False), b"reaction_toggle")],
         [styled_button("لیست ریکت", b"reaction_list", style=STYLE_INFO)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
 def get_reaction_list_text(user_id):
@@ -1852,7 +1962,7 @@ def get_autoreply_menu_keyboard(user):
         [styled_button("حذف پاسخ خودکار", b"autoreply_remove", style=STYLE_OFF)],
         [styled_button("لیست پاسخ‌های خودکار", b"autoreply_list", style=STYLE_INFO)],
         [styled_button(f"نوع تطبیق: {match_label}", b"autoreply_matchtype", style=STYLE_INFO)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
 def get_autoreply_matchtype_text():
@@ -1905,7 +2015,7 @@ def get_time_menu_keyboard(user):
         [toggle_button("ساعت نام", user["name_time"], b"toggle_name_time")],
         [toggle_button("ساعت بیو", user["bio_time"], b"toggle_bio_time")],
         [styled_button("فونت ساعت", b"menu_fonts", style=STYLE_INFO)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
 def get_time_menu_text(user):
@@ -1961,7 +2071,7 @@ def get_actions_menu_keyboard(current_action):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)])
+    buttons.append([styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)])
     return buttons
 
 def get_date_menu_keyboard(user):
@@ -1977,7 +2087,7 @@ def get_date_menu_keyboard(user):
         [toggle_button("تاریخ بیو", user.get("date_enabled"), b"toggle_date_enabled")],
         type_row,
         [styled_button("فونت تاریخ", b"menu_date_fonts", style=STYLE_INFO)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
 def get_date_menu_text(user):
@@ -2031,7 +2141,7 @@ def get_textmode_menu_keyboard(current_mode):
     if row:
         buttons.append(row)
 
-    buttons.append([styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)])
+    buttons.append([styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)])
     return buttons
 
 def get_tag_menu_text():
@@ -2047,7 +2157,7 @@ def get_tag_menu_text():
     )
 
 def get_tag_menu_keyboard():
-    return [[styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]]
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 def get_secretary_menu_text(user):
     status = status_icon(user.get("secretary_enabled"))
@@ -2075,7 +2185,7 @@ def get_meow_menu_keyboard(user):
         [toggle_button("🪙 میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_settings")],
         [toggle_button("🐈 نجات پیشی", user.get("streetcat_enabled", False), b"streetcat_settings")],
         [toggle_button("❄️ یخچال میویی", user.get("fridge_enabled", False), b"fridge_settings")],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
 def get_meow_settings_text(user):
@@ -2241,44 +2351,95 @@ def get_secretary_menu_keyboard(user):
         [toggle_button("منشی", on, b"secretary_toggle")],
         [styled_button("📝 تنظیم متن", b"secretary_set_text", style=STYLE_INFO)],
         [styled_button(f"⏱️ تنظیم تایم ({delay} ثانیه)", b"secretary_set_time", style=STYLE_INFO)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
-def get_account_text(user_id, user):
-    username = user.get("username")
-    username_display = f"@{username}" if username else "ثبت نشده"
+def get_start_account_text(user_id, user):
     diamonds = format_diamonds(user.get("diamonds", 0))
     toman = format_toman(user.get("diamonds", 0))
-    expiry = format_expiry(user.get("diamonds", 0))
-
     return (
         "👤 **حساب کاربری**\n\n"
-        f"💡 نام کاربری: {username_display}\n"
-        f"🆔 آیدی عددی: `{user_id}`\n"
-        f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
-        f"💎 موجودی الماس: {diamonds}\n"
-        f"💰 معادل تومانی: {toman} تومان\n"
-        f"⏳ انقضای تخمینی: {expiry}\n\n"
-        "--------------------"
+        f"🆔 آیدی عددی : {user_id}\n"
+        f"👥 تعداد رفرال : {user.get('referral_count', 0)}\n"
+        f"💎 موجودی الماس : {diamonds}\n"
+        f"💸 معادل تومانی : {toman} تومان"
     )
 
-def get_account_keyboard():
+def get_start_account_keyboard():
     return [
         [
             styled_button("💎 خرید الماس", b"account_buy_diamond", style=STYLE_ON),
             styled_button("💸 انتقال الماس", b"account_transfer_start", style=STYLE_ON),
         ],
-        [styled_button("🎁 کد هدیه", b"account_giftcode_start", style=STYLE_ON)],
-        [styled_button("🔄 بازیابی نشست", b"account_recover_session", style=STYLE_INFO)],
-        [styled_button("🗑 حذف حساب کاربری", b"account_delete_confirm", style=STYLE_OFF)],
-        [styled_button("➜ بازگشت", b"back_to_main", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]
     ]
 
 def get_account_delete_warning_keyboard():
     return [
-        [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"start_manage_self", style=STYLE_OFF)],
         [styled_button("✅ تایید و حذف حساب کاربری", b"account_delete_final", style=STYLE_OFF)]
     ]
+
+def get_start_root_text():
+    return "🔘 **پنـل اصـلی مدیریـت نـوا سـلف**"
+
+def get_start_root_keyboard(user):
+    rows = []
+    if not user.get("session"):
+        rows.append([
+            styled_button("✦ نصب نوا سلف", b"start_gen_fast", style=STYLE_ON),
+            styled_button("💠 مدیریت سلف", b"start_manage_self", style=STYLE_ON),
+        ])
+    else:
+        rows.append([styled_button("💠 مدیریت سلف", b"start_manage_self", style=STYLE_ON)])
+
+    rows.append([
+        styled_button("👤 حساب کاربری", b"start_account", style=STYLE_INFO),
+        styled_button("🎁 کد هدیه", b"account_giftcode_start", style=STYLE_INFO),
+    ])
+    rows.append([styled_button("💳 خرید الماس", b"account_buy_diamond", style=STYLE_ON)])
+    rows.append([
+        Button.url("💻 پشتیبانی", "https://t.me/SaYPouYa"),
+        Button.url("📢 کانال نوا سلف", "https://t.me/NovaCodeR"),
+    ])
+    rows.append([styled_button("💡 سلف چیه؟", b"start_about", style=STYLE_OFF)])
+    return rows
+
+def get_start_manage_self_text(user):
+    connected = "متصل شده!" if user.get("session") else "متصل نشده!"
+    return (
+        "🔘 **پنـل اصـلی مدیریـت نـوا سـلف**\n\n"
+        "وضعیت اتصال به حساب:\n\n"
+        f"{connected}"
+    )
+
+def get_start_manage_self_keyboard(user):
+    expiry_text = format_expiry(user.get("diamonds", 0))
+    return [
+        [toggle_button(f"وضعیت سلف  |  ⏳ {expiry_text}", user["status"], b"toggle_status")],
+        [
+            styled_button("🌀 بازیابی نشست", b"account_recover_session", style=STYLE_INFO),
+            styled_button("حذف سلف", b"account_delete_confirm", style=STYLE_OFF),
+        ],
+        [styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]
+    ]
+
+def get_start_about_text():
+    return (
+        "💡 **سلف چیست؟**\n\n"
+        "سلف یک ربات است که قابلیت‌های زیادی به اکانت شما اضافه می‌کند.\n\n"
+        "• آنلاین بودن ۱۰۰ درصدی اکانت به‌صورت ۲۴ ساعته\n\n"
+        "• نمایش ساعت و تاریخ به‌صورت لحظه‌ای در کنار نام و بیو\n\n"
+        "• حالت‌های متنی متنوع\n\n"
+        "• اکشن‌های چت\n\n"
+        "• فارمر ربات‌های ترند تلگرام\n\n"
+        "• منشی و پاسخ خودکار حتی در زمان آفلاین بودن\n\n"
+        "• ریکت خودکار و نمایش اطلاعات\n\n"
+        "• و ده‌ها قابلیت جذاب دیگر..."
+    )
+
+def get_start_about_keyboard():
+    return [[styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]]
 
 def get_transfer_cancel_keyboard():
     return [[styled_button("➜ بازگشت", b"transfer_cancel", style=STYLE_OFF)]]
@@ -2322,7 +2483,7 @@ def get_buy_amount_keyboard(buffer_str):
             Button.inline("0", b"buy_k_0"),
             styled_button("✅ تأیید", b"buy_k_submit", style=STYLE_ON),
         ],
-        [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]
+        [styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]
     ]
 
 def get_buy_confirm_text(amount):
@@ -4185,10 +4346,10 @@ async def inline_panel_handler(event):
         return
 
     builder = event.builder
-    keyboard = wrap_panel_buttons(get_main_menu_keyboard(user), owner_id)
+    keyboard = wrap_panel_buttons(get_panel_root_keyboard(user), owner_id)
     result = builder.article(
         "🔗 پنل NovaSelf",
-        text="🔘 **پنـل مدیریـت نـوا سـلف**\nاز طریق منوی زیر سلف خود را مدیریت کنید:",
+        text=PANEL_TEXT,
         buttons=keyboard,
     )
     await event.answer([result], cache_time=0)
@@ -4206,20 +4367,10 @@ async def start_handler(event):
 
     user = user_data[user_id]
 
-    if user["session"] is None:
-        buttons = [
-            [styled_button("✦ نصب نوا سلف", b"start_gen_fast", style=STYLE_ON)]
-        ]
-        await event.respond(
-            "• به ربات مدیریت اکانت نوا سلف خوش آمدید!",
-            buttons=buttons
-        )
-    else:
-        await event.respond(
-            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
-            "از طریق منوی زیر سلف خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user)
-        )
+    await event.respond(
+        get_start_root_text(),
+        buttons=get_start_root_keyboard(user)
+    )
 
 @bot.on(events.NewMessage(pattern='/admin'))
 async def admin_handler(event):
@@ -4888,7 +5039,7 @@ async def callback_handler(event):
             "⚠️ اطلاعات حساب حذف نمی‌شود اما نیاز به ورود دوباره دارید.",
             buttons=[
                 [styled_button("🟢 تایید", b"account_recover_session_confirmed", style=STYLE_ON)],
-                [styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]
+                [styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]
             ]
         )
         return
@@ -4950,11 +5101,40 @@ async def callback_handler(event):
     user = user_data[user_id]
 
     if data == b"back_to_main":
-        await safe_edit(event,
-            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
-            "از طریق منوی زیر سلف خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user)
-        )
+        # نگه‌داشته شده برای سازگاری با هر پیام قدیمیِ باز، اما دیگر از هیچ دکمه‌ی
+        # جدیدی صدا زده نمی‌شود؛ به ریشه‌ی مناسب بسته به بستر (پنل خصوصی/عمومی) می‌رود.
+        if panel_owner_id is not None:
+            await safe_edit(event, PANEL_TEXT, buttons=get_panel_root_keyboard(user))
+        else:
+            await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
+        return
+
+    if data == b"panel_root":
+        await safe_edit(event, PANEL_TEXT, buttons=get_panel_root_keyboard(user))
+        return
+
+    if data == b"settings_root":
+        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard())
+        return
+
+    if data == b"panel_account":
+        await safe_edit(event, get_panel_account_text(user_id, user), buttons=get_panel_account_keyboard(user_id, user))
+        return
+
+    if data == b"start_root":
+        await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
+        return
+
+    if data == b"start_manage_self":
+        await safe_edit(event, get_start_manage_self_text(user), buttons=get_start_manage_self_keyboard(user))
+        return
+
+    if data == b"start_account":
+        await safe_edit(event, get_start_account_text(user_id, user), buttons=get_start_account_keyboard())
+        return
+
+    if data == b"start_about":
+        await safe_edit(event, get_start_about_text(), buttons=get_start_about_keyboard())
         return
 
     if data == b"menu_time":
@@ -5099,11 +5279,13 @@ async def callback_handler(event):
         save_user(user_id, user)
         log_self_toggle(user_id, user["status"])
 
-        await safe_edit(event,
-            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
-            "از طریق منوی زیر سلف خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user)
-        )
+        # دکمه‌ی «وضعیت سلف» هم در ریشه‌ی `.پنل` و هم در «مدیریت سلف» (/start) وجود
+        # دارد؛ بسته به بستری که از آن کلیک شده (پنل خصوصی یا چت عادی بات)، همان
+        # صفحه دوباره با وضعیت تازه رندر می‌شود.
+        if panel_owner_id is not None:
+            await safe_edit(event, PANEL_TEXT, buttons=get_panel_root_keyboard(user))
+        else:
+            await safe_edit(event, get_start_manage_self_text(user), buttons=get_start_manage_self_keyboard(user))
         return
 
     if data == b"toggle_name_time":
@@ -5126,10 +5308,6 @@ async def callback_handler(event):
             get_time_menu_text(user),
             buttons=get_time_menu_keyboard(user)
         )
-        return
-
-    if data == b"menu_account":
-        await safe_edit(event, get_account_text(user_id, user), buttons=get_account_keyboard())
         return
 
     # ====================================================================
@@ -5189,7 +5367,7 @@ async def callback_handler(event):
         if not pending or "amount" not in pending:
             user["step"] = "managed"
             await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
-                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+                             buttons=[[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]])
             return
         user["step"] = "buy_payment"
         await safe_edit(event, get_buy_payment_text(pending["amount"]), buttons=get_buy_payment_keyboard())
@@ -5210,7 +5388,7 @@ async def callback_handler(event):
         if not pending or "amount" not in pending:
             user["step"] = "managed"
             await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
-                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+                             buttons=[[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]])
             return
         pending["payment_method"] = "card_to_card"
         pending["invoice_created_at"] = tehran_now()
@@ -5233,7 +5411,7 @@ async def callback_handler(event):
         if not pending or "amount" not in pending:
             user["step"] = "managed"
             await safe_edit(event, "❌ عملیات منقضی شده. دوباره از منوی «خرید الماس» اقدام کنید.",
-                             buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]])
+                             buttons=[[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]])
             return
 
         # اگر سفارش قبلاً ساخته شده (مثلاً کاربر چندبار روی تأیید زده)، دوباره ساخته نمی‌شود
@@ -5298,14 +5476,14 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎁 **کد هدیه**\n\n"
             "لطفاً کد هدیه‌ی خود را ارسال کنید:",
-            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
+            buttons=[[styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]]
         )
         return
 
     if data == b"transfer_cancel":
         transfer_data.pop(user_id, None)
         user["step"] = "managed"
-        await safe_edit(event, get_account_text(user_id, user), buttons=get_account_keyboard())
+        await safe_edit(event, get_start_account_text(user_id, user), buttons=get_start_account_keyboard())
         return
 
     if data == b"transfer_confirm_execute":
@@ -5340,7 +5518,7 @@ async def callback_handler(event):
             # --- رسید فرستنده (روی همین پیام) ---
             await safe_edit(event,
                 build_sender_receipt(receiver_label, amount_str, format_diamonds(sender_balance), when),
-                buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
+                buttons=[[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]]
             )
 
             # --- رسید گیرنده (پیام جداگانه به خودش، اگر قبلاً با ربات استارت زده باشد) ---
@@ -5354,7 +5532,7 @@ async def callback_handler(event):
         else:
             await safe_edit(event,
                 f"{message}",
-                buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
+                buttons=[[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]]
             )
             transfer_data.pop(user_id, None)
             user["step"] = "managed"
@@ -5862,9 +6040,8 @@ async def process_code_signin(event, user_id, code):
             del active_signins[user_id]
 
         await event.respond(
-            "🔘 **پنـل مدیریـت نـوا سـلف**\n"
-            "از طریق منوی زیر سلف خود را مدیریت کنید:",
-            buttons=get_main_menu_keyboard(user_data[user_id])
+            get_start_root_text(),
+            buttons=get_start_root_keyboard(user_data[user_id])
         )
 
     except SessionPasswordNeededError:
@@ -6060,7 +6237,7 @@ async def message_handler(event):
             f"🧾 کد سفارش: `{order_id}`\n"
             "📌 وضعیت: در انتظار بررسی ادمین\n\n"
             "نتیجه‌ی بررسی به‌محض تأیید یا رد توسط ادمین برای شما ارسال می‌شود.",
-            buttons=[[styled_button("➜ بازگشت به منو", b"menu_account", style=STYLE_OFF)]]
+            buttons=[[styled_button("➜ بازگشت به منو", b"start_account", style=STYLE_OFF)]]
         )
 
         # ارسال سفارش کامل + عکس رسید برای همه‌ی ادمین‌ها
@@ -6347,7 +6524,15 @@ async def message_handler(event):
         generator = generator_data[user_id]
 
         if generator["step"] == "get_phone":
-            generator["phone"] = text
+            normalized_phone, phone_error = normalize_phone_number(text)
+            if phone_error:
+                await event.respond(
+                    f"{phone_error}\n\n"
+                    "نمونه‌های قابل قبول: `0912xxxxxxx`، `912xxxxxxx`، `+98912xxxxxxx`"
+                )
+                return  # در همان مرحله می‌ماند تا کاربر دوباره امتحان کند (بدون کرش)
+
+            generator["phone"] = normalized_phone
 
             await event.respond("⏳ در حال اتصال به سرورهای تلگرام...")
 
@@ -6410,9 +6595,8 @@ async def message_handler(event):
                     del active_signins[user_id]
 
                 await event.respond(
-                    "🔘 **پنـل مدیریـت نـوا سـلف**\n"
-                    "از طریق منوی زیر سلف خود را مدیریت کنید:",
-                    buttons=get_main_menu_keyboard(user_data[user_id])
+                    get_start_root_text(),
+                    buttons=get_start_root_keyboard(user_data[user_id])
                 )
             except Exception as e:
                 await event.respond(
@@ -6471,7 +6655,7 @@ async def message_handler(event):
 
         await event.respond(
             message,
-            buttons=[[styled_button("➜ بازگشت", b"menu_account", style=STYLE_OFF)]]
+            buttons=[[styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]]
         )
         return
 
