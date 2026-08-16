@@ -5,6 +5,8 @@ import os
 import secrets
 import string
 import pickle
+import json
+import base64
 import io
 import pytz
 import psycopg2
@@ -22,6 +24,7 @@ from telethon.errors import (
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
 from telethon.tl.functions.users import GetFullUserRequest
+from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
@@ -198,6 +201,10 @@ click_debouncer = ClickDebouncer(window_seconds=1.2)  # جلوگیری از پر
 reaction_targets = {}   # {owner_id: {target_user_id: {"emoji":..., "username":...}}} کش ریکت (بند ۳-۴)
 autoreply_cache = {}    # {owner_id: [{"local_id":..., "trigger_text":..., "response_text":..., "entities":..., "media_kind":..., "media_bytes":..., "media_filename":..., "media_mime":...}, ...]} کش پاسخ خودکار (بند ۵-۹)
 autoreply_draft = {}    # {owner_id: {"trigger_text":...}} وضعیت موقت افزودن پاسخ خودکار (دو مرحله‌ای)
+feature_locks = {}      # {user_id: {feature_key, ...}} کش قفل قابلیت‌ها توسط ادمین
+backup_upload_pending = {}  # {admin_id: dump_dict} بکاپ آپلودشده‌ای که هنوز تأیید نشده
+join_channels_cache = []  # لیست کانال‌های فعالِ جوین اجباری (کش)
+verified_users = set()    # {user_id, ...} کاربرانی که عضویتشان قبلاً تأیید شده
 _background_tasks = set()  # نگه‌داشتن رفرنس Taskهای پس‌زمینه‌ی کوتاه‌مدت تا با GC زودهنگام لغو نشوند
 
 def _spawn_background_task(coro):
@@ -480,6 +487,51 @@ def init_db():
                 response_media_mime TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (owner_id, local_id)
+            )
+        ''')
+        conn.commit()
+
+        # ---------- قفل کردن قابلیت‌ها توسط ادمین ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_feature_locks (
+                user_id BIGINT NOT NULL,
+                feature_key TEXT NOT NULL,
+                locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, feature_key)
+            )
+        ''')
+        conn.commit()
+
+        # ---------- جوین اجباری ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_join_channels (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                identifier TEXT NOT NULL,
+                invite_link TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_join_verified (
+                user_id BIGINT PRIMARY KEY,
+                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
+        # ---------- سیستم بکاپ ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_backups (
+                id SERIAL PRIMARY KEY,
+                created_by BIGINT,
+                label TEXT,
+                size_bytes INTEGER,
+                data BYTEA,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
@@ -1588,6 +1640,642 @@ def load_autoreplies_cache():
     autoreply_cache = fresh
     logging.info(f"🤖 کش پاسخ خودکار بارگذاری شد: {sum(len(v) for v in fresh.values())} پاسخ در {len(fresh)} حساب.")
 
+# ======================== قفل کردن قابلیت‌ها توسط ادمین ========================
+FEATURE_LOCK_DEFS = [
+    ("time", "⌚ ساعت"),
+    ("date", "📅 تاریخ"),
+    ("actions", "🎭 اکشن"),
+    ("textmode", "🖊️ حالت متن"),
+    ("secretary", "🧑‍💼 منشی پیوی"),
+    ("tag", "🏷️ تگ"),
+    ("meow", "🐱 میو"),
+    ("fish", "🐟 ماهی"),
+    ("meowpoint", "🪙 میو پوینت"),
+    ("streetcat", "🐈 نجات پیشی"),
+    ("fridge", "❄️ یخچال میویی"),
+    ("ping", "🏓 پینگ"),
+    ("whois", "🪪 اطلاعات"),
+    ("reaction", "👍 ریکت"),
+    ("autoreply", "🤖 پاسخ خودکار"),
+]
+FEATURE_LOCK_LABELS = dict(FEATURE_LOCK_DEFS)
+
+def get_all_feature_locks_db():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, feature_key FROM novaself_feature_locks")
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در بارگذاری اولیه‌ی قفل قابلیت‌ها: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def load_feature_locks_cache():
+    """بارگذاری کش قفل‌ها در استارتاپ (تا Restart تنظیمات قفل را از بین نبرد)."""
+    global feature_locks
+    fresh = {}
+    for owner_id, feature_key in get_all_feature_locks_db():
+        fresh.setdefault(owner_id, set()).add(feature_key)
+    feature_locks = fresh
+    logging.info(f"🔒 کش قفل قابلیت‌ها بارگذاری شد: {sum(len(v) for v in fresh.values())} قفل روی {len(fresh)} کاربر.")
+
+def lock_feature_db(user_id, feature_key):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO novaself_feature_locks (user_id, feature_key)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id, feature_key) DO NOTHING
+        ''', (user_id, feature_key))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"❌ خطا در قفل کردن قابلیت {feature_key} برای {user_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def unlock_feature_db(user_id, feature_key):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM novaself_feature_locks WHERE user_id = %s AND feature_key = %s",
+            (user_id, feature_key)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"❌ خطا در باز کردن قفل {feature_key} برای {user_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def is_feature_locked(user_id, feature_key):
+    return feature_key in feature_locks.get(user_id, set())
+
+# ======================== جوین اجباری ========================
+def create_join_channel_db(title, identifier, invite_link):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_join_channels (title, identifier, invite_link) VALUES (%s, %s, %s) RETURNING id",
+            (title, identifier, invite_link)
+        )
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        return new_id
+    except Exception as e:
+        logging.error(f"❌ خطا در افزودن کانال جوین اجباری: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def list_join_channels_db(active_only=False):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        if active_only:
+            cursor.execute("SELECT * FROM novaself_join_channels WHERE is_active = TRUE ORDER BY id")
+        else:
+            cursor.execute("SELECT * FROM novaself_join_channels ORDER BY id")
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن لیست کانال‌های جوین اجباری: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_join_channel_db(channel_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute("SELECT * FROM novaself_join_channels WHERE id = %s", (channel_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن کانال جوین اجباری {channel_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def update_join_channel_link_db(channel_id, new_link):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_join_channels SET invite_link = %s WHERE id = %s", (new_link, channel_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر لینک کانال {channel_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def set_join_channel_active_db(channel_id, active):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE novaself_join_channels SET is_active = %s WHERE id = %s", (active, channel_id))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در تغییر وضعیت کانال {channel_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def delete_join_channel_db(channel_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM novaself_join_channels WHERE id = %s", (channel_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف کانال {channel_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def mark_user_verified_db(user_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_join_verified (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,)
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"❌ خطا در ثبت تأیید عضویت کاربر {user_id}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+def get_all_verified_users_db():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM novaself_join_verified")
+        return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        logging.error(f"❌ خطا در بارگذاری کاربران تأییدشده: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_verified_count_db():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM novaself_join_verified")
+        return cursor.fetchone()[0]
+    except Exception as e:
+        logging.error(f"❌ خطا در شمارش کاربران تأییدشده: {e}")
+        return 0
+    finally:
+        if conn:
+            conn.close()
+
+# ======================== سیستم بکاپ ========================
+# لیست تمام جداول قابل بکاپ به‌همراه (کلید اصلی، ستون‌های محافظت‌شده که هنگام
+# بازیابی هرگز رونویسی نمی‌شوند). محافظت از session کاربران طبق تأکید صریح
+# درخواست («بازیابی بکاپ نباید باعث حذف Session کاربران شود») است.
+BACKUP_TABLE_PKS = {
+    "novaself_users": (["user_id"], ["session"]),
+    "novaself_gift_codes": (["code"], []),
+    "novaself_gift_code_uses": (["code", "user_id"], []),
+    "novaself_orders": (["order_id"], []),
+    "novaself_broadcasts": (["broadcast_id"], []),
+    "novaself_broadcast_deliveries": (["id"], []),
+    "novaself_reactions": (["owner_id", "target_user_id"], []),
+    "novaself_autoreplies": (["id"], []),
+    "novaself_feature_locks": (["user_id", "feature_key"], []),
+    "novaself_join_channels": (["id"], []),
+    "novaself_join_verified": (["user_id"], []),
+    "novaself_admin_logs": (["id"], []),
+}
+
+def _backup_row_to_jsonable(row_dict):
+    """تبدیل یک ردیف دیتابیس (شامل bytes/datetime) به دیکشنری قابل JSON."""
+    out = {}
+    for k, v in row_dict.items():
+        if isinstance(v, (bytes, memoryview)):
+            out[k] = {"__bytes__": base64.b64encode(bytes(v)).decode("ascii")}
+        elif isinstance(v, datetime):
+            out[k] = {"__datetime__": v.isoformat()}
+        else:
+            out[k] = v
+    return out
+
+def _backup_jsonable_to_row(row_dict):
+    """معکوس _backup_row_to_jsonable برای بازیابی."""
+    out = {}
+    for k, v in row_dict.items():
+        if isinstance(v, dict) and "__bytes__" in v:
+            out[k] = base64.b64decode(v["__bytes__"])
+        elif isinstance(v, dict) and "__datetime__" in v:
+            out[k] = datetime.fromisoformat(v["__datetime__"])
+        else:
+            out[k] = v
+    return out
+
+def build_backup_payload():
+    """
+    دامپ کامل تمام جداول پروژه به یک دیکشنری JSON-پذیر.
+    خروجی: (payload_dict, error یا None)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        dump = {
+            "meta": {
+                "created_at": tehran_now().isoformat(),
+                "version": 1,
+                "tables": list(BACKUP_TABLE_PKS.keys()),
+            }
+        }
+        for table in BACKUP_TABLE_PKS:
+            try:
+                cursor.execute(f"SELECT * FROM {table}")
+                rows = cursor.fetchall()
+                dump[table] = [_backup_row_to_jsonable(dict(r)) for r in rows]
+            except Exception as e:
+                logging.error(f"⚠️ خطا در دامپ جدول {table}: {e}")
+                dump[table] = []
+        return dump, None
+    except Exception as e:
+        logging.error(f"❌ خطا در ساخت بکاپ: {e}")
+        return None, str(e)
+    finally:
+        if conn:
+            conn.close()
+
+def create_backup_db(admin_id, label=None):
+    """
+    یک بکاپ کامل می‌سازد و مستقیماً داخل خودِ دیتابیس (جدول novaself_backups)
+    ذخیره می‌کند — این‌طوری بکاپ‌ها مستقل از فایل‌سیستم موقتِ Railway باقی می‌مانند.
+    خروجی: (backup_id, size_bytes) یا (None, 0) در صورت خطا.
+    """
+    dump, error = build_backup_payload()
+    if dump is None:
+        return None, 0
+
+    payload_bytes = json.dumps(dump, ensure_ascii=False).encode("utf-8")
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO novaself_backups (created_by, label, size_bytes, data) VALUES (%s, %s, %s, %s) RETURNING id",
+            (admin_id, label, len(payload_bytes), psycopg2.Binary(payload_bytes))
+        )
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        return new_id, len(payload_bytes)
+    except Exception as e:
+        logging.error(f"❌ خطا در ذخیره بکاپ: {e}")
+        if conn:
+            conn.rollback()
+        return None, 0
+    finally:
+        if conn:
+            conn.close()
+
+def list_backups_db():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(
+            "SELECT id, created_by, label, size_bytes, created_at FROM novaself_backups ORDER BY created_at DESC"
+        )
+        return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"❌ خطا در دریافت لیست بکاپ‌ها: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_backup_data_db(backup_id):
+    """محتوای کامل یک بکاپ (بایت خام JSON) را برمی‌گرداند، یا None."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM novaself_backups WHERE id = %s", (backup_id,))
+        row = cursor.fetchone()
+        return bytes(row[0]) if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن بکاپ {backup_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def delete_backup_db(backup_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM novaself_backups WHERE id = %s", (backup_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف بکاپ {backup_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def restore_backup_payload(dump):
+    """
+    بازیابیِ یک دامپِ JSON روی دیتابیس فعلی. برای هر جدول از INSERT ... ON CONFLICT
+    DO UPDATE استفاده می‌شود (نه TRUNCATE/DELETE) — یعنی هیچ رکورد کاربر یا دیتای
+    دیگری هرگز حذف نمی‌شود، فقط رونویسی/افزوده می‌شود. ستون‌های محافظت‌شده (مثل
+    session کاربران) هرگز در SET قرار نمی‌گیرند، پس مقدار زنده‌ی فعلی‌شان دست‌نخورده
+    باقی می‌ماند؛ برای کاربرِ کاملاً جدید (که در DB فعلی وجود ندارد) session از
+    خودِ بکاپ درج می‌شود چون در آن حالت چیزی برای «شکستن» وجود ندارد.
+    خروجی: (success: bool, summary: dict جدول->تعداد ردیف بازیابی‌شده, error یا None)
+    """
+    conn = None
+    summary = {}
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        for table, (pk_cols, protect_cols) in BACKUP_TABLE_PKS.items():
+            rows = dump.get(table) or []
+            restored = 0
+            for raw_row in rows:
+                row = _backup_jsonable_to_row(raw_row)
+                cols = list(row.keys())
+                if not cols or not all(pk in cols for pk in pk_cols):
+                    continue
+
+                placeholders = ", ".join(["%s"] * len(cols))
+                col_list = ", ".join(cols)
+                update_cols = [c for c in cols if c not in pk_cols and c not in protect_cols]
+
+                if update_cols:
+                    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+                    conflict_clause = f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {set_clause}"
+                else:
+                    conflict_clause = f"ON CONFLICT ({', '.join(pk_cols)}) DO NOTHING"
+
+                sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_clause}"
+                try:
+                    cursor.execute(sql, [row[c] for c in cols])
+                    restored += 1
+                except Exception as e:
+                    logging.error(f"⚠️ خطا در بازیابی یک ردیف از {table}: {e}")
+
+            summary[table] = restored
+
+        conn.commit()
+        return True, summary, None
+    except Exception as e:
+        logging.error(f"❌ خطا در بازیابی بکاپ: {e}")
+        if conn:
+            conn.rollback()
+        return False, summary, str(e)
+    finally:
+        if conn:
+            conn.close()
+
+def reload_join_channels_cache():
+    """کش کانال‌های فعال را از دیتابیس تازه می‌کند (بعد از هر افزودن/حذف/ویرایش ادمین)."""
+    global join_channels_cache
+    join_channels_cache = list(list_join_channels_db(active_only=True))
+
+def load_join_gate_cache():
+    """بارگذاری اولیه‌ی کش‌های جوین اجباری در استارتاپ."""
+    global verified_users
+    reload_join_channels_cache()
+    verified_users = set(get_all_verified_users_db())
+    logging.info(f"🔐 جوین اجباری: {len(join_channels_cache)} کانال فعال، {len(verified_users)} کاربر تأییدشده.")
+
+async def check_user_joined_all(user_id):
+    """
+    بررسی عضویت کاربر در تمام کانال‌های فعالِ جوین اجباری با کلاینت بات.
+    اگر بات خودش عضو یکی از کانال‌ها نباشد یا شناسه نامعتبر باشد، آن کانال را
+    به‌عنوان مانع در نظر نمی‌گیرد (Fail-open) تا یک تنظیم اشتباه کل ربات را قفل نکند.
+    خروجی: (all_joined: bool, missing_channels: list[dict])
+    """
+    missing = []
+    for ch in join_channels_cache:
+        try:
+            identifier = ch["identifier"]
+            try:
+                identifier = int(identifier)
+            except (ValueError, TypeError):
+                pass
+            perms = await bot.get_permissions(identifier, user_id)
+            if not perms or not perms.is_member:
+                missing.append(ch)
+        except Exception as e:
+            log_internal_error("check_joined", f"channel_id={ch.get('id')} err={e}")
+    return (len(missing) == 0), missing
+
+# ======================== رابط کاربری جوین اجباری (سمت کاربر) ========================
+JOIN_REQUIRED_TEXT = (
+    "برای استفاده‌ی دائمی از امکانات ربات، فقط کافیه یک‌بار در کانال‌های ما عضو بشی!\n\n"
+    "✅ بعد از عضویت در کانال، روی دکمه «تایید عضویت» کلیک کن."
+)
+
+def get_join_required_keyboard(missing_channels):
+    rows = []
+    for ch in missing_channels:
+        rows.append([Button.url(f"🔔 {ch['title']}", ch["invite_link"])])
+    rows.append([styled_button("تایید عضویت ☑️", b"join_verify_check", style=STYLE_ON)])
+    return rows
+
+async def _send_join_gate(event, user_id, missing_channels):
+    await event.respond(JOIN_REQUIRED_TEXT, buttons=get_join_required_keyboard(missing_channels))
+
+# ======================== مدیریت جوین اجباری در پنل ادمین ========================
+def get_joingate_admin_text():
+    channels = list_join_channels_db()
+    verified_count = get_verified_count_db()
+    lines = [
+        "🔔 **مدیریت جوین اجباری**\n",
+        f"تعداد کانال‌ها: {len(channels)}",
+        f"کاربران تأییدشده تاکنون: {verified_count}\n",
+        "برای مدیریت هر کانال روی آن کلیک کنید:"
+    ]
+    return "\n".join(lines)
+
+def get_joingate_admin_keyboard():
+    channels = list_join_channels_db()
+    buttons = [[styled_button("➕ افزودن کانال", b"admin_joingate_add", style=STYLE_ON)]]
+    for ch in channels:
+        state = status_icon(bool(ch["is_active"]))
+        buttons.append([styled_button(
+            f"{state} {ch['title']}",
+            f"admin_joingate_manage_{ch['id']}".encode(),
+            style=STYLE_ON if ch["is_active"] else STYLE_OFF
+        )])
+    buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
+    return buttons
+
+def get_joingate_manage_text(ch):
+    state = "فعال ✓" if ch["is_active"] else "غیرفعال ✕"
+    return (
+        f"🔔 **مدیریت کانال** «{ch['title']}»\n\n"
+        f"شناسه/یوزرنیم: `{ch['identifier']}`\n"
+        f"لینک: {ch['invite_link']}\n"
+        f"وضعیت: {state}"
+    )
+
+def get_joingate_manage_keyboard(ch):
+    cid = ch["id"]
+    active = bool(ch["is_active"])
+    return [
+        [styled_button("✏️ تغییر لینک کانال", f"admin_joingate_editlink_{cid}".encode(), style=STYLE_INFO)],
+        [styled_button(
+            "✕ غیرفعال کردن" if active else "✓ فعال کردن",
+            f"admin_joingate_toggle_{cid}".encode(),
+            style=STYLE_OFF if active else STYLE_ON
+        )],
+        [styled_button("🗑 حذف کانال", f"admin_joingate_delete_{cid}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"admin_joingate", style=STYLE_OFF)]
+    ]
+
+def get_joingate_delete_confirm_keyboard(cid):
+    return [
+        [styled_button("🗑 بله، حذف شود", f"admin_joingate_delete_confirm_{cid}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", f"admin_joingate_manage_{cid}".encode(), style=STYLE_OFF)]
+    ]
+
+# ======================== رابط کاربری سیستم بکاپ (پنل ادمین) ========================
+def _format_bytes(n):
+    n = n or 0
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} KB"
+    return f"{n/(1024*1024):.1f} MB"
+
+def get_backup_menu_text():
+    backups = list_backups_db()
+    total_size = sum(b["size_bytes"] or 0 for b in backups)
+    return (
+        "💾 **سیستم بکاپ**\n\n"
+        f"تعداد بکاپ‌های موجود: {len(backups)}\n"
+        f"حجم کل: {_format_bytes(total_size)}\n\n"
+        "بکاپ‌ها مستقیماً داخل خودِ دیتابیس ذخیره می‌شوند، اما پیشنهاد می‌شود بعد از "
+        "ساخت هر بکاپ، حتماً یک نسخه هم با «دانلود» روی گوشی/کامپیوتر خودتان نگه دارید."
+    )
+
+def get_backup_menu_keyboard():
+    return [
+        [styled_button("➕ ایجاد بکاپ جدید", b"admin_backup_create", style=STYLE_ON)],
+        [styled_button("📋 مشاهده بکاپ‌ها", b"admin_backup_list", style=STYLE_INFO)],
+        [styled_button("⬆️ بارگذاری و بازیابی بکاپ", b"admin_backup_upload", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
+    ]
+
+def get_backup_list_text():
+    backups = list_backups_db()
+    if not backups:
+        return "📋 **لیست بکاپ‌ها**\n\nهنوز هیچ بکاپی ساخته نشده است."
+    return "📋 **لیست بکاپ‌ها**\n\nبرای مدیریت هر بکاپ روی آن کلیک کنید:"
+
+def get_backup_list_keyboard():
+    backups = list_backups_db()
+    buttons = []
+    for b in backups:
+        ts = b["created_at"].strftime("%Y-%m-%d %H:%M") if b["created_at"] else "؟"
+        label = f"💾 {ts} — {_format_bytes(b['size_bytes'])}"
+        buttons.append([styled_button(label, f"admin_backup_manage_{b['id']}".encode(), style=STYLE_INFO)])
+    buttons.append([styled_button("➜ بازگشت", b"admin_backup", style=STYLE_OFF)])
+    return buttons
+
+def get_backup_manage_text(b):
+    ts = b["created_at"].strftime("%Y-%m-%d %H:%M") if b["created_at"] else "؟"
+    creator = b["created_by"] or "نامشخص"
+    return (
+        f"💾 **بکاپ شماره {b['id']}**\n\n"
+        f"تاریخ ساخت: {ts}\n"
+        f"حجم: {_format_bytes(b['size_bytes'])}\n"
+        f"ساخته‌شده توسط: {creator}"
+    )
+
+def get_backup_manage_keyboard(bid):
+    return [
+        [styled_button("⬇️ دانلود", f"admin_backup_download_{bid}".encode(), style=STYLE_INFO)],
+        [styled_button("♻️ بازیابی این بکاپ", f"admin_backup_restore_{bid}".encode(), style=STYLE_ON)],
+        [styled_button("🗑 حذف بکاپ", f"admin_backup_delete_{bid}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"admin_backup_list", style=STYLE_OFF)]
+    ]
+
+def get_backup_delete_confirm_keyboard(bid):
+    return [
+        [styled_button("🗑 بله، حذف شود", f"admin_backup_delete_confirm_{bid}".encode(), style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", f"admin_backup_manage_{bid}".encode(), style=STYLE_OFF)]
+    ]
+
+def get_backup_restore_confirm_text(source_label):
+    return (
+        f"⚠️ **بازیابی بکاپ «{source_label}»**\n\n"
+        "قبل از بازیابی، یک بکاپ خودکار از وضعیت فعلی دیتابیس گرفته می‌شود تا در "
+        "صورت بروز مشکل قابل برگشت باشد.\n\n"
+        "Session کاربران دست‌نخورده باقی می‌ماند و هیچ رکوردی حذف نمی‌شود (فقط "
+        "بروزرسانی/افزوده می‌شود).\n\n"
+        "آیا مطمئن هستید؟"
+    )
+
+def get_backup_restore_confirm_keyboard(token):
+    return [
+        [styled_button("♻️ بله، بازیابی شود", f"admin_backup_restore_confirm_{token}".encode(), style=STYLE_ON)],
+        [styled_button("➜ بازگشت", b"admin_backup_list", style=STYLE_OFF)]
+    ]
+
 def format_diamonds(value):
     value = float(value or 0)
     if value == int(value):
@@ -1829,27 +2517,32 @@ def get_panel_root_keyboard(user):
         ],
     ]
 
-def get_settings_root_keyboard():
+def get_settings_root_keyboard(user_id):
     """صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی."""
+    locks = feature_locks.get(user_id, set())
+
+    def lbl(key, text):
+        return f"{text} 🔒" if key in locks else text
+
     return [
         [
-            styled_button("📅 تاریخ", b"menu_date", style=STYLE_INFO),
-            styled_button("🎭 اکشن", b"menu_actions", style=STYLE_INFO),
-            styled_button("⌚ ساعت", b"menu_time", style=STYLE_INFO),
+            styled_button(lbl("date", "📅 تاریخ"), b"menu_date", style=STYLE_INFO),
+            styled_button(lbl("actions", "🎭 اکشن"), b"menu_actions", style=STYLE_INFO),
+            styled_button(lbl("time", "⌚ ساعت"), b"menu_time", style=STYLE_INFO),
         ],
         [
-            styled_button("🖊️ حالت متن", b"menu_textmode", style=STYLE_INFO),
-            styled_button("🧑‍💼 منشی پیوی", b"menu_secretary", style=STYLE_INFO),
+            styled_button(lbl("textmode", "🖊️ حالت متن"), b"menu_textmode", style=STYLE_INFO),
+            styled_button(lbl("secretary", "🧑‍💼 منشی پیوی"), b"menu_secretary", style=STYLE_INFO),
         ],
         [
-            styled_button("🏷️ تگ", b"menu_tag", style=STYLE_INFO),
-            styled_button("🐱 میو", b"menu_meow", style=STYLE_INFO),
-            styled_button("🏓 پینگ", b"menu_ping", style=STYLE_INFO),
+            styled_button(lbl("tag", "🏷️ تگ"), b"menu_tag", style=STYLE_INFO),
+            styled_button(lbl("meow", "🐱 میو"), b"menu_meow", style=STYLE_INFO),
+            styled_button(lbl("ping", "🏓 پینگ"), b"menu_ping", style=STYLE_INFO),
         ],
         [
-            styled_button("🤖 پاسخ خودکار", b"menu_autoreply", style=STYLE_INFO),
-            styled_button("👍 ریکت", b"menu_reaction", style=STYLE_INFO),
-            styled_button("🪪 اطلاعات", b"menu_whois", style=STYLE_INFO),
+            styled_button(lbl("autoreply", "🤖 پاسخ خودکار"), b"menu_autoreply", style=STYLE_INFO),
+            styled_button(lbl("reaction", "👍 ریکت"), b"menu_reaction", style=STYLE_INFO),
+            styled_button(lbl("whois", "🪪 اطلاعات"), b"menu_whois", style=STYLE_INFO),
         ],
         [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
@@ -1872,9 +2565,12 @@ def get_panel_account_keyboard(user_id, user):
     expiry = format_expiry(user.get("diamonds", 0))
 
     def info_row(label, value):
+        # ترتیب دکمه‌ها در آرایه = ترتیب نمایش چپ‌به‌راست در تلگرام (مستقل از جهت
+        # متن)؛ طبق درخواست، مقدار باید سمت چپ و عنوان سمت راست باشد یعنی مقدار
+        # اول در لیست بیاید.
         return [
-            styled_button(label, b"void", style=STYLE_INFO),
             styled_button(str(value), b"void", style=STYLE_INFO),
+            styled_button(label, b"void", style=STYLE_INFO),
         ]
 
     return [
@@ -2175,16 +2871,25 @@ def get_secretary_menu_text(user):
 def get_meow_menu_text(user):
     return "🐱 **بخش میو**\n\nیکی از قابلیت‌های زیر را برای مدیریت انتخاب کنید:"
 
-def get_meow_menu_keyboard(user):
+def get_meow_menu_keyboard(user_id, user):
     group_title = user.get("meow_chat_title")
     group_label = f"📍 گروه: {group_title[:28]}" if group_title else "📍 گروه: انتخاب نشده"
+    locks = feature_locks.get(user_id, set())
+
+    def sub_button(key, label, flag, callback):
+        text = toggle_label(label, flag)
+        if key in locks:
+            text += " 🔒"
+        style = STYLE_ON if flag else STYLE_OFF
+        return styled_button(text, callback, style=style)
+
     return [
         [styled_button(group_label, b"meow_select_group", style=STYLE_INFO if group_title else STYLE_OFF)],
         [toggle_button("🐱 میو", user.get("meow_enabled", False), b"meow_settings")],
-        [toggle_button("🐟 ماهی", user.get("fish_enabled", False), b"fish_settings")],
-        [toggle_button("🪙 میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_settings")],
-        [toggle_button("🐈 نجات پیشی", user.get("streetcat_enabled", False), b"streetcat_settings")],
-        [toggle_button("❄️ یخچال میویی", user.get("fridge_enabled", False), b"fridge_settings")],
+        [sub_button("fish", "🐟 ماهی", user.get("fish_enabled", False), b"fish_settings")],
+        [sub_button("meowpoint", "🪙 میو پوینت", user.get("meowpoint_enabled", False), b"meowpoint_settings")],
+        [sub_button("streetcat", "🐈 نجات پیشی", user.get("streetcat_enabled", False), b"streetcat_settings")],
+        [sub_button("fridge", "❄️ یخچال میویی", user.get("fridge_enabled", False), b"fridge_settings")],
         [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
 
@@ -2386,12 +3091,8 @@ def get_start_root_text():
 def get_start_root_keyboard(user):
     rows = []
     if not user.get("session"):
-        rows.append([
-            styled_button("✦ نصب نوا سلف", b"start_gen_fast", style=STYLE_ON),
-            styled_button("💠 مدیریت سلف", b"start_manage_self", style=STYLE_ON),
-        ])
-    else:
-        rows.append([styled_button("💠 مدیریت سلف", b"start_manage_self", style=STYLE_ON)])
+        rows.append([styled_button("✦ نصب نوا سلف", b"start_gen_fast", style=STYLE_ON)])
+    rows.append([styled_button("💠 مدیریت سلف", b"start_manage_self", style=STYLE_ON)])
 
     rows.append([
         styled_button("👤 حساب کاربری", b"start_account", style=STYLE_INFO),
@@ -2418,7 +3119,7 @@ def get_start_manage_self_keyboard(user):
     return [
         [toggle_button(f"وضعیت سلف  |  ⏳ {expiry_text}", user["status"], b"toggle_status")],
         [
-            styled_button("🌀 بازیابی نشست", b"account_recover_session", style=STYLE_INFO),
+            styled_button("بازیابی نشست", b"account_recover_session", style=STYLE_INFO),
             styled_button("حذف سلف", b"account_delete_confirm", style=STYLE_OFF),
         ],
         [styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]
@@ -2567,6 +3268,8 @@ def get_admin_main_menu():
         [styled_button("🔍 جستجوی کاربر", b"admin_search_user", style=STYLE_INFO)],
         [styled_button("🎁 مدیریت کدهای هدیه", b"admin_giftcodes", style=STYLE_INFO)],
         [styled_button("🧾 پیام‌های ارسالی", b"admin_messages_list", style=STYLE_INFO)],
+        [styled_button("🔔 جوین اجباری", b"admin_joingate", style=STYLE_INFO)],
+        [styled_button("💾 سیستم بکاپ", b"admin_backup", style=STYLE_INFO)],
         [styled_button("📜 لاگ‌های مدیریتی اخیر", b"admin_logs", style=STYLE_INFO)],
         [styled_button("🔄 بروزرسانی همه کاربران", b"admin_refresh_all", style=STYLE_INFO)]
     ]
@@ -2717,10 +3420,32 @@ def get_user_detail_buttons(user_id):
         ],
         [styled_button("👥 تغییر تعداد رفرال", f"admin_set_referral_{user_id}".encode(), style=STYLE_INFO)],
         [styled_button("⚙️ مدیریت قابلیت‌ها", f"admin_features_{user_id}".encode(), style=STYLE_INFO)],
+        [styled_button("🔒 قفل کردن قابلیت‌ها", f"admin_lock_features_{user_id}".encode(), style=STYLE_OFF)],
         [styled_button("❌ حذف کاربر", f"admin_delete_user_{user_id}".encode(), style=STYLE_OFF)],
         [styled_button("📨 ارسال پیام به این کاربر", f"admin_send_to_user_{user_id}".encode(), style=STYLE_INFO)],
         [styled_button("➜ بازگشت", b"admin_users_list", style=STYLE_OFF)]
     ]
+
+def get_lock_features_text(user_id):
+    locks = feature_locks.get(user_id, set())
+    return (
+        f"🔒 **قفل کردن قابلیت‌ها برای کاربر** `{user_id}`\n\n"
+        f"تعداد قابلیت‌های قفل‌شده: {len(locks)}\n\n"
+        "با زدن هر دکمه، وضعیت قفل همان قابلیت تغییر می‌کند (🔒 = قفل، ✓ = باز):"
+    )
+
+def get_lock_features_keyboard(user_id):
+    locks = feature_locks.get(user_id, set())
+    buttons = []
+    for key, label in FEATURE_LOCK_DEFS:
+        locked = key in locks
+        text = f"{label} 🔒" if locked else f"{label} ✓"
+        buttons.append([styled_button(
+            text, f"admin_togglelock_{key}_{user_id}".encode(),
+            style=STYLE_OFF if locked else STYLE_ON
+        )])
+    buttons.append([styled_button("➜ بازگشت", f"admin_view_user_{user_id}".encode(), style=STYLE_OFF)])
+    return buttons
 
 # قابلیت‌های قابل مدیریت توسط ادمین برای هر کاربر: (کلید_در_دیتابیس، برچسب نمایشی)
 ADMIN_MANAGEABLE_FEATURES = [
@@ -3144,17 +3869,27 @@ def make_outgoing_handler(user_id):
 
             # --- پینگ (در هر نوع چتی) ---
             if text_stripped and text_stripped.lower() in PING_TRIGGERS:
+                if is_feature_locked(user_id, "ping"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
                 await handle_ping_command(event, user_id)
                 return
 
             # --- اطلاعات/آیدی (در هر نوع چتی، فقط با Reply) ---
             if text_stripped and text_stripped.lower() in WHOIS_TRIGGERS:
+                if is_feature_locked(user_id, "whois"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
                 await handle_whois_command(event, user_id)
                 return
 
             # --- تنظیم/حذف ریکت (در هر نوع چتی، فقط با Reply) ---
             if text_stripped:
                 lowered_cmd = text_stripped.lower()
+                is_reaction_cmd = lowered_cmd.startswith(REACTION_SET_PREFIXES) or lowered_cmd in REACTION_REMOVE_TRIGGERS
+                if is_reaction_cmd and is_feature_locked(user_id, "reaction"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
                 if lowered_cmd.startswith(REACTION_SET_PREFIXES):
                     await handle_set_reaction_command(event, user_id)
                     return
@@ -3165,6 +3900,10 @@ def make_outgoing_handler(user_id):
             # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
             if text_stripped and not event.is_private:
                 lowered = text_stripped.lower()
+                is_tag_cmd = lowered in TAG_ADMIN_TRIGGERS or lowered in TAG_MEMBERS_TRIGGERS
+                if is_tag_cmd and is_feature_locked(user_id, "tag"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
                 if lowered in TAG_ADMIN_TRIGGERS:
                     await handle_tag_admins(event, user_id)
                     return
@@ -3356,6 +4095,9 @@ def make_reaction_handler(user_id):
             if not user or not user.get("status") or not user.get("reaction_enabled"):
                 return
 
+            if is_feature_locked(user_id, "reaction"):
+                return
+
             sender_id = event.sender_id
             if not sender_id:
                 return
@@ -3373,6 +4115,8 @@ def make_reaction_handler(user_id):
                     await asyncio.sleep(REACTION_APPLY_DELAY)
                     cur_user = user_data.get(user_id)
                     if not cur_user or not cur_user.get("status") or not cur_user.get("reaction_enabled"):
+                        return
+                    if is_feature_locked(user_id, "reaction"):
                         return
                     cur_targets = reaction_targets.get(user_id)
                     if not cur_targets or sender_id not in cur_targets:
@@ -3414,6 +4158,9 @@ def make_autoreply_handler(user_id):
 
             user = user_data.get(user_id)
             if not user or not user.get("status") or not user.get("autoreply_enabled"):
+                return
+
+            if is_feature_locked(user_id, "autoreply"):
                 return
 
             text = (event.raw_text or "").strip()
@@ -4363,9 +5110,32 @@ async def start_handler(event):
         return
 
     if user_id not in user_data:
+        sender = None
+        try:
+            sender = await event.get_sender()
+        except Exception as e:
+            log_internal_error("start_get_sender", e)
+
         user_data[user_id] = make_default_user(step="menu")
+        if sender and getattr(sender, "username", None):
+            user_data[user_id]["username"] = sender.username
+
+        # طبق درخواست «تمام کاربرانی که ربات را استارت می‌کنند باید در دیتابیس ذخیره
+        # شوند» — بلافاصله ذخیره می‌شود، نه فقط وقتی کاربر واقعاً سلف نصب می‌کند؛
+        # این‌طوری در پنل ادمین/بکاپ هم از همان لحظه‌ی اول دیده می‌شود.
+        save_user(user_id, user_data[user_id])
 
     user = user_data[user_id]
+
+    # جوین اجباری: ادمین‌ها معاف هستند تا هیچ‌وقت خودشان از پنل قفل نشوند.
+    if join_channels_cache and user_id not in verified_users and not is_admin(user_id):
+        all_joined, missing = await check_user_joined_all(user_id)
+        if all_joined:
+            verified_users.add(user_id)
+            mark_user_verified_db(user_id)
+        else:
+            await _send_join_gate(event, user_id, missing)
+            return
 
     await event.respond(
         get_start_root_text(),
@@ -4436,6 +5206,18 @@ async def callback_handler(event):
         await event.answer()  # کلیک تکراری/سریع؛ بی‌صدا نادیده گرفته می‌شود
         return
 
+    if data == b"join_verify_check":
+        all_joined, missing = await check_user_joined_all(user_id)
+        if all_joined:
+            verified_users.add(user_id)
+            mark_user_verified_db(user_id)
+            user = user_data.get(user_id) or make_default_user(step="menu")
+            user_data[user_id] = user
+            await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
+        else:
+            await event.answer("برای استفاده از ربات، ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
+        return
+
     # ====== منوی ادمین ======
     if is_admin(user_id):
         # پنل ادمین
@@ -4457,6 +5239,238 @@ async def callback_handler(event):
                 f"🔴 کاربران غیرفعال: {total - active}\n\n"
                 f"🕐 آخرین بروزرسانی: {tehran_now().strftime('%Y-%m-%d %H:%M:%S')}",
                 buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
+            )
+            return
+
+        # ====================================================================
+        # ============================ جوین اجباری ============================
+        # ====================================================================
+        if data == b"admin_joingate":
+            await safe_edit(event, get_joingate_admin_text(), buttons=get_joingate_admin_keyboard())
+            return
+
+        if data == b"admin_joingate_add":
+            admin_action_data[user_id] = {"type": "add_joingate", "step": "get_title"}
+            await safe_edit(event,
+                "➕ **افزودن کانال جوین اجباری**\n\n"
+                "نام نمایشی کانال را ارسال کنید (همان چیزی که کنار 🔔 نشان داده می‌شود):",
+                buttons=[[styled_button("➜ بازگشت", b"admin_joingate", style=STYLE_OFF)]]
+            )
+            return
+
+        if data.startswith(b"admin_joingate_manage_"):
+            cid = int(data.decode().split("admin_joingate_manage_", 1)[1])
+            ch = get_join_channel_db(cid)
+            if not ch:
+                await event.answer("❌ این کانال پیدا نشد.", alert=True)
+                await safe_edit(event, get_joingate_admin_text(), buttons=get_joingate_admin_keyboard())
+                return
+            await safe_edit(event, get_joingate_manage_text(ch), buttons=get_joingate_manage_keyboard(ch))
+            return
+
+        if data.startswith(b"admin_joingate_editlink_"):
+            cid = int(data.decode().split("admin_joingate_editlink_", 1)[1])
+            if not get_join_channel_db(cid):
+                await event.answer("❌ این کانال پیدا نشد.", alert=True)
+                return
+            admin_action_data[user_id] = {"type": "edit_joingate_link", "channel_id": cid, "step": "get_link"}
+            await safe_edit(event,
+                "✏️ **تغییر لینک کانال**\n\n"
+                "لینک عضویت جدید را ارسال کنید (مثال: `https://t.me/mychannel`):",
+                buttons=[[styled_button("➜ بازگشت", f"admin_joingate_manage_{cid}".encode(), style=STYLE_OFF)]]
+            )
+            return
+
+        if data.startswith(b"admin_joingate_toggle_"):
+            cid = int(data.decode().split("admin_joingate_toggle_", 1)[1])
+            ch = get_join_channel_db(cid)
+            if not ch:
+                await event.answer("❌ این کانال پیدا نشد.", alert=True)
+                return
+            new_state = not bool(ch["is_active"])
+            set_join_channel_active_db(cid, new_state)
+            reload_join_channels_cache()
+            log_admin_action(user_id, 0, "toggle_joingate", f"id={cid} active={new_state}")
+            ch = get_join_channel_db(cid)
+            await safe_edit(event, get_joingate_manage_text(ch), buttons=get_joingate_manage_keyboard(ch))
+            return
+
+        if data.startswith(b"admin_joingate_delete_confirm_"):
+            cid = int(data.decode().split("admin_joingate_delete_confirm_", 1)[1])
+            success = delete_join_channel_db(cid)
+            reload_join_channels_cache()
+            if success:
+                log_admin_action(user_id, 0, "delete_joingate", f"id={cid}")
+                await event.answer("✅ کانال حذف شد.", alert=True)
+            else:
+                await event.answer("❌ این کانال پیدا نشد.", alert=True)
+            await safe_edit(event, get_joingate_admin_text(), buttons=get_joingate_admin_keyboard())
+            return
+
+        if data.startswith(b"admin_joingate_delete_"):
+            cid = int(data.decode().split("admin_joingate_delete_", 1)[1])
+            ch = get_join_channel_db(cid)
+            if not ch:
+                await event.answer("❌ این کانال پیدا نشد.", alert=True)
+                return
+            await safe_edit(event,
+                f"⚠️ حذف کانال «{ch['title']}»؟ این عملیات غیرقابل بازگشت است.",
+                buttons=get_joingate_delete_confirm_keyboard(cid)
+            )
+            return
+
+        # ====================================================================
+        # ============================ سیستم بکاپ =============================
+        # ====================================================================
+        if data == b"admin_backup":
+            await safe_edit(event, get_backup_menu_text(), buttons=get_backup_menu_keyboard())
+            return
+
+        if data == b"admin_backup_create":
+            await safe_edit(event, "⏳ در حال ساخت بکاپ... (ممکن است چند ثانیه طول بکشد)")
+            backup_id, size_bytes = create_backup_db(user_id, label="manual")
+            if backup_id is None:
+                await safe_edit(event, "❌ خطا در ساخت بکاپ. لاگ سرور را بررسی کنید.",
+                                 buttons=get_backup_menu_keyboard())
+                return
+            log_admin_action(user_id, 0, "create_backup", f"id={backup_id} size={size_bytes}")
+            await safe_edit(event,
+                f"✅ بکاپ شماره {backup_id} با موفقیت ساخته شد. ({_format_bytes(size_bytes)})",
+                buttons=get_backup_manage_keyboard(backup_id)
+            )
+            return
+
+        if data == b"admin_backup_list":
+            await safe_edit(event, get_backup_list_text(), buttons=get_backup_list_keyboard())
+            return
+
+        if data.startswith(b"admin_backup_manage_"):
+            bid = int(data.decode().split("admin_backup_manage_", 1)[1])
+            rows = {b["id"]: b for b in list_backups_db()}
+            b = rows.get(bid)
+            if not b:
+                await event.answer("❌ این بکاپ پیدا نشد.", alert=True)
+                await safe_edit(event, get_backup_list_text(), buttons=get_backup_list_keyboard())
+                return
+            await safe_edit(event, get_backup_manage_text(b), buttons=get_backup_manage_keyboard(bid))
+            return
+
+        if data.startswith(b"admin_backup_download_"):
+            bid = int(data.decode().split("admin_backup_download_", 1)[1])
+            raw = get_backup_data_db(bid)
+            if not raw:
+                await event.answer("❌ این بکاپ پیدا نشد.", alert=True)
+                return
+            file_obj = io.BytesIO(raw)
+            file_obj.name = f"novaself_backup_{bid}.json"
+            try:
+                await safe_call(bot.send_file, user_id, file_obj,
+                                 caption=f"💾 بکاپ شماره {bid}")
+                await event.answer("✅ فایل بکاپ برایتان ارسال شد.", alert=True)
+            except Exception as e:
+                log_internal_error("backup_download", e)
+                await event.answer("❌ خطا در ارسال فایل.", alert=True)
+            return
+
+        if data.startswith(b"admin_backup_delete_confirm_"):
+            bid = int(data.decode().split("admin_backup_delete_confirm_", 1)[1])
+            success = delete_backup_db(bid)
+            if success:
+                log_admin_action(user_id, 0, "delete_backup", f"id={bid}")
+                await event.answer("✅ بکاپ حذف شد.", alert=True)
+            else:
+                await event.answer("❌ این بکاپ پیدا نشد.", alert=True)
+            await safe_edit(event, get_backup_list_text(), buttons=get_backup_list_keyboard())
+            return
+
+        if data.startswith(b"admin_backup_delete_"):
+            bid = int(data.decode().split("admin_backup_delete_", 1)[1])
+            await safe_edit(event,
+                f"⚠️ حذف بکاپ شماره {bid}؟ این عملیات غیرقابل بازگشت است.",
+                buttons=get_backup_delete_confirm_keyboard(bid)
+            )
+            return
+
+        if data.startswith(b"admin_backup_restore_confirm_"):
+            token = data.decode().split("admin_backup_restore_confirm_", 1)[1]
+
+            if token == "uploaded":
+                dump = backup_upload_pending.get(user_id)
+                source_label = "فایل آپلودشده"
+            else:
+                bid = int(token)
+                raw = get_backup_data_db(bid)
+                dump = json.loads(raw.decode("utf-8")) if raw else None
+                source_label = f"بکاپ شماره {bid}"
+
+            if not dump:
+                await event.answer("❌ این بکاپ دیگر در دسترس نیست.", alert=True)
+                return
+
+            await safe_edit(event, "⏳ در حال گرفتن بکاپ ایمنی از وضعیت فعلی...")
+            safety_id, _ = create_backup_db(user_id, label="pre_restore_auto")
+            if safety_id is None:
+                await safe_edit(event,
+                    "❌ ساخت بکاپ ایمنیِ قبل از بازیابی ناموفق بود؛ برای احتیاط، بازیابی متوقف شد.",
+                    buttons=get_backup_menu_keyboard()
+                )
+                return
+
+            await safe_edit(event, "⏳ در حال بازیابی...")
+            success, summary, error = restore_backup_payload(dump)
+            backup_upload_pending.pop(user_id, None)
+
+            if not success:
+                await safe_edit(event,
+                    f"❌ خطا در بازیابی: {error}\n\n"
+                    f"می‌توانید از بکاپ ایمنیِ شماره {safety_id} (که همین الان گرفته شد) برای برگشت استفاده کنید.",
+                    buttons=get_backup_menu_keyboard()
+                )
+                return
+
+            log_admin_action(user_id, 0, "restore_backup", f"source={source_label} safety_id={safety_id}")
+
+            # بعد از بازیابی، کش‌های درون‌حافظه‌ای که از دیتابیس خوانده می‌شوند تازه
+            # می‌شوند تا وضعیت زنده‌ی ربات با دیتابیس هماهنگ بماند (بدون نیاز به Restart).
+            try:
+                reload_join_channels_cache()
+                load_reactions_cache()
+                load_autoreplies_cache()
+                load_feature_locks_cache()
+            except Exception as e:
+                log_internal_error("post_restore_cache_reload", e)
+
+            summary_lines = "\n".join(f"▫️ {t}: {c}" for t, c in summary.items() if c)
+            await safe_edit(event,
+                f"✅ **بازیابی «{source_label}» با موفقیت انجام شد.**\n\n"
+                f"ردیف‌های بازیابی‌شده:\n{summary_lines or '(هیچ)'}\n\n"
+                f"🛟 بکاپ ایمنیِ قبل از بازیابی: شماره {safety_id}\n\n"
+                "⚠️ توجه: کاربرانی که همین الان با سلف روشن در حافظه فعال بودند تا "
+                "ری‌استارت بعدی ربات با همان وضعیت قبلی کار می‌کنند؛ اطلاعات پروفایل/"
+                "الماس/تنظیماتشان از دفعه‌ی بعدی که تغییری بدهند با نسخه‌ی بازیابی‌شده "
+                "همگام می‌شود.",
+                buttons=get_backup_menu_keyboard()
+            )
+            return
+
+        if data.startswith(b"admin_backup_restore_"):
+            bid = int(data.decode().split("admin_backup_restore_", 1)[1])
+            rows = {b["id"]: b for b in list_backups_db()}
+            if bid not in rows:
+                await event.answer("❌ این بکاپ پیدا نشد.", alert=True)
+                return
+            await safe_edit(event,
+                get_backup_restore_confirm_text(f"شماره {bid}"),
+                buttons=get_backup_restore_confirm_keyboard(str(bid))
+            )
+            return
+
+        if data == b"admin_backup_upload":
+            admin_action_data[user_id] = {"type": "backup_upload", "step": "get_file"}
+            await safe_edit(event,
+                "⬆️ **بارگذاری بکاپ**\n\n"
+                "فایل JSON بکاپ (که قبلاً از همین ربات دانلود کرده‌اید) را ارسال کنید:",
+                buttons=[[styled_button("➜ بازگشت", b"admin_backup", style=STYLE_OFF)]]
             )
             return
 
@@ -4695,6 +5709,44 @@ async def callback_handler(event):
                 get_user_features_text(target_id),
                 buttons=get_user_features_keyboard(target_id, user_data[target_id])
             )
+            return
+
+        # ====================================================================
+        # ================ قفل کردن قابلیت‌ها برای یک کاربر خاص ==============
+        # ====================================================================
+        if data.startswith(b"admin_lock_features_"):
+            target_id = int(data.decode().split("admin_lock_features_", 1)[1])
+            if target_id not in user_data:
+                await event.answer("❌ کاربر پیدا نشد!", alert=True)
+                return
+            await safe_edit(event, get_lock_features_text(target_id), buttons=get_lock_features_keyboard(target_id))
+            return
+
+        if data.startswith(b"admin_togglelock_"):
+            remainder = data.decode().split("admin_togglelock_", 1)[1]
+            key, _, target_id_str = remainder.rpartition("_")
+
+            try:
+                target_id = int(target_id_str)
+            except ValueError:
+                await event.answer("❌ عملیات نامعتبر است.", alert=True)
+                return
+
+            if key not in FEATURE_LOCK_LABELS or target_id not in user_data:
+                await event.answer("❌ عملیات نامعتبر است.", alert=True)
+                return
+
+            currently_locked = key in feature_locks.get(target_id, set())
+            if currently_locked:
+                unlock_feature_db(target_id, key)
+                feature_locks.get(target_id, set()).discard(key)
+                log_admin_action(user_id, target_id, "unlock_feature", key)
+            else:
+                lock_feature_db(target_id, key)
+                feature_locks.setdefault(target_id, set()).add(key)
+                log_admin_action(user_id, target_id, "lock_feature", key)
+
+            await safe_edit(event, get_lock_features_text(target_id), buttons=get_lock_features_keyboard(target_id))
             return
 
         if data.startswith(b"admin_togglefeat_"):
@@ -5114,7 +6166,7 @@ async def callback_handler(event):
         return
 
     if data == b"settings_root":
-        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard())
+        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard(user_id))
         return
 
     if data == b"panel_account":
@@ -5138,6 +6190,9 @@ async def callback_handler(event):
         return
 
     if data == b"menu_time":
+        if is_feature_locked(user_id, "time"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event,
             get_time_menu_text(user),
             buttons=get_time_menu_keyboard(user)
@@ -5152,6 +6207,9 @@ async def callback_handler(event):
         return
 
     if data == b"menu_actions":
+        if is_feature_locked(user_id, "actions"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             "با انتخاب هر گزینه، وضعیت شما به‌صورت مداوم برای دیگران نمایش داده می‌شود:",
@@ -5160,6 +6218,9 @@ async def callback_handler(event):
         return
 
     if data == b"menu_date":
+        if is_feature_locked(user_id, "date"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event,
             get_date_menu_text(user),
             buttons=get_date_menu_keyboard(user)
@@ -5207,6 +6268,9 @@ async def callback_handler(event):
         return
 
     if data == b"menu_textmode":
+        if is_feature_locked(user_id, "textmode"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event,
             "🖊️ **حالت متن**\n\n"
             "با انتخاب یکی از حالت‌های زیر، تمام پیام‌های متنی شما بلافاصله پس از ارسال "
@@ -5539,14 +6603,23 @@ async def callback_handler(event):
         return
 
     if data == b"menu_tag":
+        if is_feature_locked(user_id, "tag"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_tag_menu_text(), buttons=get_tag_menu_keyboard())
         return
 
     if data == b"menu_ping":
+        if is_feature_locked(user_id, "ping"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_ping_menu_text(), buttons=get_ping_menu_keyboard())
         return
 
     if data == b"menu_whois":
+        if is_feature_locked(user_id, "whois"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_whois_menu_text(), buttons=get_whois_menu_keyboard())
         return
 
@@ -5554,6 +6627,9 @@ async def callback_handler(event):
     # ============================== ریکت ================================
     # ====================================================================
     if data == b"menu_reaction":
+        if is_feature_locked(user_id, "reaction"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_reaction_menu_text(user_id, user), buttons=get_reaction_menu_keyboard(user))
         return
 
@@ -5572,6 +6648,9 @@ async def callback_handler(event):
     # ========================== پاسخ خودکار ==============================
     # ====================================================================
     if data == b"menu_autoreply":
+        if is_feature_locked(user_id, "autoreply"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_autoreply_menu_text(user_id, user), buttons=get_autoreply_menu_keyboard(user))
         return
 
@@ -5654,12 +6733,18 @@ async def callback_handler(event):
         return
 
     if data == b"menu_secretary":
+        if is_feature_locked(user_id, "secretary"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
     # ====== میو ======
     if data == b"menu_meow":
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        if is_feature_locked(user_id, "meow"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user_id, user))
         return
 
     if data == b"meow_settings":
@@ -5667,18 +6752,30 @@ async def callback_handler(event):
         return
 
     if data == b"fish_settings":
+        if is_feature_locked(user_id, "fish"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_fish_settings_text(user), buttons=get_fish_settings_keyboard(user))
         return
 
     if data == b"meowpoint_settings":
+        if is_feature_locked(user_id, "meowpoint"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_meowpoint_settings_text(user), buttons=get_meowpoint_settings_keyboard(user))
         return
 
     if data == b"streetcat_settings":
+        if is_feature_locked(user_id, "streetcat"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_streetcat_settings_text(user), buttons=get_streetcat_settings_keyboard(user))
         return
 
     if data == b"fridge_settings":
+        if is_feature_locked(user_id, "fridge"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
         await safe_edit(event, get_fridge_settings_text(user), buttons=get_fridge_settings_keyboard(user))
         return
 
@@ -5972,7 +7069,7 @@ async def callback_handler(event):
                         user[task_key] = asyncio.get_event_loop().create_task(worker_fn(user_id, client))
 
         meow_group_cache.pop(user_id, None)
-        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user))
+        await safe_edit(event, get_meow_menu_text(user), buttons=get_meow_menu_keyboard(user_id, user))
         return
 
     if data == b"secretary_toggle":
@@ -6086,6 +7183,7 @@ async def message_handler(event):
         transfer_data.pop(user_id, None)
         purchase_data.pop(user_id, None)
         autoreply_draft.pop(user_id, None)
+        backup_upload_pending.pop(user_id, None)
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
         await event.respond("❌ عملیات لغو شد.")
@@ -6267,6 +7365,124 @@ async def message_handler(event):
         return
 
     # ====== ساخت کد هدیه توسط ادمین (چندمرحله‌ای، قبل از هندلر عمومی عددی) ======
+    # ====== افزودن کانال جوین اجباری (سه‌مرحله‌ای: نام، شناسه، لینک) ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "add_joingate":
+        action = admin_action_data[user_id]
+        cancel_kb = [[styled_button("➜ بازگشت", b"admin_joingate", style=STYLE_OFF)]]
+
+        if action["step"] == "get_title":
+            title = text.strip()
+            if not title:
+                await event.respond("❌ لطفاً یک نام معتبر ارسال کنید.", buttons=cancel_kb)
+                return
+            action["title"] = title[:64]
+            action["step"] = "get_identifier"
+            await event.respond(
+                "حالا شناسه‌ی کانال را ارسال کنید:\n"
+                "برای کانال عمومی: `@channel_username`\n"
+                "برای کانال خصوصی: آیدی عددی کانال (باید ربات از قبل ادمین آن کانال باشد)",
+                buttons=cancel_kb
+            )
+            return
+
+        if action["step"] == "get_identifier":
+            identifier = text.strip().lstrip("@")
+            if not identifier:
+                await event.respond("❌ شناسه نامعتبر است.", buttons=cancel_kb)
+                return
+            action["identifier"] = identifier
+            action["step"] = "get_link"
+            await event.respond(
+                "حالا لینک عضویت کانال را ارسال کنید (مثال: `https://t.me/channel_username`):",
+                buttons=cancel_kb
+            )
+            return
+
+        if action["step"] == "get_link":
+            link = text.strip()
+            if not link.startswith("http"):
+                await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
+                return
+
+            new_id = create_join_channel_db(action["title"], action["identifier"], link)
+            del admin_action_data[user_id]
+
+            if new_id is None:
+                await event.respond("❌ خطا در ذخیره‌سازی کانال.", buttons=get_joingate_admin_keyboard())
+                return
+
+            reload_join_channels_cache()
+            log_admin_action(user_id, 0, "add_joingate", f"id={new_id} title={action['title']}")
+            await event.respond(
+                f"✅ کانال «{action['title']}» با موفقیت اضافه شد.\n\n"
+                "⚠️ یادت باشه که ربات باید از قبل عضو/ادمین این کانال باشه تا بتونه عضویت کاربرا رو چک کنه.",
+                buttons=get_joingate_admin_keyboard()
+            )
+            return
+
+    # ====== تغییر لینک یک کانال جوین اجباری موجود ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "edit_joingate_link":
+        action = admin_action_data[user_id]
+        cid = action["channel_id"]
+        cancel_kb = [[styled_button("➜ بازگشت", f"admin_joingate_manage_{cid}".encode(), style=STYLE_OFF)]]
+
+        link = text.strip()
+        if not link.startswith("http"):
+            await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
+            return
+
+        success = update_join_channel_link_db(cid, link)
+        del admin_action_data[user_id]
+
+        if not success:
+            await event.respond("❌ این کانال پیدا نشد.", buttons=get_joingate_admin_keyboard())
+            return
+
+        reload_join_channels_cache()
+        log_admin_action(user_id, 0, "edit_joingate_link", f"id={cid}")
+        ch = get_join_channel_db(cid)
+        await event.respond(
+            "✅ لینک کانال بروزرسانی شد.",
+            buttons=get_joingate_manage_keyboard(ch) if ch else get_joingate_admin_keyboard()
+        )
+        return
+
+    # ====== دریافت فایل بکاپ آپلودشده برای بازیابی ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "backup_upload":
+        cancel_kb = [[styled_button("➜ بازگشت", b"admin_backup", style=STYLE_OFF)]]
+
+        if not event.document:
+            await event.respond("❌ لطفاً فایل JSON بکاپ را به‌صورت Document ارسال کنید (نه متن).", buttons=cancel_kb)
+            return
+
+        size = getattr(event.file, "size", None) if event.file else None
+        if size and size > 30 * 1024 * 1024:
+            await event.respond("❌ حجم فایل بیش از حد مجاز است (حداکثر ۳۰ مگابایت).", buttons=cancel_kb)
+            return
+
+        try:
+            raw = await event.download_media(file=bytes)
+            dump = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            log_internal_error("backup_upload_parse", e)
+            await event.respond("❌ فایل ارسالی یک بکاپ معتبر JSON نیست یا خراب است.", buttons=cancel_kb)
+            return
+
+        if not isinstance(dump, dict) or "meta" not in dump:
+            await event.respond("❌ ساختار فایل با فرمت بکاپ NovaSelf مطابقت ندارد.", buttons=cancel_kb)
+            return
+
+        backup_upload_pending[user_id] = dump
+        del admin_action_data[user_id]
+
+        meta = dump.get("meta", {})
+        created_at = meta.get("created_at", "نامشخص")
+        await event.respond(
+            get_backup_restore_confirm_text(f"فایل آپلودشده (ساخته‌شده در {created_at})"),
+            buttons=get_backup_restore_confirm_keyboard("uploaded")
+        )
+        return
+
     if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "create_giftcode":
         action = admin_action_data[user_id]
         cancel_kb = [[styled_button("➜ بازگشت", b"admin_giftcodes", style=STYLE_OFF)]]
@@ -6524,6 +7740,15 @@ async def message_handler(event):
         generator = generator_data[user_id]
 
         if generator["step"] == "get_phone":
+            # جلوگیری از اسپم: اگر کاربر قبلاً شماره‌ی اشتباه فرستاده، تا پایان
+            # زمان انتظار (۳۰ ثانیه بار اول، ۶۰ ثانیه بار دوم به بعد) اجازه‌ی
+            # تلاش مجدد داده نمی‌شود.
+            wait_until = generator.get("phone_wait_until")
+            if wait_until and tehran_now() < wait_until:
+                remaining = int((wait_until - tehran_now()).total_seconds()) + 1
+                await event.respond(f"⏳ لطفاً {remaining} ثانیه دیگر صبر کنید و دوباره شماره را ارسال کنید.")
+                return
+
             normalized_phone, phone_error = normalize_phone_number(text)
             if phone_error:
                 await event.respond(
@@ -6536,6 +7761,7 @@ async def message_handler(event):
 
             await event.respond("⏳ در حال اتصال به سرورهای تلگرام...")
 
+            client = None
             try:
                 client = TelegramClient(StringSession(), API_ID, API_HASH)
                 await client.connect()
@@ -6544,6 +7770,8 @@ async def message_handler(event):
                 active_signins[user_id] = client
                 generator["phone_code_hash"] = send_code_result.phone_code_hash
                 generator["step"] = "get_code"
+                generator.pop("phone_attempts", None)
+                generator.pop("phone_wait_until", None)
 
                 await event.respond(
                     "📩 **کد تایید ارسال شد!**\n\n"
@@ -6551,14 +7779,39 @@ async def message_handler(event):
                     "لطفاً آن را از طریق دکمه‌های زیر وارد کنید:",
                     buttons=get_code_keyboard("")
                 )
-            except Exception as e:
+            except FloodWaitError as e:
+                # خود تلگرام محدودیت گذاشته؛ دقیقاً به همان مدت صبر تحمیل می‌شود
+                generator["phone_wait_until"] = tehran_now() + timedelta(seconds=e.seconds)
                 await event.respond(
-                    f"❌ **خطا در ارسال کد:**\n\n`{str(e)}`\n\n"
-                    "لطفاً مجدداً /start را بزنید و تلاش کنید."
+                    f"⏳ تلگرام درخواست شما را موقتاً محدود کرده است.\n"
+                    f"لطفاً {e.seconds} ثانیه دیگر دوباره شماره را ارسال کنید."
                 )
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                 if user_id in active_signins:
                     del active_signins[user_id]
-                del generator_data[user_id]
+            except Exception as e:
+                attempts = generator.get("phone_attempts", 0) + 1
+                generator["phone_attempts"] = attempts
+                wait_seconds = 30 if attempts == 1 else 60
+                generator["phone_wait_until"] = tehran_now() + timedelta(seconds=wait_seconds)
+
+                await event.respond(
+                    f"❌ **خطا در ارسال کد:**\n\n`{str(e)}`\n\n"
+                    f"لطفاً {wait_seconds} ثانیه صبر کنید و دوباره شماره را ارسال کنید."
+                )
+                # generator_data عمداً حذف نمی‌شود تا کاربر مجبور به /start دوباره
+                # نشود؛ فقط در همین مرحله با محدودیت زمانی می‌ماند.
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                if user_id in active_signins:
+                    del active_signins[user_id]
 
             return
 
@@ -6838,6 +8091,8 @@ if __name__ == "__main__":
     logging.info(f"📊 تعداد کاربران بارگذاری شده: {len(user_data)}")
     load_reactions_cache()
     load_autoreplies_cache()
+    load_feature_locks_cache()
+    load_join_gate_cache()
 
     loop = asyncio.get_event_loop()
 
