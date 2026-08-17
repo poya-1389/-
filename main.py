@@ -2198,10 +2198,12 @@ async def check_user_joined_all(user_id):
         except UserNotParticipantError:
             missing.append(ch)
         except (ChatAdminRequiredError, ChannelPrivateError) as e:
+            bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
             logging.error(
-                f"⚠️ جوین اجباری: ربات به کانال «{ch['title']}» (شناسه: {ch['identifier']}) دسترسی کافی "
-                f"ندارد یا در آن ادمین نیست ({e}). این کانال به‌عنوان «عضو نشده» در نظر گرفته می‌شود تا "
-                "قابلیت جوین اجباری بی‌اثر نشود — لطفاً از پنل ادمین بررسی کنید که بات در این کانال عضو/ادمین باشد."
+                f"⚠️ جوین اجباری: {bot_mention} به کانال «{ch['title']}» (شناسه: {ch['identifier']}) دسترسی کافی "
+                f"ندارد یا در آن عضو/ادمین نیست ({e}). این کانال به‌عنوان «عضو نشده» در نظر گرفته می‌شود تا "
+                f"قابلیت جوین اجباری بی‌اثر نشود — لطفاً از پنل ادمین بررسی کنید که خودِ {bot_mention} "
+                "(نه اکانت سلف کاربران) در این کانال عضو/ادمین باشد."
             )
             missing.append(ch)
         except Exception as e:
@@ -5320,6 +5322,15 @@ async def callback_handler(event):
 
         if real_action == "panel_close":
             await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
+            # برای شلوغ‌نشدنِ چت، خودِ پیامِ «پنل بسته شد» هم بعد از چند ثانیه
+            # به‌صورت خودکار پاک می‌شود (در پس‌زمینه، بدون بلاک‌کردن هندلر).
+            async def _auto_delete_closed_panel():
+                await asyncio.sleep(3)
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+            _spawn_background_task(_auto_delete_closed_panel())
             return
 
         user_id = owner_id
@@ -7595,11 +7606,20 @@ async def message_handler(event):
                 if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
                     raise ChatAdminRequiredError(request=None)
             except Exception as e:
+                # نکته‌ی مهم که باعث سردرگمی می‌شود: این چک مربوط به «خودِ ربات»
+                # (همان اکانتی که با BOT_TOKEN بالا آمده، یعنی @BOT_USERNAME) است،
+                # نه اکانتِ سلف/یوزربات کاربران. اضافه‌کردن اکانت سلف به‌عنوان ادمین
+                # کانال هیچ ربطی به این چک ندارد؛ کافی است @BOT_USERNAME (که پیام‌ها
+                # را می‌فرستد) در کانال عضو/ادمین شود. برای همین یوزرنیم دقیق ربات را
+                # هم توی پیام خطا می‌آوریم تا اشتباه گرفته نشود.
+                bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
                 await event.respond(
-                    "❌ **ربات هنوز عضو/ادمین این کانال نیست.**\n\n"
+                    f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
                     f"جزئیات: `{e}`\n\n"
-                    "لطفاً اول ربات را در کانال (ترجیحاً با دسترسی ادمین) عضو کنید، بعد دوباره شناسه یا "
-                    "پیام Forward‌شده را ارسال کنید. بدون این مرحله، بررسی عضویت کاربران کار نخواهد کرد.",
+                    f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
+                    f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
+                    "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
+                    "بدون این مرحله، بررسی عضویت کاربران کار نخواهد کرد.",
                     buttons=cancel_kb
                 )
                 return
@@ -8337,6 +8357,8 @@ if __name__ == "__main__":
         format_diamonds=format_diamonds,
         diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
         allowed_origin=MINIAPP_ORIGIN,
+        is_feature_locked=is_feature_locked,
+        is_feature_globally_locked=is_feature_globally_locked,
     )
     loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
 

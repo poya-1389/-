@@ -98,12 +98,33 @@ def wrap_panel_buttons(rows, owner_id, add_close=True):
         for btn in row:
             data = getattr(btn, "data", None)
             if data:
-                new_data = f"ip_{owner_id}_".encode() + data
+                prefix = f"ip_{owner_id}_".encode()
+                new_data = prefix + data
                 style = _style_obj_to_str(getattr(btn, "style", None))
-                new_row.append(styled_button(btn.text, new_data, style=style))
+                # callback_data تلگرام حداکثر ۶۴ بایت مجاز است (Button.inline خودش
+                # روی مقدار بزرگ‌تر ValueError می‌دهد و کل هندلر کرش می‌کند). بعضی از
+                # منوهای عمیق‌تر ربات (مثل مدیریت بک‌آپ/کدهای هدیه/جوین اجباری) از
+                # callback_data های نسبتاً بلند و پویا (با شناسه/توکن داخلشان) استفاده
+                # می‌کنند؛ وقتی این پیام‌ها از طریق «پنل درون‌چتی» باز شوند، افزودنِ
+                # پیشوند مالکیت می‌توانست این حد را رد کند.
+                # توجه: اینجا نباید دکمه را بدون پیشوند برگرداند، چون هندلرِ پنل
+                # درون‌چتی («if data.startswith(b"ip_")» در main.py) دقیقاً همین
+                # پیشوند را برای احراز مالکیتِ کلیک چک می‌کند؛ حذف پیشوند یعنی چک
+                # «فقط صاحب پنل می‌تواند کلیک کند» هم دور زده می‌شود. برای همین، به‌جای
+                # ارسال یک دکمه‌ی ناامن، دکمه را کلاً از صفحه حذف می‌کنیم و خطا را لاگ
+                # می‌کنیم تا مشخص شود کدام منو باید callback_data کوتاه‌تری بگیرد.
+                if len(new_data) > 64:
+                    logging.warning(
+                        f"⚠️ callback_data بعد از افزودن پیشوند پنل از ۶۴ بایت رد شد "
+                        f"(owner={owner_id}, len={len(new_data)}, text={btn.text!r}); "
+                        f"دکمه به‌صورت امن از پنل درون‌چتی حذف شد."
+                    )
+                else:
+                    new_row.append(styled_button(btn.text, new_data, style=style))
             else:
                 new_row.append(btn)  # دکمه‌های URL و مشابه بدون تغییر باقی می‌مانند
-        wrapped.append(new_row)
+        if new_row:  # اگر همه‌ی دکمه‌های این ردیف به‌خاطر حد ۶۴ بایتی حذف شدند، ردیفِ خالی اضافه نمی‌شود
+            wrapped.append(new_row)
 
     if add_close:
         wrapped.append([styled_button("✕ بستن پنل", f"ip_{owner_id}_panel_close".encode(), style=STYLE_OFF)])

@@ -38,6 +38,29 @@ SIMPLE_FIELDS = {
     "date_font": int,
 }
 
+# محدوده‌ی مجاز برای فیلدهای عددی/متنی ساده (برای همسان‌ماندن با محدودیت‌های
+# همان فیلدها در منوهای خودِ ربات؛ قبلاً این محدودیت‌ها فقط سمت ربات چک می‌شد
+# و از طریق Mini App هر عددی قابل ارسال بود).
+FONT_ID_RANGE = range(0, 21)          # با تعداد فونت‌های واقعی FONTS در main.py هماهنگ کنید
+TEXT_MODE_RANGE = range(0, 9)         # 0 (خاموش) تا 8 طبق build_format_entities
+DATE_FONT_ID_RANGE = FONT_ID_RANGE
+DATE_TYPE_VALUES = {"shamsi", "qamari", "gregorian"}
+
+# نگاشت هر فیلد به کلید قفلِ قابلیتِ متناظرش (طبق همان کلیدهایی که در منوهای
+# خودِ ربات با is_feature_locked/is_feature_globally_locked چک می‌شوند). این
+# نگاشت برای جلوگیری از دورزدنِ قفل ادمین از طریق Mini App استفاده می‌شود.
+FIELD_TO_FEATURE_KEY = {
+    "font_id": "time",
+    "text_mode": "textmode",
+    "date_type": "date",
+    "date_font": "date",
+    "date_enabled": "date",
+    "name_time": "time",
+    "bio_time": "time",
+    "secretary_enabled": "secretary",
+    "secretary_bulk": "secretary",
+}
+
 
 def _validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = 86400):
     """
@@ -79,7 +102,8 @@ def _validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = 8
 
 def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
                        stop_self_client, format_diamonds, diamond_rate_per_hour=5,
-                       allowed_origin="*"):
+                       allowed_origin="*", is_feature_locked=None,
+                       is_feature_globally_locked=None):
     """
     این تابع را از main.py صدا بزن و خروجی‌اش را با run_webapp_server اجرا کن.
     توجه: user_data باید همان دیکشنری سراسری main.py باشد (پاس دادن با رفرنس)
@@ -116,22 +140,53 @@ def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
 
         field = body.get("field")
 
+        # جلوگیری از دورزدنِ قفلِ قابلیت (که در منوهای خودِ ربات رعایت می‌شود)
+        # از طریق فراخوانی مستقیمِ Mini App API. قبلاً این‌جا هیچ‌کدام از این دو
+        # چک انجام نمی‌شد و یک کاربرِ قفل‌شده می‌توانست تنظیمات را از طریق
+        # Mini App تغییر دهد حتی اگر ادمین آن قابلیت را برایش قفل کرده باشد.
+        feature_key = FIELD_TO_FEATURE_KEY.get(field)
+        if feature_key:
+            if callable(is_feature_globally_locked) and is_feature_globally_locked(feature_key):
+                return web.json_response({"ok": False, "error": "feature-locked"}, status=403)
+            if callable(is_feature_locked) and is_feature_locked(user_id, feature_key):
+                return web.json_response({"ok": False, "error": "feature-locked"}, status=403)
+
         try:
             if field == "status":
-                await _handle_status_toggle(user_id, user, bool(body.get("value")),
-                                             start_self_client, stop_self_client)
+                try:
+                    await _handle_status_toggle(user_id, user, bool(body.get("value")),
+                                                 start_self_client, stop_self_client)
+                except ValueError as e:
+                    # دلیل دقیقِ شکست (موجودی ناکافی / نشست نامعتبر) را حفظ می‌کنیم
+                    # تا فرانت بتواند پیام درست را نشان دهد؛ قبلاً این دلیل با یک
+                    # پیام عمومی «invalid-value» گم می‌شد و کاربر متوجه علت
+                    # واقعی نمی‌شد (برخلاف رفتار خودِ ربات که پیام دقیق می‌دهد).
+                    save_user(user_id, user)
+                    return web.json_response({"ok": False, "error": str(e), **_serialize_user(user)}, status=409)
 
             elif field in TOGGLE_FIELDS:
                 user[field] = bool(body.get("value"))
 
             elif field in SIMPLE_FIELDS:
                 caster = SIMPLE_FIELDS[field]
-                user[field] = caster(body.get("value"))
+                value = caster(body.get("value"))
+                if field == "font_id" and value not in FONT_ID_RANGE:
+                    return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
+                if field == "text_mode" and value not in TEXT_MODE_RANGE:
+                    return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
+                if field == "date_font" and value not in DATE_FONT_ID_RANGE:
+                    return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
+                if field == "date_type" and value not in DATE_TYPE_VALUES:
+                    return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
+                user[field] = value
 
             elif field == "secretary_bulk":
                 text = str(body.get("secretary_text", "") or "")[:500]
                 delay = int(body.get("secretary_delay", 60))
-                delay = max(5, min(delay, 3600))
+                # محدوده را با محدوده‌ی واقعیِ همین فیلد در منوی خودِ ربات
+                # (۱ تا ۸۶۴۰۰ ثانیه) یکسان کردیم؛ قبلاً این‌جا ۵ تا ۳۶۰۰ بود که
+                # با چیزی که در ربات مجاز است هم‌خوانی نداشت.
+                delay = max(1, min(delay, 86400))
                 user["secretary_text"] = text
                 user["secretary_delay"] = delay
 
