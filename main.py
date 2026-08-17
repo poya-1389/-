@@ -7629,8 +7629,17 @@ async def message_handler(event):
                 resolved_from_dialogs = None
                 if target_id is not None:
                     try:
+                        # اشتباهِ نسخه‌ی قبلی همین‌جا بود: d.id مقدارِ «مارک‌شده»ی
+                        # دیالوگ است (برای کانال‌ها همیشه منفی و با پیشوندِ -100،
+                        # طبق مستندات رسمی Telethon — مثلاً کانال با id خامِ 456 در
+                        # دیالوگ‌ها به‌صورت -1000000000456 دیده می‌شود)، در حالی که
+                        # resolved_entity.id مقدارِ خامِ id کانال است (همان 456،
+                        # بدون علامت منفی/بدون -100). مقایسه‌ی مستقیمِ این دو همیشه
+                        # False می‌شد و کل fallback عملاً کاری نمی‌کرد. برای همین حالا
+                        # id خامِ خودِ entity هر دیالوگ (d.entity.id) را با id خامِ
+                        # entity هدف مقایسه می‌کنیم — هر دو در یک فرمت.
                         async for d in bot.iter_dialogs():
-                            if d.id == target_id:
+                            if d.entity is not None and getattr(d.entity, "id", None) == target_id:
                                 resolved_from_dialogs = d.entity
                                 break
                     except Exception:
