@@ -72,6 +72,13 @@ bot = TelegramClient('helper_bot', API_ID, API_HASH, catch_up=True).start(bot_to
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ======================== تنظیمات سیستم الماس ========================
+# ======================== تنظیمات جوین اجباری ========================
+# مدت اعتبار یک تأیید عضویت. بعد از این مدت، دفعه‌ی بعد که کاربر تعامل کند
+# (کلیک/پیام/استارت)، عضویتش دوباره واقعاً از تلگرام استعلام می‌شود — تا کسی که
+# از کانال لفت داده برای همیشه معاف نماند. مقدار کم باعث افزایش تماس با API
+# تلگرام می‌شود و مقدار خیلی زیاد اثر «اجباری بودن» را کم می‌کند؛ ۶ ساعت تعادل خوبی است.
+JOIN_GATE_RECHECK_SECONDS = 6 * 60 * 60
+
 DIAMOND_RATE_PER_HOUR = 5       # مصرف الماس به ازای هر ساعت روشن بودن سلف
 DIAMOND_PRICE_TOMAN = 20        # قیمت هر الماس به تومان
 BILLING_INTERVAL_SECONDS = 60   # فاصله زمانی محاسبه و کسر الماس
@@ -215,7 +222,12 @@ feature_locks = {}      # {user_id: {feature_key, ...}} کش قفل قابلیت
 global_feature_locks = set()  # {feature_key, ...} کش قفل سراسری (برای همه‌ی کاربران)
 backup_upload_pending = {}  # {admin_id: dump_dict} بکاپ آپلودشده‌ای که هنوز تأیید نشده
 join_channels_cache = []  # لیست کانال‌های فعالِ جوین اجباری (کش)
-verified_users = set()    # {user_id, ...} کاربرانی که عضویتشان قبلاً تأیید شده
+# {user_id: {"verified_at": datetime, "snapshot": str}, ...}
+# برخلاف نسخه‌ی قبلی (یک set ساده که یعنی «یک‌بار برای همیشه تأیید شده»)، اینجا
+# برای هر کاربر زمانِ آخرین تأیید و «عکسِ لحظه‌ایِ» کانال‌های فعال در آن لحظه هم
+# نگه‌داری می‌شود؛ همین دو مقدار است که به needs_join_check() اجازه می‌دهد تشخیص
+# بدهد یک تأییدِ قدیمی هنوز معتبر است یا باید دوباره از کاربر خواسته شود.
+verified_users = {}
 _background_tasks = set()  # نگه‌داشتن رفرنس Taskهای پس‌زمینه‌ی کوتاه‌مدت تا با GC زودهنگام لغو نشوند
 
 def _spawn_background_task(coro):
@@ -538,10 +550,20 @@ def init_db():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS novaself_join_verified (
                 user_id BIGINT PRIMARY KEY,
-                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channels_snapshot TEXT DEFAULT ''
             )
         ''')
         conn.commit()
+
+        # ستون channels_snapshot برای دیپلوی‌های قدیمی‌تر که این جدول را از قبل
+        # (بدون این ستون) دارند، اضافه می‌شود تا نیازی به دراپ‌کردن دستی جدول نباشد.
+        try:
+            cursor.execute("ALTER TABLE novaself_join_verified ADD COLUMN IF NOT EXISTS channels_snapshot TEXT DEFAULT ''")
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ خطا در افزودن ستون channels_snapshot: {e}")
 
         # ---------- سیستم بکاپ ----------
         cursor.execute('''
@@ -1911,15 +1933,27 @@ def delete_join_channel_db(channel_id):
         if conn:
             conn.close()
 
-def mark_user_verified_db(user_id):
+def mark_user_verified_db(user_id, channels_snapshot, verified_at=None):
+    """
+    برخلاف نسخه‌ی قبلی (INSERT ... DO NOTHING که فقط یک‌بار برای همیشه ثبت می‌کرد و
+    دیگر هیچ‌وقت آپدیت نمی‌شد)، این نسخه هر بار که کاربر با موفقیت دوباره تأیید
+    می‌شود، هم verified_at و هم channels_snapshot (عکسِ لحظه‌ایِ کانال‌های فعال در
+    زمان تأیید) را آپدیت می‌کند. این snapshot دقیقاً همان چیزی است که در حافظه هم
+    نگه‌داری می‌شود تا بعد از هر ری‌استارت، وضعیت «باید دوباره چک شود یا نه» درست
+    از دیتابیس بازسازی شود.
+    """
+    verified_at = verified_at or tehran_now()
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO novaself_join_verified (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
-            (user_id,)
-        )
+        cursor.execute('''
+            INSERT INTO novaself_join_verified (user_id, verified_at, channels_snapshot)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                verified_at = EXCLUDED.verified_at,
+                channels_snapshot = EXCLUDED.channels_snapshot
+        ''', (user_id, verified_at, channels_snapshot))
         conn.commit()
     except Exception as e:
         logging.error(f"❌ خطا در ثبت تأیید عضویت کاربر {user_id}: {e}")
@@ -1929,16 +1963,41 @@ def mark_user_verified_db(user_id):
         if conn:
             conn.close()
 
-def get_all_verified_users_db():
+def clear_user_verified_db(user_id):
+    """پاک‌کردن رکورد تأیید یک کاربر (مثلاً اگر ادمین بخواهد کاربری را دستی مجبور به جوین مجدد کند)."""
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM novaself_join_verified")
-        return [row[0] for row in cursor.fetchall()]
+        cursor.execute("DELETE FROM novaself_join_verified WHERE user_id = %s", (user_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.error(f"❌ خطا در حذف تأیید عضویت کاربر {user_id}: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_all_verified_users_db():
+    """
+    خروجی: دیکشنری {user_id: {"verified_at": datetime, "snapshot": str}}
+    (قبلاً فقط لیست ساده‌ی آیدی‌ها برمی‌گشت که امکان تشخیص «قدیمی/منقضی‌شده» را نمی‌داد.)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, verified_at, channels_snapshot FROM novaself_join_verified")
+        result = {}
+        for row in cursor.fetchall():
+            result[row[0]] = {"verified_at": row[1], "snapshot": row[2] or ""}
+        return result
     except Exception as e:
         logging.error(f"❌ خطا در بارگذاری کاربران تأییدشده: {e}")
-        return []
+        return {}
     finally:
         if conn:
             conn.close()
@@ -2177,8 +2236,52 @@ def load_join_gate_cache():
     """بارگذاری اولیه‌ی کش‌های جوین اجباری در استارتاپ."""
     global verified_users
     reload_join_channels_cache()
-    verified_users = set(get_all_verified_users_db())
+    verified_users = get_all_verified_users_db()
     logging.info(f"🔐 جوین اجباری: {len(join_channels_cache)} کانال فعال، {len(verified_users)} کاربر تأییدشده.")
+
+def _join_channels_snapshot():
+    """
+    یک رشته‌ی کوتاه و پایدار که «هویتِ» ست فعلیِ کانال‌های فعال را نشان می‌دهد
+    (آیدی‌های کانال‌های فعال، مرتب‌شده). هر بار که ادمین کانالی اضافه/حذف/غیرفعال
+    کند، این رشته عوض می‌شود؛ همین تغییر است که باعث می‌شود کاربرانی که قبلاً با
+    ست قدیمیِ کانال‌ها تأیید شده بودند، دوباره وارد مسیر بررسی شوند.
+    """
+    return ",".join(str(ch["id"]) for ch in sorted(join_channels_cache, key=lambda c: c["id"]))
+
+def needs_join_check(user_id):
+    """
+    تصمیم می‌گیرد که آیا باید عضویت این کاربر را دوباره واقعاً از تلگرام استعلام
+    کنیم یا تأییدِ قبلی‌اش هنوز معتبر است. این تابع سبک است (فقط یک lookup روی
+    دیکشنری در حافظه)، پس صدا زدنش در هر تعامل (نه فقط /start) هزینه‌ی محسوسی ندارد؛
+    تماسِ واقعی و نسبتاً سنگین با API تلگرام (check_user_joined_all) فقط وقتی این
+    تابع True برگرداند اجرا می‌شود.
+    """
+    if not join_channels_cache or is_admin(user_id):
+        return False
+
+    record = verified_users.get(user_id)
+    if not record:
+        return True
+
+    # کانال‌های اجباری از آخرین تأیید این کاربر تغییر کرده‌اند (کانال جدید اضافه/
+    # حذف/غیرفعال شده) — باید دوباره برای ستِ جدید چک شود.
+    if record.get("snapshot") != _join_channels_snapshot():
+        return True
+
+    # تأیید قدیمی منقضی شده — دوباره چک می‌کنیم تا کسانی که کانال را ترک کرده‌اند
+    # برای همیشه معاف نمانند.
+    verified_at = record.get("verified_at")
+    if not verified_at:
+        return True
+    age_seconds = (tehran_now() - verified_at).total_seconds()
+    return age_seconds > JOIN_GATE_RECHECK_SECONDS
+
+def _mark_user_verified(user_id):
+    """کاربر را هم در حافظه و هم در دیتابیس، همراه با عکسِ لحظه‌ایِ کانال‌های فعال، تأییدشده ثبت می‌کند."""
+    snapshot = _join_channels_snapshot()
+    now = tehran_now()
+    verified_users[user_id] = {"verified_at": now, "snapshot": snapshot}
+    mark_user_verified_db(user_id, snapshot, now)
 
 async def check_user_joined_all(user_id):
     """
@@ -2241,10 +2344,13 @@ async def _send_join_gate(event, user_id, missing_channels):
 def get_joingate_admin_text():
     channels = list_join_channels_db()
     verified_count = get_verified_count_db()
+    recheck_hours = JOIN_GATE_RECHECK_SECONDS // 3600
     lines = [
         "🔔 **مدیریت جوین اجباری**\n",
         f"تعداد کانال‌ها: {len(channels)}",
-        f"کاربران تأییدشده تاکنون: {verified_count}\n",
+        f"کاربران تأییدشده (حداکثر تا {recheck_hours} ساعت اخیر): {verified_count}\n",
+        "ℹ️ عضویت هر کاربر همیشگی نیست: هر چند ساعت یک‌بار و هر بار که کانال‌های این "
+        "لیست تغییر کند (افزوده/حذف/غیرفعال شود)، دوباره از تلگرام استعلام می‌شود.\n",
         "برای مدیریت هر کانال روی آن کلیک کنید:"
     ]
     return "\n".join(lines)
@@ -5264,11 +5370,10 @@ async def start_handler(event):
     user = user_data[user_id]
 
     # جوین اجباری: ادمین‌ها معاف هستند تا هیچ‌وقت خودشان از پنل قفل نشوند.
-    if join_channels_cache and user_id not in verified_users and not is_admin(user_id):
+    if needs_join_check(user_id):
         all_joined, missing = await check_user_joined_all(user_id)
         if all_joined:
-            verified_users.add(user_id)
-            mark_user_verified_db(user_id)
+            _mark_user_verified(user_id)
         else:
             await _send_join_gate(event, user_id, missing)
             return
@@ -5354,14 +5459,27 @@ async def callback_handler(event):
     if data == b"join_verify_check":
         all_joined, missing = await check_user_joined_all(user_id)
         if all_joined:
-            verified_users.add(user_id)
-            mark_user_verified_db(user_id)
+            _mark_user_verified(user_id)
             user = user_data.get(user_id) or make_default_user(step="menu")
             user_data[user_id] = user
             await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
         else:
             await event.answer("برای استفاده از ربات، ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
         return
+
+    # ====== گیت جوین اجباری (بندِ بازسازی): فقط دکمه‌ی «تایید عضویت» بالا از این
+    # گیت معاف است. این چک روی هر کلیکی اجرا می‌شود (نه فقط /start) تا کاربری که
+    # مدت‌هاست /start نزده یا از کانال لفت داده، همچنان از استفاده باز نماند.
+    # چون needs_join_check سبک است (lookup در حافظه)، تماس واقعاً سنگین با API
+    # تلگرام (check_user_joined_all) فقط وقتی واقعاً لازم باشد اجرا می‌شود.
+    if needs_join_check(user_id):
+        all_joined, missing = await check_user_joined_all(user_id)
+        if all_joined:
+            _mark_user_verified(user_id)
+        else:
+            await event.answer("⛔ ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
+            await _send_join_gate(event, user_id, missing)
+            return
 
     # ====== منوی ادمین ======
     if is_admin(user_id):
@@ -7386,6 +7504,20 @@ async def message_handler(event):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
         return
 
+    # ====== گیت جوین اجباری ======
+    # این چک هم اینجا (نه فقط روی /start) تکرار می‌شود تا کاربرانی که مدت‌ها با
+    # ربات کار کرده‌اند و دیگر /start نمی‌زنند هم از قلم نیفتند. عمداً وقتی کاربر
+    # وسط فرآیند نصب سلف (وارد کردن شماره/کد/رمز دو مرحله‌ای) است این گیت اجرا
+    # نمی‌شود؛ چون OTP تلگرام زمان محدودی دارد و متوقف‌کردنِ کاربر وسط آن فرآیند
+    # برای اجبار به جوین، می‌تواند باعث از‌دست‌رفتن کدِ ورود شود.
+    if user_id not in generator_data and user_id not in active_signins and needs_join_check(user_id):
+        all_joined, missing = await check_user_joined_all(user_id)
+        if all_joined:
+            _mark_user_verified(user_id)
+        else:
+            await _send_join_gate(event, user_id, missing)
+            return
+
     # ====== افزودن پاسخ خودکار (دو مرحله‌ای: Trigger سپس Response) ======
     if user_id in user_data and user_data[user_id].get("step") == "autoreply_get_trigger":
         trigger_text = text.strip()
@@ -7574,21 +7706,45 @@ async def message_handler(event):
             action["step"] = "get_identifier"
             await event.respond(
                 "حالا شناسه‌ی کانال را مشخص کنید — یکی از این دو راه:\n\n"
-                "1️⃣ یک پیام از همان کانال را Forward کنید (ساده‌ترین و مطمئن‌ترین روش)\n"
-                "2️⃣ یا شناسه را به‌صورت متن بفرستید: `@channel_username` یا آیدی عددی کانال\n\n"
+                "1️⃣ **(پیشنهادی)** یک پیام از همان کانال را Forward کنید — تنها راهی که "
+                "برای کانال خصوصی هم همیشه کار می‌کند، به‌شرطی که ربات از قبل عضو آن باشد.\n"
+                "2️⃣ یا `@channel_username` را متنی بفرستید (فقط برای کانال‌های عمومی؛ "
+                "آیدی عددی خام معمولاً کار نمی‌کند مگر ربات قبلاً به‌نوعی این کانال را دیده باشد).\n\n"
                 "⚠️ در هر دو حالت، ربات باید از قبل عضو (ترجیحاً ادمین) آن کانال باشد.",
                 buttons=cancel_kb
             )
             return
 
         if action["step"] == "get_identifier":
-            # ساده‌ترین و مطمئن‌ترین راه: ادمین یک پیام از همان کانال را Forward کند؛
-            # این‌طوری شناسه‌ی دقیق کانال (بدون خطای تایپی در آیدی عددی) به‌دست می‌آید.
+            # روش پیشنهادی و مطمئن: فوروارد یک پیام از همان کانال.
+            #
+            # رفعِ باگِ واقعی («ربات از قبل ادمین بود ولی حتی با فوروارد هم گفت
+            # ادمین نیست»): نسخه‌ی قبلی از دو جای اشتباه استفاده می‌کرد:
+            #   ۱) fwd.chat یک PROPERTY همزمان است که فقط از کشِ محلیِ خودِ کتابخانه
+            #      می‌خواند و هیچ تماسی با تلگرام نمی‌زند؛ اگر این entity قبلاً کش
+            #      نشده بود (خیلی محتمل، چون این اولین باری بود که ربات به این
+            #      کانال برمی‌خورد)، یا None برمی‌گرداند یا نسخه‌ی ناقص/min بدون
+            #      access_hash معتبر.
+            #   ۲) برای جبران آن، به‌عنوان fallback سراغ bot.iter_dialogs() می‌رفت؛
+            #      اما طبق مستندات رسمی Telethon، اکانت‌های بات اصلاً «دیالوگ»
+            #      ندارند و این متد روی اکانت بات همیشه شکست می‌خورد یا خالی
+            #      برمی‌گردد — پس این fallback هیچ‌وقت، برای هیچ کانالی، حتی وقتی
+            #      ربات واقعاً ادمین بود، جواب نمی‌داد.
+            # راه‌حل درست: به‌جای fwd.chat از fwd.get_chat() (متد ناهمزم) استفاده
+            # می‌کنیم که واقعاً از تلگرام entity کامل را می‌گیرد (همان چیزی که
+            # مستندات Telethon هم برای رسیدن به entity از طریق پیام فوروارد‌شده
+            # توصیه می‌کند)، و fallback ناکارآمدِ دیالوگ‌ها کامل حذف شد.
             fwd = getattr(event.message, "forward", None)
             resolved_entity = None
-            if fwd and getattr(fwd, "chat", None):
-                resolved_entity = fwd.chat
-            else:
+            resolution_error = None
+
+            if fwd is not None:
+                try:
+                    resolved_entity = await fwd.get_chat()
+                except Exception as e:
+                    resolution_error = e
+
+            if resolved_entity is None and fwd is None:
                 identifier_text = text.strip().lstrip("@")
                 if not identifier_text:
                     await event.respond("❌ شناسه نامعتبر است.", buttons=cancel_kb)
@@ -7600,87 +7756,40 @@ async def message_handler(event):
                 try:
                     resolved_entity = await bot.get_entity(identifier_text)
                 except Exception as e:
-                    await event.respond(
-                        "❌ **این کانال پیدا نشد.**\n\n"
-                        f"جزئیات: `{e}`\n\n"
-                        "برای کانال‌های خصوصی، ساده‌ترین راه این است که یک پیام از همان کانال را "
-                        "برای ربات Forward کنید (به‌جای وارد کردن آیدی عددی دستی).",
-                        buttons=cancel_kb
-                    )
-                    return
+                    resolution_error = e
 
-            # اعتبارسنجی فوری: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد، وگرنه
-            # جوین اجباری برای این کانال هرگز کار نخواهد کرد (بند رفع باگ).
-            #
-            # نکته‌ی مهم (رفعِ گزارشِ «ربات از اول ادمین بود ولی گفت جوین نیست»):
-            # entity ای که از فوروارد (fwd.chat) یا از get_entity با آیدی خام به‌دست
-            # می‌آید، ممکن است نسخه‌ی «min» تلگرام باشد (بدون access_hash کاملاً
-            # قابل‌استفاده برای GetParticipantRequest)، حتی اگر ربات واقعاً عضو/ادمین
-            # آن کانال باشد. راه مطمئن برای گرفتن نسخه‌ی کامل و معتبر entity این است
-            # که در لیست دیالوگ‌های زنده‌ی خودِ ربات (که همیشه access_hash درست و
-            # به‌روز کانال‌هایی که واقعاً در آن‌هاست را دارد) دنبالش بگردیم — این کار
-            # به‌طور کامل مستقل از کش/آپدیت‌های ازدست‌رفته است.
+            if resolved_entity is None:
+                await event.respond(
+                    "❌ **این کانال پیدا نشد.**\n\n"
+                    f"جزئیات: `{resolution_error}`\n\n"
+                    "مطمئن‌ترین راه، فوروارد‌کردنِ یک پیام از همان کانال است. توجه: "
+                    "برای کانال‌های خصوصی (یا هر کانالی که آیدی عددی خامش را وارد "
+                    "می‌کنید)، ربات باید از قبل واقعاً در آن کانال عضو باشد — چون "
+                    "تلگرام فقط entity کانال‌هایی را که ربات از قبل «دیده» (عضو "
+                    "است، یا @username دارد، یا پیامی از آن فوروارد شده) به ربات می‌دهد.",
+                    buttons=cancel_kb
+                )
+                return
+
+            # اعتبارسنجی: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد، وگرنه
+            # جوین اجباری برای این کانال هرگز کار نخواهد کرد.
             try:
                 my_perms = await bot.get_permissions(resolved_entity)
                 if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
                     raise ChatAdminRequiredError(request=None)
-            except Exception as first_err:
-                target_id = getattr(resolved_entity, "id", None)
-                resolved_from_dialogs = None
-                if target_id is not None:
-                    try:
-                        # اشتباهِ نسخه‌ی قبلی همین‌جا بود: d.id مقدارِ «مارک‌شده»ی
-                        # دیالوگ است (برای کانال‌ها همیشه منفی و با پیشوندِ -100،
-                        # طبق مستندات رسمی Telethon — مثلاً کانال با id خامِ 456 در
-                        # دیالوگ‌ها به‌صورت -1000000000456 دیده می‌شود)، در حالی که
-                        # resolved_entity.id مقدارِ خامِ id کانال است (همان 456،
-                        # بدون علامت منفی/بدون -100). مقایسه‌ی مستقیمِ این دو همیشه
-                        # False می‌شد و کل fallback عملاً کاری نمی‌کرد. برای همین حالا
-                        # id خامِ خودِ entity هر دیالوگ (d.entity.id) را با id خامِ
-                        # entity هدف مقایسه می‌کنیم — هر دو در یک فرمت.
-                        async for d in bot.iter_dialogs():
-                            if d.entity is not None and getattr(d.entity, "id", None) == target_id:
-                                resolved_from_dialogs = d.entity
-                                break
-                    except Exception:
-                        pass
-
-                if resolved_from_dialogs is None:
-                    bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
-                    await event.respond(
-                        f"❌ **{bot_mention} در لیست چت‌های خودش این کانال را پیدا نکرد.**\n\n"
-                        f"جزئیات فنی: `{first_err}`\n\n"
-                        f"اگر مطمئن هستید {bot_mention} از قبل در این کانال عضو/ادمین است (نه اکانت سلف)، "
-                        "معمولاً دلیلش این است که ربات وقتی به کانال اضافه شده، آفلاین بوده (مثلاً هنگام "
-                        "ری‌استارتِ سرور روی Railway) و آپدیتِ عضویت را از دست داده. راه‌حل: یک پیام جدید در "
-                        f"کانال بفرستید (یا {bot_mention} را یک‌بار حذف و دوباره اضافه کنید) تا آپدیت تازه "
-                        "برسد، سپس دوباره امتحان کنید.",
-                        buttons=cancel_kb
-                    )
-                    return
-
-                resolved_entity = resolved_from_dialogs
-                try:
-                    my_perms = await bot.get_permissions(resolved_entity)
-                    if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
-                        raise ChatAdminRequiredError(request=None)
-                except Exception as e:
-                    # این نقطه یعنی حتی بعد از جست‌وجو در دیالوگ‌های زنده‌ی ربات هم
-                    # این کانال پیدا/تأیید نشد — یعنی واقعاً ربات (نه اکانت سلف کاربر)
-                    # در این کانال عضو نیست. یادآوری: این چک مربوط به «خودِ ربات»
-                    # (اکانتی که با BOT_TOKEN بالا آمده، یعنی @BOT_USERNAME) است، نه
-                    # اکانتِ سلف/یوزربات کاربران.
-                    bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
-                    await event.respond(
-                        f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
-                        f"جزئیات: `{e}`\n\n"
-                        f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
-                        f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
-                        "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
-                        "بدون این مرحله، بررسی عضویت کاربران کار نخواهد کرد.",
-                        buttons=cancel_kb
-                    )
-                    return
+            except Exception as e:
+                bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
+                await event.respond(
+                    f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
+                    f"جزئیات: `{e}`\n\n"
+                    f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
+                    f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
+                    "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
+                    "اگر مطمئنید ربات از قبل عضو است، یک پیام جدید در کانال بفرستید (تا "
+                    "آپدیت عضویت به ربات برسد) و دوباره امتحان کنید.",
+                    buttons=cancel_kb
+                )
+                return
 
             action["identifier"] = str(resolved_entity.id)
             action["resolved_title"] = getattr(resolved_entity, "title", None) or getattr(resolved_entity, "username", None)
