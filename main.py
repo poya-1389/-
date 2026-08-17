@@ -7831,8 +7831,17 @@ async def message_handler(event):
                 return
 
             # اعتبارسنجی نهایی: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد.
+            #
+            # باگِ واقعیِ همین چک (که بارها هرچه درست بود باز «ادمین نیست» نشان
+            # می‌داد): get_permissions(entity) بدون مشخص‌کردنِ کاربر، اصلاً وضعیتِ
+            # خودِ بات را چک نمی‌کند — طبق مستندات رسمی Telethon، این حالت
+            # «مجوزهای پیش‌فرضِ کلیِ چت» (default banned rights) را برمی‌گرداند که
+            # هیچ ربطی به ادمین‌بودنِ بات ندارد. برای همین همیشه is_admin/is_creator/
+            # is_member همه False بودند و خودِ همین کد (نه تلگرام) خطای مصنوعیِ
+            # ChatAdminRequiredError صادر می‌کرد. برای چک‌کردنِ وضعیتِ خودِ بات، باید
+            # صریحاً 'me' را به‌عنوان کاربر پاس بدهیم.
             try:
-                my_perms = await bot.get_permissions(resolved_entity)
+                my_perms = await bot.get_permissions(resolved_entity, 'me')
                 if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
                     raise ChatAdminRequiredError(request=None)
             except Exception as e:
