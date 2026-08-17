@@ -58,7 +58,17 @@ if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
 if not ADMIN_IDS:
     logging.warning("⚠️ هشدار: هیچ ادمینی تنظیم نشده است!")
 
-bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# catch_up=True: بدون این، Telethon پیش‌فرض روی False است و آپدیت‌هایی که در
+# حین قطعی/ری‌استارت (مثلاً روی Railway) رخ داده‌اند (از جمله «ربات به فلان کانال
+# اضافه/ادمین شد») از دست می‌روند و کش انتیتیِ کانال هیچ‌وقت پر نمی‌شود — حتی اگر
+# ربات واقعاً عضو/ادمین آن کانال باشد (همان دلیل اصلیِ خطای گمراه‌کننده‌ی
+# «ربات ادمین نشده» در بخش جوین اجباری، وقتی ربات از قبل واقعاً ادمین بوده است).
+# catch_up=True: بدون این، Telethon پیش‌فرض روی False است و آپدیت‌هایی که در
+# حین قطعی/ری‌استارت (مثلاً روی Railway) رخ داده‌اند (از جمله «ربات به فلان کانال
+# اضافه/ادمین شد») از دست می‌روند و کش انتیتیِ کانال هیچ‌وقت پر نمی‌شود — حتی اگر
+# ربات واقعاً عضو/ادمین آن کانال باشد (همان دلیل اصلیِ خطای گمراه‌کننده‌ی
+# «ربات ادمین نشده» در بخش جوین اجباری، وقتی ربات از قبل واقعاً ادمین بوده است).
+bot = TelegramClient('helper_bot', API_ID, API_HASH, catch_up=True).start(bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ======================== تنظیمات سیستم الماس ========================
@@ -7601,28 +7611,67 @@ async def message_handler(event):
 
             # اعتبارسنجی فوری: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد، وگرنه
             # جوین اجباری برای این کانال هرگز کار نخواهد کرد (بند رفع باگ).
+            #
+            # نکته‌ی مهم (رفعِ گزارشِ «ربات از اول ادمین بود ولی گفت جوین نیست»):
+            # entity ای که از فوروارد (fwd.chat) یا از get_entity با آیدی خام به‌دست
+            # می‌آید، ممکن است نسخه‌ی «min» تلگرام باشد (بدون access_hash کاملاً
+            # قابل‌استفاده برای GetParticipantRequest)، حتی اگر ربات واقعاً عضو/ادمین
+            # آن کانال باشد. راه مطمئن برای گرفتن نسخه‌ی کامل و معتبر entity این است
+            # که در لیست دیالوگ‌های زنده‌ی خودِ ربات (که همیشه access_hash درست و
+            # به‌روز کانال‌هایی که واقعاً در آن‌هاست را دارد) دنبالش بگردیم — این کار
+            # به‌طور کامل مستقل از کش/آپدیت‌های ازدست‌رفته است.
             try:
                 my_perms = await bot.get_permissions(resolved_entity)
                 if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
                     raise ChatAdminRequiredError(request=None)
-            except Exception as e:
-                # نکته‌ی مهم که باعث سردرگمی می‌شود: این چک مربوط به «خودِ ربات»
-                # (همان اکانتی که با BOT_TOKEN بالا آمده، یعنی @BOT_USERNAME) است،
-                # نه اکانتِ سلف/یوزربات کاربران. اضافه‌کردن اکانت سلف به‌عنوان ادمین
-                # کانال هیچ ربطی به این چک ندارد؛ کافی است @BOT_USERNAME (که پیام‌ها
-                # را می‌فرستد) در کانال عضو/ادمین شود. برای همین یوزرنیم دقیق ربات را
-                # هم توی پیام خطا می‌آوریم تا اشتباه گرفته نشود.
-                bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
-                await event.respond(
-                    f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
-                    f"جزئیات: `{e}`\n\n"
-                    f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
-                    f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
-                    "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
-                    "بدون این مرحله، بررسی عضویت کاربران کار نخواهد کرد.",
-                    buttons=cancel_kb
-                )
-                return
+            except Exception as first_err:
+                target_id = getattr(resolved_entity, "id", None)
+                resolved_from_dialogs = None
+                if target_id is not None:
+                    try:
+                        async for d in bot.iter_dialogs():
+                            if d.id == target_id:
+                                resolved_from_dialogs = d.entity
+                                break
+                    except Exception:
+                        pass
+
+                if resolved_from_dialogs is None:
+                    bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
+                    await event.respond(
+                        f"❌ **{bot_mention} در لیست چت‌های خودش این کانال را پیدا نکرد.**\n\n"
+                        f"جزئیات فنی: `{first_err}`\n\n"
+                        f"اگر مطمئن هستید {bot_mention} از قبل در این کانال عضو/ادمین است (نه اکانت سلف)، "
+                        "معمولاً دلیلش این است که ربات وقتی به کانال اضافه شده، آفلاین بوده (مثلاً هنگام "
+                        "ری‌استارتِ سرور روی Railway) و آپدیتِ عضویت را از دست داده. راه‌حل: یک پیام جدید در "
+                        f"کانال بفرستید (یا {bot_mention} را یک‌بار حذف و دوباره اضافه کنید) تا آپدیت تازه "
+                        "برسد، سپس دوباره امتحان کنید.",
+                        buttons=cancel_kb
+                    )
+                    return
+
+                resolved_entity = resolved_from_dialogs
+                try:
+                    my_perms = await bot.get_permissions(resolved_entity)
+                    if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
+                        raise ChatAdminRequiredError(request=None)
+                except Exception as e:
+                    # این نقطه یعنی حتی بعد از جست‌وجو در دیالوگ‌های زنده‌ی ربات هم
+                    # این کانال پیدا/تأیید نشد — یعنی واقعاً ربات (نه اکانت سلف کاربر)
+                    # در این کانال عضو نیست. یادآوری: این چک مربوط به «خودِ ربات»
+                    # (اکانتی که با BOT_TOKEN بالا آمده، یعنی @BOT_USERNAME) است، نه
+                    # اکانتِ سلف/یوزربات کاربران.
+                    bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
+                    await event.respond(
+                        f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
+                        f"جزئیات: `{e}`\n\n"
+                        f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
+                        f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
+                        "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
+                        "بدون این مرحله، بررسی عضویت کاربران کار نخواهد کرد.",
+                        buttons=cancel_kb
+                    )
+                    return
 
             action["identifier"] = str(resolved_entity.id)
             action["resolved_title"] = getattr(resolved_entity, "title", None) or getattr(resolved_entity, "username", None)
