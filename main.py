@@ -22,7 +22,7 @@ from telethon.errors import (
     UserNotParticipantError, ChatAdminRequiredError,
 )
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
+from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest, CheckChatInviteRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import (
@@ -32,7 +32,7 @@ from telethon.tl.types import (
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
-    DocumentAttributeAnimated,
+    DocumentAttributeAnimated, ChatInviteAlready,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -2287,13 +2287,24 @@ async def check_user_joined_all(user_id):
     """
     بررسی عضویت کاربر در تمام کانال‌های فعالِ جوین اجباری با کلاینت بات.
 
-    برخلاف نسخه‌ی قبلی (که هر خطا را نادیده می‌گرفت و همین باعث می‌شد کل قابلیت
-    بی‌صدا از کار بیفتد)، اینجا فقط UserNotParticipantError به معنای واقعیِ
-    «کاربر عضو نیست» است. هر خطای دیگر (مثلاً ChatAdminRequiredError چون بات در
-    آن کانال ادمین نیست) یعنی ما اصلاً نمی‌توانیم عضویت را تأیید کنیم — و طبق
-    منطق درست برای یک قابلیت امنیتی/محدودکننده، این حالت هم باید Fail-Closed باشد
-    (یعنی کاربر را عضو در نظر نگیریم)، نه Fail-Open که کل جوین اجباری را بی‌اثر
-    می‌کرد. خطا هم بلند در لاگ ثبت می‌شود تا ادمین بفهمد کانالی درست تنظیم نشده.
+    فقط UserNotParticipantError به معنای واقعیِ «کاربر عضو نیست» است. هر خطای
+    دیگر (مثلاً ChatAdminRequiredError چون بات در آن کانال ادمین نیست) یعنی ما
+    اصلاً نمی‌توانیم عضویت را تأیید کنیم — و طبق منطق درست برای یک قابلیت
+    امنیتی/محدودکننده، این حالت هم باید Fail-Closed باشد (یعنی کاربر را عضو در
+    نظر نگیریم)، نه Fail-Open که کل جوین اجباری را بی‌اثر می‌کرد.
+
+    نکته‌ی مهم (خودترمیمی بعد از هر ری‌دیپلوی روی Railway): چون bot با یک سشنِ
+    فایلیِ SQLite بالا می‌آید (`TelegramClient('helper_bot', ...)`) و روی Railway
+    فایل‌سیستم معمولاً پایدار/دائمی نیست، بعد از هر ری‌دیپلوی/ری‌استارت این کش
+    entity به‌طور کامل از بین می‌رود؛ یعنی تلاش اول (با شناسه‌ی عددی خامِ ذخیره‌شده)
+    ممکن است شکست بخورد، حتی اگر بات هنوز واقعاً عضو/ادمین همان کانال باشد. اگر
+    فقط به همین تلاش اول بسنده می‌کردیم، جوین اجباری بعد از هر ری‌دیپلوی از کار
+    می‌افتاد تا ادمین دستی دوباره کانال را اضافه کند. برای همین، اگر تلاش اول با
+    شناسه‌ی خام شکست بخورد (و علتش «کاربر عضو نیست» نباشد)، یک‌بار دیگر از روی
+    همان لینک دعوتیِ ذخیره‌شده (با _resolve_channel_from_link، دقیقاً همان تابعی
+    که هنگام افزودن کانال استفاده می‌شود) entity را تازه resolve کرده و دوباره
+    امتحان می‌کنیم — بدون نیاز به هیچ دخالت دستی.
+
     خروجی: (all_joined: bool, missing_channels: list[dict])
     """
     missing = []
@@ -2308,21 +2319,94 @@ async def check_user_joined_all(user_id):
             perms = await bot.get_permissions(identifier, user_id)
             if not perms or not perms.is_member:
                 missing.append(ch)
+            continue
         except UserNotParticipantError:
             missing.append(ch)
-        except (ChatAdminRequiredError, ChannelPrivateError) as e:
+            continue
+        except Exception:
+            pass  # می‌رویم سراغ تلاش دوم (resolve تازه از روی لینک) پایین
+
+        resolved_entity, resolve_err = await _resolve_channel_from_link(ch.get("invite_link", ""))
+        if resolved_entity is None:
             bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
             logging.error(
                 f"⚠️ جوین اجباری: {bot_mention} به کانال «{ch['title']}» (شناسه: {ch['identifier']}) دسترسی کافی "
-                f"ندارد یا در آن عضو/ادمین نیست ({e}). این کانال به‌عنوان «عضو نشده» در نظر گرفته می‌شود تا "
-                f"قابلیت جوین اجباری بی‌اثر نشود — لطفاً از پنل ادمین بررسی کنید که خودِ {bot_mention} "
+                f"ندارد یا در آن عضو/ادمین نیست ({resolve_err}). این کانال به‌عنوان «عضو نشده» در نظر گرفته می‌شود "
+                f"تا قابلیت جوین اجباری بی‌اثر نشود — لطفاً از پنل ادمین بررسی کنید که خودِ {bot_mention} "
                 "(نه اکانت سلف کاربران) در این کانال عضو/ادمین باشد."
             )
+            missing.append(ch)
+            continue
+
+        try:
+            perms = await bot.get_permissions(resolved_entity, user_id)
+            if not perms or not perms.is_member:
+                missing.append(ch)
+        except UserNotParticipantError:
             missing.append(ch)
         except Exception as e:
             log_internal_error("check_joined", f"channel_id={ch.get('id')} identifier={identifier} err={e}")
             missing.append(ch)
     return (len(missing) == 0), missing
+
+async def _resolve_channel_from_link(link):
+    """
+    مطمئن‌ترین راهِ resolve کردنِ یک کانال برای اکانت بات، بدون هیچ وابستگی به
+    کش/سشن قبلی، دیالوگ‌ها، یا فوروارد پیام:
+
+    - اگر لینک عمومی باشد (t.me/username): مستقیماً با ResolveUsername حل می‌شود.
+      این متد همیشه برای بات کار می‌کند چون نیازی به access_hash از قبل ندارد.
+
+    - اگر لینک دعوتیِ خصوصی باشد (t.me/+HASH یا t.me/joinchat/HASH): با
+      CheckChatInviteRequest بررسی می‌شود. طبق مستندات رسمی تلگرام، اگر اکانتِ
+      فراخوان (اینجا بات) از قبل واقعاً عضوِ آن چت باشد، تلگرام یک شیء
+      ChatInviteAlready برمی‌گرداند که فیلدِ chat آن، entity کامل و معتبر (با
+      access_hash درست) است — دقیقاً چیزی که لازم داریم، مستقل از اینکه بات قبلاً
+      این کانال را از راه دیگری «دیده» باشد یا نه. این روش جایگزینِ دو تلاش قبلی
+      (fwd.chat / fwd.get_chat و جست‌وجو در iter_dialogs) شد، چون آن‌ها یا فقط
+      نسخه‌ی ناقص/min برمی‌گرداندند یا اصلاً برای اکانت بات کار نمی‌کردند
+      (iter_dialogs یک متدِ مخصوصِ اکانت کاربری است، نه بات).
+
+    خروجی: (entity یا None, پیام‌خطا یا None)
+    """
+    link = (link or "").strip()
+    m = re.match(r'^(?:https?://)?(?:www\.)?t\.me/(.+)$', link, re.IGNORECASE)
+    tail = m.group(1) if m else link.lstrip("@")
+    tail = tail.split("?")[0].strip("/")
+
+    if not tail:
+        return None, "لینک نامعتبر است."
+
+    try:
+        if tail.startswith("+"):
+            invite_hash = tail[1:]
+        elif tail.lower().startswith("joinchat/"):
+            invite_hash = tail[len("joinchat/"):]
+        else:
+            invite_hash = None
+
+        if invite_hash:
+            try:
+                result = await bot(CheckChatInviteRequest(invite_hash))
+            except Exception as e:
+                return None, e
+            if isinstance(result, ChatInviteAlready):
+                return result.chat, None
+            return None, (
+                "طبق پاسخ تلگرام، ربات هنوز از طریق این لینک عضو این کانال نشده است "
+                "(لینک معتبر است، ولی ربات را باید یک ادمین دستی به کانال اضافه کند؛ "
+                "بات‌ها معمولاً نمی‌توانند صرفاً با لینک دعوت خودشان عضو شوند)."
+            )
+
+        # لینک عمومی: بخشی که بعد از t.me/ آمده، یوزرنیم کانال است.
+        username = tail.split("/")[0]
+        try:
+            entity = await bot.get_entity(username)
+            return entity, None
+        except Exception as e:
+            return None, e
+    except Exception as e:
+        return None, e
 
 # ======================== رابط کاربری جوین اجباری (سمت کاربر) ========================
 JOIN_REQUIRED_TEXT = (
@@ -7703,76 +7787,50 @@ async def message_handler(event):
                 await event.respond("❌ لطفاً یک نام معتبر ارسال کنید.", buttons=cancel_kb)
                 return
             action["title"] = title[:64]
-            action["step"] = "get_identifier"
+            action["step"] = "get_link"
             await event.respond(
-                "حالا شناسه‌ی کانال را مشخص کنید — یکی از این دو راه:\n\n"
-                "1️⃣ **(پیشنهادی)** یک پیام از همان کانال را Forward کنید — تنها راهی که "
-                "برای کانال خصوصی هم همیشه کار می‌کند، به‌شرطی که ربات از قبل عضو آن باشد.\n"
-                "2️⃣ یا `@channel_username` را متنی بفرستید (فقط برای کانال‌های عمومی؛ "
-                "آیدی عددی خام معمولاً کار نمی‌کند مگر ربات قبلاً به‌نوعی این کانال را دیده باشد).\n\n"
-                "⚠️ در هر دو حالت، ربات باید از قبل عضو (ترجیحاً ادمین) آن کانال باشد.",
+                "حالا **لینک عضویت کانال** را ارسال کنید (نه شناسه یا فوروارد پیام):\n\n"
+                "• کانال عمومی: `https://t.me/channel_username`\n"
+                "• کانال خصوصی: `https://t.me/+xxxxxxxxxx`\n\n"
+                "⚠️ ربات باید از قبل واقعاً در این کانال عضو باشد (ترجیحاً با دسترسی ادمین)؛ "
+                "همین لینک هم برای شناسایی دقیق کانال استفاده می‌شود و هم به‌عنوان دکمه‌ی "
+                "«عضویت» به کاربران نشان داده خواهد شد.",
                 buttons=cancel_kb
             )
             return
 
-        if action["step"] == "get_identifier":
-            # روش پیشنهادی و مطمئن: فوروارد یک پیام از همان کانال.
-            #
+        if action["step"] == "get_link":
             # رفعِ باگِ واقعی («ربات از قبل ادمین بود ولی حتی با فوروارد هم گفت
-            # ادمین نیست»): نسخه‌ی قبلی از دو جای اشتباه استفاده می‌کرد:
-            #   ۱) fwd.chat یک PROPERTY همزمان است که فقط از کشِ محلیِ خودِ کتابخانه
-            #      می‌خواند و هیچ تماسی با تلگرام نمی‌زند؛ اگر این entity قبلاً کش
-            #      نشده بود (خیلی محتمل، چون این اولین باری بود که ربات به این
-            #      کانال برمی‌خورد)، یا None برمی‌گرداند یا نسخه‌ی ناقص/min بدون
-            #      access_hash معتبر.
-            #   ۲) برای جبران آن، به‌عنوان fallback سراغ bot.iter_dialogs() می‌رفت؛
-            #      اما طبق مستندات رسمی Telethon، اکانت‌های بات اصلاً «دیالوگ»
-            #      ندارند و این متد روی اکانت بات همیشه شکست می‌خورد یا خالی
-            #      برمی‌گردد — پس این fallback هیچ‌وقت، برای هیچ کانالی، حتی وقتی
-            #      ربات واقعاً ادمین بود، جواب نمی‌داد.
-            # راه‌حل درست: به‌جای fwd.chat از fwd.get_chat() (متد ناهمزم) استفاده
-            # می‌کنیم که واقعاً از تلگرام entity کامل را می‌گیرد (همان چیزی که
-            # مستندات Telethon هم برای رسیدن به entity از طریق پیام فوروارد‌شده
-            # توصیه می‌کند)، و fallback ناکارآمدِ دیالوگ‌ها کامل حذف شد.
-            fwd = getattr(event.message, "forward", None)
-            resolved_entity = None
-            resolution_error = None
+            # ادمین نیست»): دو تلاش قبلی هیچ‌کدام برای اکانت بات قابل‌اعتماد نبودند:
+            #   ۱) fwd.chat / fwd.get_chat فقط وقتی چیزی برمی‌گردانند که Telegram
+            #      از قبل entity کامل را در کش/همان پیام گنجانده باشد؛ برای اولین
+            #      برخورد بات با یک کانال خصوصی، معمولاً یک نسخه‌ی ناقص/min
+            #      (بدون access_hash معتبر) برمی‌گردد که چک عضویت رویش شکست می‌خورد.
+            #   ۲) bot.iter_dialogs() اصلاً برای اکانت بات کار نمی‌کند (طبق مستندات
+            #      رسمی Telethon: «bot accounts do not have dialogs»)، پس آن fallback
+            #      همیشه شکست می‌خورد، فارغ از عضویت واقعی بات.
+            # راه‌حل قابل‌اعتماد: از روی همین لینک دعوت، با CheckChatInviteRequest
+            # چک می‌کنیم. طبق مستندات تلگرام، اگر بات از قبل واقعاً عضو آن چت باشد،
+            # پاسخ از نوع ChatInviteAlready است که entity کامل (با access_hash درست)
+            # را همراه خودش دارد — بدون هیچ وابستگی به کش/دیالوگ/فوروارد.
+            link = text.strip()
+            if not link.startswith("http"):
+                await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
+                return
 
-            if fwd is not None:
-                try:
-                    resolved_entity = await fwd.get_chat()
-                except Exception as e:
-                    resolution_error = e
-
-            if resolved_entity is None and fwd is None:
-                identifier_text = text.strip().lstrip("@")
-                if not identifier_text:
-                    await event.respond("❌ شناسه نامعتبر است.", buttons=cancel_kb)
-                    return
-                try:
-                    identifier_text = int(identifier_text)
-                except ValueError:
-                    pass
-                try:
-                    resolved_entity = await bot.get_entity(identifier_text)
-                except Exception as e:
-                    resolution_error = e
+            resolved_entity, resolution_error = await _resolve_channel_from_link(link)
 
             if resolved_entity is None:
                 await event.respond(
                     "❌ **این کانال پیدا نشد.**\n\n"
                     f"جزئیات: `{resolution_error}`\n\n"
-                    "مطمئن‌ترین راه، فوروارد‌کردنِ یک پیام از همان کانال است. توجه: "
-                    "برای کانال‌های خصوصی (یا هر کانالی که آیدی عددی خامش را وارد "
-                    "می‌کنید)، ربات باید از قبل واقعاً در آن کانال عضو باشد — چون "
-                    "تلگرام فقط entity کانال‌هایی را که ربات از قبل «دیده» (عضو "
-                    "است، یا @username دارد، یا پیامی از آن فوروارد شده) به ربات می‌دهد.",
+                    "مطمئن شوید لینک درست است و ربات از قبل واقعاً در این کانال عضو است "
+                    "(نه اکانت سلف — خودِ ربات).",
                     buttons=cancel_kb
                 )
                 return
 
-            # اعتبارسنجی: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد، وگرنه
-            # جوین اجباری برای این کانال هرگز کار نخواهد کرد.
+            # اعتبارسنجی نهایی: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد.
             try:
                 my_perms = await bot.get_permissions(resolved_entity)
                 if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
@@ -7782,32 +7840,16 @@ async def message_handler(event):
                 await event.respond(
                     f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
                     f"جزئیات: `{e}`\n\n"
-                    f"⚠️ توجه: این مورد به اکانت سلف/یوزربات شما ربطی ندارد؛ باید خودِ "
-                    f"ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — ترجیحاً "
-                    "با دسترسی ادمین — سپس دوباره شناسه یا پیام Forward‌شده را ارسال کنید. "
-                    "اگر مطمئنید ربات از قبل عضو است، یک پیام جدید در کانال بفرستید (تا "
-                    "آپدیت عضویت به ربات برسد) و دوباره امتحان کنید.",
+                    f"باید خودِ ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — "
+                    "ترجیحاً با دسترسی ادمین — سپس همین لینک را دوباره ارسال کنید.",
                     buttons=cancel_kb
                 )
                 return
 
-            action["identifier"] = str(resolved_entity.id)
-            action["resolved_title"] = getattr(resolved_entity, "title", None) or getattr(resolved_entity, "username", None)
-            action["step"] = "get_link"
-            await event.respond(
-                f"✅ کانال شناسایی شد: «{action['resolved_title'] or action['identifier']}»\n\n"
-                "حالا لینک عضویت کانال را ارسال کنید (مثال: `https://t.me/channel_username`):",
-                buttons=cancel_kb
-            )
-            return
+            identifier = str(resolved_entity.id)
+            resolved_title = getattr(resolved_entity, "title", None) or getattr(resolved_entity, "username", None)
 
-        if action["step"] == "get_link":
-            link = text.strip()
-            if not link.startswith("http"):
-                await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
-                return
-
-            new_id = create_join_channel_db(action["title"], action["identifier"], link)
+            new_id = create_join_channel_db(action["title"], identifier, link)
             del admin_action_data[user_id]
 
             if new_id is None:
@@ -7817,7 +7859,8 @@ async def message_handler(event):
             reload_join_channels_cache()
             log_admin_action(user_id, 0, "add_joingate", f"id={new_id} title={action['title']}")
             await event.respond(
-                f"✅ کانال «{action['title']}» با موفقیت اضافه شد و بررسی شد که ربات به آن دسترسی دارد.",
+                f"✅ کانال «{action['title']}» (شناسایی‌شده به‌عنوان «{resolved_title or identifier}») "
+                "با موفقیت اضافه شد و بررسی شد که ربات به آن دسترسی دارد.",
                 buttons=get_joingate_admin_keyboard()
             )
             return
