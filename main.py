@@ -2359,21 +2359,19 @@ async def check_user_joined_all(user_id):
 
 async def _resolve_channel_from_link(link):
     """
-    مطمئن‌ترین راهِ resolve کردنِ یک کانال برای اکانت بات، بدون هیچ وابستگی به
-    کش/سشن قبلی، دیالوگ‌ها، یا فوروارد پیام:
+    مطمئن‌ترین راهِ resolve کردنِ یک کانال برای اکانت بات:
 
     - اگر لینک عمومی باشد (t.me/username): مستقیماً با ResolveUsername حل می‌شود.
       این متد همیشه برای بات کار می‌کند چون نیازی به access_hash از قبل ندارد.
 
-    - اگر لینک دعوتیِ خصوصی باشد (t.me/+HASH یا t.me/joinchat/HASH): با
-      CheckChatInviteRequest بررسی می‌شود. طبق مستندات رسمی تلگرام، اگر اکانتِ
-      فراخوان (اینجا بات) از قبل واقعاً عضوِ آن چت باشد، تلگرام یک شیء
-      ChatInviteAlready برمی‌گرداند که فیلدِ chat آن، entity کامل و معتبر (با
-      access_hash درست) است — دقیقاً چیزی که لازم داریم، مستقل از اینکه بات قبلاً
-      این کانال را از راه دیگری «دیده» باشد یا نه. این روش جایگزینِ دو تلاش قبلی
-      (fwd.chat / fwd.get_chat و جست‌وجو در iter_dialogs) شد، چون آن‌ها یا فقط
-      نسخه‌ی ناقص/min برمی‌گرداندند یا اصلاً برای اکانت بات کار نمی‌کردند
-      (iter_dialogs یک متدِ مخصوصِ اکانت کاربری است، نه بات).
+    - اگر لینک دعوتیِ خصوصی باشد (t.me/+HASH یا t.me/joinchat/HASH): طبق پیام
+      رسمی خودِ تلگرام («The API access for bot users is restricted... cannot
+      be executed as a bot»)، CheckChatInviteRequest اصلاً برای اکانت بات مجاز
+      نیست — این یک محدودیت رسمی پلتفرم است، نه چیزی قابل دور‌زدن با کد. برای
+      همین این حالت مستقیماً پیام روشن می‌دهد: تنها راه، ارسال یک پیامِ تازه
+      مستقیماً در خودِ کانال (نه فوروارد) است، چون بات به‌عنوان ادمین آن کانال،
+      آن پست را به‌صورت آپدیت مستقیم دریافت می‌کند و Telethon خودش access_hash
+      کامل را در همان لحظه کش می‌کند.
 
     خروجی: (entity یا None, پیام‌خطا یا None)
     """
@@ -2394,16 +2392,13 @@ async def _resolve_channel_from_link(link):
             invite_hash = None
 
         if invite_hash:
-            try:
-                result = await bot(CheckChatInviteRequest(invite_hash))
-            except Exception as e:
-                return None, e
-            if isinstance(result, ChatInviteAlready):
-                return result.chat, None
             return None, (
-                "طبق پاسخ تلگرام، ربات هنوز از طریق این لینک عضو این کانال نشده است "
-                "(لینک معتبر است، ولی ربات را باید یک ادمین دستی به کانال اضافه کند؛ "
-                "بات‌ها معمولاً نمی‌توانند صرفاً با لینک دعوت خودشان عضو شوند)."
+                "این یک لینک دعوتِ خصوصی است و طبق قوانین رسمی تلگرام، اکانت‌های بات "
+                "اصلاً اجازه‌ی استعلام لینک دعوت را ندارند (این محدودیتِ خودِ تلگرام است، "
+                "نه ربات). راه‌حل: یک پیامِ تازه مستقیماً داخل خودِ کانال پست کنید "
+                "(نه فوروارد به جای دیگر)؛ چون ربات ادمین آن کاناله، همین یک پست کافی است "
+                "تا کانال را بشناسد — سپس دوباره از منوی افزودن کانال، این‌بار "
+                "«@یوزرنیم» (اگر کانال یوزرنیم عمومی دارد) یا آیدی عددی کانال را وارد کنید."
             )
 
         # لینک عمومی: بخشی که بعد از t.me/ آمده، یوزرنیم کانال است.
@@ -7798,35 +7793,51 @@ async def message_handler(event):
             action["step"] = "get_link"
             await event.respond(
                 "حالا **لینک عضویت کانال** را ارسال کنید (نه شناسه یا فوروارد پیام):\n\n"
-                "• کانال عمومی: `https://t.me/channel_username`\n"
-                "• کانال خصوصی: `https://t.me/+xxxxxxxxxx`\n\n"
-                "⚠️ ربات باید از قبل واقعاً در این کانال عضو باشد (ترجیحاً با دسترسی ادمین)؛ "
-                "همین لینک هم برای شناسایی دقیق کانال استفاده می‌شود و هم به‌عنوان دکمه‌ی "
-                "«عضویت» به کاربران نشان داده خواهد شد.",
+                "• کانال عمومی: `https://t.me/channel_username` یا `@channel_username`\n"
+                "• کانال خصوصی: لینک `t.me/+xxxx` را **به‌عنوان لینکِ نمایشی به کاربران** بفرستید "
+                "(برای شناسایی کانال کار نمی‌کند؛ توضیح پایین را ببینید)\n\n"
+                "⚠️ ربات باید از قبل واقعاً در این کانال عضو باشد (ترجیحاً با دسترسی ادمین). "
+                "برای کانال **خصوصی بدون یوزرنیم عمومی**: چون طبق قوانین تلگرام بات‌ها اجازه‌ی "
+                "استعلام لینک دعوت را ندارند، اول یک پیامِ تازه مستقیماً در همان کانال پست کنید "
+                "(نه فوروارد)، بعد همین‌جا آیدی عددی کانال (مثلاً `-1001234567890` یا `1234567890`) "
+                "را بفرستید.",
                 buttons=cancel_kb
             )
             return
 
         if action["step"] == "get_link":
             # رفعِ باگِ واقعی («ربات از قبل ادمین بود ولی حتی با فوروارد هم گفت
-            # ادمین نیست»): دو تلاش قبلی هیچ‌کدام برای اکانت بات قابل‌اعتماد نبودند:
+            # ادمین نیست»): سه تلاش قبلی هیچ‌کدام برای اکانت بات قابل‌اعتماد نبودند:
             #   ۱) fwd.chat / fwd.get_chat فقط وقتی چیزی برمی‌گردانند که Telegram
             #      از قبل entity کامل را در کش/همان پیام گنجانده باشد؛ برای اولین
             #      برخورد بات با یک کانال خصوصی، معمولاً یک نسخه‌ی ناقص/min
             #      (بدون access_hash معتبر) برمی‌گردد که چک عضویت رویش شکست می‌خورد.
-            #   ۲) bot.iter_dialogs() اصلاً برای اکانت بات کار نمی‌کند (طبق مستندات
-            #      رسمی Telethon: «bot accounts do not have dialogs»)، پس آن fallback
-            #      همیشه شکست می‌خورد، فارغ از عضویت واقعی بات.
-            # راه‌حل قابل‌اعتماد: از روی همین لینک دعوت، با CheckChatInviteRequest
-            # چک می‌کنیم. طبق مستندات تلگرام، اگر بات از قبل واقعاً عضو آن چت باشد،
-            # پاسخ از نوع ChatInviteAlready است که entity کامل (با access_hash درست)
-            # را همراه خودش دارد — بدون هیچ وابستگی به کش/دیالوگ/فوروارد.
-            link = text.strip()
-            if not link.startswith("http"):
-                await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
-                return
+            #   ۲) bot.iter_dialogs() اصلاً برای اکانت بات کار نمی‌کند («bot accounts
+            #      do not have dialogs»)، پس آن fallback همیشه شکست می‌خورد.
+            #   ۳) CheckChatInviteRequest هم طبق پیامِ رسمیِ خودِ تلگرام
+            #      («The API access for bot users is restricted... cannot be
+            #      executed as a bot») اصلاً برای بات مجاز نیست — این محدودیتِ
+            #      خودِ پلتفرم است، نه چیزی قابل دور‌زدن.
+            # راه‌حل واقعی برای کانال خصوصی: بعد از اینکه ادمین یک پست تازه مستقیماً
+            # در کانال بگذارد (نه فوروارد)، بات آن پست را به‌صورت آپدیت مستقیم
+            # دریافت و access_hash را خودش کش می‌کند؛ از آن لحظه به بعد، آیدی عددی
+            # خام (یا یوزرنیمِ عمومی، اگر کانال داشته باشد) به‌راحتی resolve می‌شود.
+            text_in = text.strip()
 
-            resolved_entity, resolution_error = await _resolve_channel_from_link(link)
+            if text_in.startswith("http") or text_in.startswith("@"):
+                resolved_entity, resolution_error = await _resolve_channel_from_link(text_in)
+            else:
+                candidate = text_in
+                try:
+                    candidate = int(candidate)
+                except ValueError:
+                    pass
+                try:
+                    resolved_entity = await bot.get_entity(candidate)
+                    resolution_error = None
+                except Exception as e:
+                    resolved_entity = None
+                    resolution_error = e
 
             if resolved_entity is None:
                 await event.respond(
