@@ -2293,6 +2293,14 @@ async def check_user_joined_all(user_id):
     امنیتی/محدودکننده، این حالت هم باید Fail-Closed باشد (یعنی کاربر را عضو در
     نظر نگیریم)، نه Fail-Open که کل جوین اجباری را بی‌اثر می‌کرد.
 
+    نکته‌ی مهم (رفعِ باگِ «کاربر جوین شده ولی می‌گفت جوین نشده»): طبق مستندات
+    رسمی Telethon، فیلدِ perms.is_member فقط برای «عضو عادی» True است و صراحتاً
+    ادمین‌ها و مالکِ کانال را شامل نمی‌شود («not administrator, but not banned
+    either»). اگر کاربری که چک می‌شود خودش ادمین/مالکِ همان کانال باشد (خیلی
+    محتمل، مثلاً موقع تستِ خودِ سازنده‌ی ربات)، فقط چک‌کردنِ is_member نادرست
+    False برمی‌گرداند. برای همین همیشه is_admin و is_creator را هم کنار
+    is_member چک می‌کنیم.
+
     نکته‌ی مهم (خودترمیمی بعد از هر ری‌دیپلوی روی Railway): چون bot با یک سشنِ
     فایلیِ SQLite بالا می‌آید (`TelegramClient('helper_bot', ...)`) و روی Railway
     فایل‌سیستم معمولاً پایدار/دائمی نیست، بعد از هر ری‌دیپلوی/ری‌استارت این کش
@@ -2317,7 +2325,7 @@ async def check_user_joined_all(user_id):
 
         try:
             perms = await bot.get_permissions(identifier, user_id)
-            if not perms or not perms.is_member:
+            if not perms or not (perms.is_member or perms.is_admin or getattr(perms, "is_creator", False)):
                 missing.append(ch)
             continue
         except UserNotParticipantError:
@@ -2340,7 +2348,7 @@ async def check_user_joined_all(user_id):
 
         try:
             perms = await bot.get_permissions(resolved_entity, user_id)
-            if not perms or not perms.is_member:
+            if not perms or not (perms.is_member or perms.is_admin or getattr(perms, "is_creator", False)):
                 missing.append(ch)
         except UserNotParticipantError:
             missing.append(ch)
