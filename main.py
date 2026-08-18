@@ -22,7 +22,7 @@ from telethon.errors import (
     UserNotParticipantError, ChatAdminRequiredError,
 )
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import (
@@ -32,7 +32,7 @@ from telethon.tl.types import (
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
-    DocumentAttributeAnimated, ChatInviteAlready,
+    DocumentAttributeAnimated,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -58,27 +58,10 @@ if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
 if not ADMIN_IDS:
     logging.warning("⚠️ هشدار: هیچ ادمینی تنظیم نشده است!")
 
-# catch_up=True: بدون این، Telethon پیش‌فرض روی False است و آپدیت‌هایی که در
-# حین قطعی/ری‌استارت (مثلاً روی Railway) رخ داده‌اند (از جمله «ربات به فلان کانال
-# اضافه/ادمین شد») از دست می‌روند و کش انتیتیِ کانال هیچ‌وقت پر نمی‌شود — حتی اگر
-# ربات واقعاً عضو/ادمین آن کانال باشد (همان دلیل اصلیِ خطای گمراه‌کننده‌ی
-# «ربات ادمین نشده» در بخش جوین اجباری، وقتی ربات از قبل واقعاً ادمین بوده است).
-# catch_up=True: بدون این، Telethon پیش‌فرض روی False است و آپدیت‌هایی که در
-# حین قطعی/ری‌استارت (مثلاً روی Railway) رخ داده‌اند (از جمله «ربات به فلان کانال
-# اضافه/ادمین شد») از دست می‌روند و کش انتیتیِ کانال هیچ‌وقت پر نمی‌شود — حتی اگر
-# ربات واقعاً عضو/ادمین آن کانال باشد (همان دلیل اصلیِ خطای گمراه‌کننده‌ی
-# «ربات ادمین نشده» در بخش جوین اجباری، وقتی ربات از قبل واقعاً ادمین بوده است).
-bot = TelegramClient('helper_bot', API_ID, API_HASH, catch_up=True).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ======================== تنظیمات سیستم الماس ========================
-# ======================== تنظیمات جوین اجباری ========================
-# مدت اعتبار یک تأیید عضویت. بعد از این مدت، دفعه‌ی بعد که کاربر تعامل کند
-# (کلیک/پیام/استارت)، عضویتش دوباره واقعاً از تلگرام استعلام می‌شود — تا کسی که
-# از کانال لفت داده برای همیشه معاف نماند. مقدار کم باعث افزایش تماس با API
-# تلگرام می‌شود و مقدار خیلی زیاد اثر «اجباری بودن» را کم می‌کند؛ ۶ ساعت تعادل خوبی است.
-JOIN_GATE_RECHECK_SECONDS = 6 * 60 * 60
-
 DIAMOND_RATE_PER_HOUR = 5       # مصرف الماس به ازای هر ساعت روشن بودن سلف
 DIAMOND_PRICE_TOMAN = 20        # قیمت هر الماس به تومان
 BILLING_INTERVAL_SECONDS = 60   # فاصله زمانی محاسبه و کسر الماس
@@ -219,15 +202,9 @@ reaction_targets = {}   # {owner_id: {target_user_id: {"emoji":..., "username":.
 autoreply_cache = {}    # {owner_id: [{"local_id":..., "trigger_text":..., "response_text":..., "entities":..., "media_kind":..., "media_bytes":..., "media_filename":..., "media_mime":...}, ...]} کش پاسخ خودکار (بند ۵-۹)
 autoreply_draft = {}    # {owner_id: {"trigger_text":...}} وضعیت موقت افزودن پاسخ خودکار (دو مرحله‌ای)
 feature_locks = {}      # {user_id: {feature_key, ...}} کش قفل قابلیت‌ها توسط ادمین
-global_feature_locks = set()  # {feature_key, ...} کش قفل سراسری (برای همه‌ی کاربران)
 backup_upload_pending = {}  # {admin_id: dump_dict} بکاپ آپلودشده‌ای که هنوز تأیید نشده
 join_channels_cache = []  # لیست کانال‌های فعالِ جوین اجباری (کش)
-# {user_id: {"verified_at": datetime, "snapshot": str}, ...}
-# برخلاف نسخه‌ی قبلی (یک set ساده که یعنی «یک‌بار برای همیشه تأیید شده»)، اینجا
-# برای هر کاربر زمانِ آخرین تأیید و «عکسِ لحظه‌ایِ» کانال‌های فعال در آن لحظه هم
-# نگه‌داری می‌شود؛ همین دو مقدار است که به needs_join_check() اجازه می‌دهد تشخیص
-# بدهد یک تأییدِ قدیمی هنوز معتبر است یا باید دوباره از کاربر خواسته شود.
-verified_users = {}
+verified_users = set()    # {user_id, ...} کاربرانی که عضویتشان قبلاً تأیید شده
 _background_tasks = set()  # نگه‌داشتن رفرنس Taskهای پس‌زمینه‌ی کوتاه‌مدت تا با GC زودهنگام لغو نشوند
 
 def _spawn_background_task(coro):
@@ -525,15 +502,6 @@ def init_db():
         ''')
         conn.commit()
 
-        # ---------- قفل سراسری قابلیت‌ها (برای همه‌ی کاربران) ----------
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS novaself_global_locks (
-                feature_key TEXT PRIMARY KEY,
-                locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-
         # ---------- جوین اجباری ----------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS novaself_join_channels (
@@ -550,20 +518,10 @@ def init_db():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS novaself_join_verified (
                 user_id BIGINT PRIMARY KEY,
-                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                channels_snapshot TEXT DEFAULT ''
+                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
-
-        # ستون channels_snapshot برای دیپلوی‌های قدیمی‌تر که این جدول را از قبل
-        # (بدون این ستون) دارند، اضافه می‌شود تا نیازی به دراپ‌کردن دستی جدول نباشد.
-        try:
-            cursor.execute("ALTER TABLE novaself_join_verified ADD COLUMN IF NOT EXISTS channels_snapshot TEXT DEFAULT ''")
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ خطا در افزودن ستون channels_snapshot: {e}")
 
         # ---------- سیستم بکاپ ----------
         cursor.execute('''
@@ -1767,66 +1725,7 @@ def unlock_feature_db(user_id, feature_key):
             conn.close()
 
 def is_feature_locked(user_id, feature_key):
-    return feature_key in feature_locks.get(user_id, set()) or feature_key in global_feature_locks
-
-def is_feature_globally_locked(feature_key):
-    return feature_key in global_feature_locks
-
-def get_all_global_locks_db():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT feature_key FROM novaself_global_locks")
-        return [r[0] for r in cursor.fetchall()]
-    except Exception as e:
-        logging.error(f"❌ خطا در بارگذاری قفل‌های سراسری: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-def load_global_locks_cache():
-    global global_feature_locks
-    global_feature_locks = set(get_all_global_locks_db())
-    logging.info(f"🌐 کش قفل سراسری بارگذاری شد: {len(global_feature_locks)} قابلیت قفل‌شده برای همه.")
-
-def lock_feature_globally_db(feature_key):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO novaself_global_locks (feature_key) VALUES (%s) ON CONFLICT (feature_key) DO NOTHING",
-            (feature_key,)
-        )
-        conn.commit()
-        return True
-    except Exception as e:
-        logging.error(f"❌ خطا در قفل سراسری {feature_key}: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-def unlock_feature_globally_db(feature_key):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM novaself_global_locks WHERE feature_key = %s", (feature_key,))
-        conn.commit()
-        return True
-    except Exception as e:
-        logging.error(f"❌ خطا در باز کردن قفل سراسری {feature_key}: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
+    return feature_key in feature_locks.get(user_id, set())
 
 # ======================== جوین اجباری ========================
 def create_join_channel_db(title, identifier, invite_link):
@@ -1933,27 +1832,15 @@ def delete_join_channel_db(channel_id):
         if conn:
             conn.close()
 
-def mark_user_verified_db(user_id, channels_snapshot, verified_at=None):
-    """
-    برخلاف نسخه‌ی قبلی (INSERT ... DO NOTHING که فقط یک‌بار برای همیشه ثبت می‌کرد و
-    دیگر هیچ‌وقت آپدیت نمی‌شد)، این نسخه هر بار که کاربر با موفقیت دوباره تأیید
-    می‌شود، هم verified_at و هم channels_snapshot (عکسِ لحظه‌ایِ کانال‌های فعال در
-    زمان تأیید) را آپدیت می‌کند. این snapshot دقیقاً همان چیزی است که در حافظه هم
-    نگه‌داری می‌شود تا بعد از هر ری‌استارت، وضعیت «باید دوباره چک شود یا نه» درست
-    از دیتابیس بازسازی شود.
-    """
-    verified_at = verified_at or tehran_now()
+def mark_user_verified_db(user_id):
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO novaself_join_verified (user_id, verified_at, channels_snapshot)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                verified_at = EXCLUDED.verified_at,
-                channels_snapshot = EXCLUDED.channels_snapshot
-        ''', (user_id, verified_at, channels_snapshot))
+        cursor.execute(
+            "INSERT INTO novaself_join_verified (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,)
+        )
         conn.commit()
     except Exception as e:
         logging.error(f"❌ خطا در ثبت تأیید عضویت کاربر {user_id}: {e}")
@@ -1963,41 +1850,16 @@ def mark_user_verified_db(user_id, channels_snapshot, verified_at=None):
         if conn:
             conn.close()
 
-def clear_user_verified_db(user_id):
-    """پاک‌کردن رکورد تأیید یک کاربر (مثلاً اگر ادمین بخواهد کاربری را دستی مجبور به جوین مجدد کند)."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM novaself_join_verified WHERE user_id = %s", (user_id,))
-        conn.commit()
-        return cursor.rowcount > 0
-    except Exception as e:
-        logging.error(f"❌ خطا در حذف تأیید عضویت کاربر {user_id}: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            conn.close()
-
 def get_all_verified_users_db():
-    """
-    خروجی: دیکشنری {user_id: {"verified_at": datetime, "snapshot": str}}
-    (قبلاً فقط لیست ساده‌ی آیدی‌ها برمی‌گشت که امکان تشخیص «قدیمی/منقضی‌شده» را نمی‌داد.)
-    """
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, verified_at, channels_snapshot FROM novaself_join_verified")
-        result = {}
-        for row in cursor.fetchall():
-            result[row[0]] = {"verified_at": row[1], "snapshot": row[2] or ""}
-        return result
+        cursor.execute("SELECT user_id FROM novaself_join_verified")
+        return [row[0] for row in cursor.fetchall()]
     except Exception as e:
         logging.error(f"❌ خطا در بارگذاری کاربران تأییدشده: {e}")
-        return {}
+        return []
     finally:
         if conn:
             conn.close()
@@ -2030,7 +1892,6 @@ BACKUP_TABLE_PKS = {
     "novaself_reactions": (["owner_id", "target_user_id"], []),
     "novaself_autoreplies": (["id"], []),
     "novaself_feature_locks": (["user_id", "feature_key"], []),
-    "novaself_global_locks": (["feature_key"], []),
     "novaself_join_channels": (["id"], []),
     "novaself_join_verified": (["user_id"], []),
     "novaself_admin_logs": (["id"], []),
@@ -2236,180 +2097,30 @@ def load_join_gate_cache():
     """بارگذاری اولیه‌ی کش‌های جوین اجباری در استارتاپ."""
     global verified_users
     reload_join_channels_cache()
-    verified_users = get_all_verified_users_db()
+    verified_users = set(get_all_verified_users_db())
     logging.info(f"🔐 جوین اجباری: {len(join_channels_cache)} کانال فعال، {len(verified_users)} کاربر تأییدشده.")
-
-def _join_channels_snapshot():
-    """
-    یک رشته‌ی کوتاه و پایدار که «هویتِ» ست فعلیِ کانال‌های فعال را نشان می‌دهد
-    (آیدی‌های کانال‌های فعال، مرتب‌شده). هر بار که ادمین کانالی اضافه/حذف/غیرفعال
-    کند، این رشته عوض می‌شود؛ همین تغییر است که باعث می‌شود کاربرانی که قبلاً با
-    ست قدیمیِ کانال‌ها تأیید شده بودند، دوباره وارد مسیر بررسی شوند.
-    """
-    return ",".join(str(ch["id"]) for ch in sorted(join_channels_cache, key=lambda c: c["id"]))
-
-def needs_join_check(user_id):
-    """
-    تصمیم می‌گیرد که آیا باید عضویت این کاربر را دوباره واقعاً از تلگرام استعلام
-    کنیم یا تأییدِ قبلی‌اش هنوز معتبر است. این تابع سبک است (فقط یک lookup روی
-    دیکشنری در حافظه)، پس صدا زدنش در هر تعامل (نه فقط /start) هزینه‌ی محسوسی ندارد؛
-    تماسِ واقعی و نسبتاً سنگین با API تلگرام (check_user_joined_all) فقط وقتی این
-    تابع True برگرداند اجرا می‌شود.
-    """
-    if not join_channels_cache or is_admin(user_id):
-        return False
-
-    record = verified_users.get(user_id)
-    if not record:
-        return True
-
-    # کانال‌های اجباری از آخرین تأیید این کاربر تغییر کرده‌اند (کانال جدید اضافه/
-    # حذف/غیرفعال شده) — باید دوباره برای ستِ جدید چک شود.
-    if record.get("snapshot") != _join_channels_snapshot():
-        return True
-
-    # تأیید قدیمی منقضی شده — دوباره چک می‌کنیم تا کسانی که کانال را ترک کرده‌اند
-    # برای همیشه معاف نمانند.
-    verified_at = record.get("verified_at")
-    if not verified_at:
-        return True
-    age_seconds = (tehran_now() - verified_at).total_seconds()
-    return age_seconds > JOIN_GATE_RECHECK_SECONDS
-
-def _mark_user_verified(user_id):
-    """کاربر را هم در حافظه و هم در دیتابیس، همراه با عکسِ لحظه‌ایِ کانال‌های فعال، تأییدشده ثبت می‌کند."""
-    snapshot = _join_channels_snapshot()
-    now = tehran_now()
-    verified_users[user_id] = {"verified_at": now, "snapshot": snapshot}
-    mark_user_verified_db(user_id, snapshot, now)
 
 async def check_user_joined_all(user_id):
     """
     بررسی عضویت کاربر در تمام کانال‌های فعالِ جوین اجباری با کلاینت بات.
-
-    فقط UserNotParticipantError به معنای واقعیِ «کاربر عضو نیست» است. هر خطای
-    دیگر (مثلاً ChatAdminRequiredError چون بات در آن کانال ادمین نیست) یعنی ما
-    اصلاً نمی‌توانیم عضویت را تأیید کنیم — و طبق منطق درست برای یک قابلیت
-    امنیتی/محدودکننده، این حالت هم باید Fail-Closed باشد (یعنی کاربر را عضو در
-    نظر نگیریم)، نه Fail-Open که کل جوین اجباری را بی‌اثر می‌کرد.
-
-    نکته‌ی مهم (رفعِ باگِ «کاربر جوین شده ولی می‌گفت جوین نشده»): طبق مستندات
-    رسمی Telethon، فیلدِ perms.is_member فقط برای «عضو عادی» True است و صراحتاً
-    ادمین‌ها و مالکِ کانال را شامل نمی‌شود («not administrator, but not banned
-    either»). اگر کاربری که چک می‌شود خودش ادمین/مالکِ همان کانال باشد (خیلی
-    محتمل، مثلاً موقع تستِ خودِ سازنده‌ی ربات)، فقط چک‌کردنِ is_member نادرست
-    False برمی‌گرداند. برای همین همیشه is_admin و is_creator را هم کنار
-    is_member چک می‌کنیم.
-
-    نکته‌ی مهم (خودترمیمی بعد از هر ری‌دیپلوی روی Railway): چون bot با یک سشنِ
-    فایلیِ SQLite بالا می‌آید (`TelegramClient('helper_bot', ...)`) و روی Railway
-    فایل‌سیستم معمولاً پایدار/دائمی نیست، بعد از هر ری‌دیپلوی/ری‌استارت این کش
-    entity به‌طور کامل از بین می‌رود؛ یعنی تلاش اول (با شناسه‌ی عددی خامِ ذخیره‌شده)
-    ممکن است شکست بخورد، حتی اگر بات هنوز واقعاً عضو/ادمین همان کانال باشد. اگر
-    فقط به همین تلاش اول بسنده می‌کردیم، جوین اجباری بعد از هر ری‌دیپلوی از کار
-    می‌افتاد تا ادمین دستی دوباره کانال را اضافه کند. برای همین، اگر تلاش اول با
-    شناسه‌ی خام شکست بخورد (و علتش «کاربر عضو نیست» نباشد)، یک‌بار دیگر از روی
-    همان لینک دعوتیِ ذخیره‌شده (با _resolve_channel_from_link، دقیقاً همان تابعی
-    که هنگام افزودن کانال استفاده می‌شود) entity را تازه resolve کرده و دوباره
-    امتحان می‌کنیم — بدون نیاز به هیچ دخالت دستی.
-
+    اگر بات خودش عضو یکی از کانال‌ها نباشد یا شناسه نامعتبر باشد، آن کانال را
+    به‌عنوان مانع در نظر نمی‌گیرد (Fail-open) تا یک تنظیم اشتباه کل ربات را قفل نکند.
     خروجی: (all_joined: bool, missing_channels: list[dict])
     """
     missing = []
     for ch in join_channels_cache:
-        identifier = ch["identifier"]
         try:
-            identifier = int(identifier)
-        except (ValueError, TypeError):
-            pass
-
-        try:
+            identifier = ch["identifier"]
+            try:
+                identifier = int(identifier)
+            except (ValueError, TypeError):
+                pass
             perms = await bot.get_permissions(identifier, user_id)
-            if not perms or not (perms.is_member or perms.is_admin or getattr(perms, "is_creator", False)):
+            if not perms or not perms.is_member:
                 missing.append(ch)
-            continue
-        except UserNotParticipantError:
-            missing.append(ch)
-            continue
-        except Exception:
-            pass  # می‌رویم سراغ تلاش دوم (resolve تازه از روی لینک) پایین
-
-        resolved_entity, resolve_err = await _resolve_channel_from_link(ch.get("invite_link", ""))
-        if resolved_entity is None:
-            bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
-            logging.error(
-                f"⚠️ جوین اجباری: {bot_mention} به کانال «{ch['title']}» (شناسه: {ch['identifier']}) دسترسی کافی "
-                f"ندارد یا در آن عضو/ادمین نیست ({resolve_err}). این کانال به‌عنوان «عضو نشده» در نظر گرفته می‌شود "
-                f"تا قابلیت جوین اجباری بی‌اثر نشود — لطفاً از پنل ادمین بررسی کنید که خودِ {bot_mention} "
-                "(نه اکانت سلف کاربران) در این کانال عضو/ادمین باشد."
-            )
-            missing.append(ch)
-            continue
-
-        try:
-            perms = await bot.get_permissions(resolved_entity, user_id)
-            if not perms or not (perms.is_member or perms.is_admin or getattr(perms, "is_creator", False)):
-                missing.append(ch)
-        except UserNotParticipantError:
-            missing.append(ch)
         except Exception as e:
-            log_internal_error("check_joined", f"channel_id={ch.get('id')} identifier={identifier} err={e}")
-            missing.append(ch)
+            log_internal_error("check_joined", f"channel_id={ch.get('id')} err={e}")
     return (len(missing) == 0), missing
-
-async def _resolve_channel_from_link(link):
-    """
-    مطمئن‌ترین راهِ resolve کردنِ یک کانال برای اکانت بات:
-
-    - اگر لینک عمومی باشد (t.me/username): مستقیماً با ResolveUsername حل می‌شود.
-      این متد همیشه برای بات کار می‌کند چون نیازی به access_hash از قبل ندارد.
-
-    - اگر لینک دعوتیِ خصوصی باشد (t.me/+HASH یا t.me/joinchat/HASH): طبق پیام
-      رسمی خودِ تلگرام («The API access for bot users is restricted... cannot
-      be executed as a bot»)، CheckChatInviteRequest اصلاً برای اکانت بات مجاز
-      نیست — این یک محدودیت رسمی پلتفرم است، نه چیزی قابل دور‌زدن با کد. برای
-      همین این حالت مستقیماً پیام روشن می‌دهد: تنها راه، ارسال یک پیامِ تازه
-      مستقیماً در خودِ کانال (نه فوروارد) است، چون بات به‌عنوان ادمین آن کانال،
-      آن پست را به‌صورت آپدیت مستقیم دریافت می‌کند و Telethon خودش access_hash
-      کامل را در همان لحظه کش می‌کند.
-
-    خروجی: (entity یا None, پیام‌خطا یا None)
-    """
-    link = (link or "").strip()
-    m = re.match(r'^(?:https?://)?(?:www\.)?t\.me/(.+)$', link, re.IGNORECASE)
-    tail = m.group(1) if m else link.lstrip("@")
-    tail = tail.split("?")[0].strip("/")
-
-    if not tail:
-        return None, "لینک نامعتبر است."
-
-    try:
-        if tail.startswith("+"):
-            invite_hash = tail[1:]
-        elif tail.lower().startswith("joinchat/"):
-            invite_hash = tail[len("joinchat/"):]
-        else:
-            invite_hash = None
-
-        if invite_hash:
-            return None, (
-                "این یک لینک دعوتِ خصوصی است و طبق قوانین رسمی تلگرام، اکانت‌های بات "
-                "اصلاً اجازه‌ی استعلام لینک دعوت را ندارند (این محدودیتِ خودِ تلگرام است، "
-                "نه ربات). راه‌حل: یک پیامِ تازه مستقیماً داخل خودِ کانال پست کنید "
-                "(نه فوروارد به جای دیگر)؛ چون ربات ادمین آن کاناله، همین یک پست کافی است "
-                "تا کانال را بشناسد — سپس دوباره از منوی افزودن کانال، این‌بار "
-                "«@یوزرنیم» (اگر کانال یوزرنیم عمومی دارد) یا آیدی عددی کانال را وارد کنید."
-            )
-
-        # لینک عمومی: بخشی که بعد از t.me/ آمده، یوزرنیم کانال است.
-        username = tail.split("/")[0]
-        try:
-            entity = await bot.get_entity(username)
-            return entity, None
-        except Exception as e:
-            return None, e
-    except Exception as e:
-        return None, e
 
 # ======================== رابط کاربری جوین اجباری (سمت کاربر) ========================
 JOIN_REQUIRED_TEXT = (
@@ -2431,13 +2142,10 @@ async def _send_join_gate(event, user_id, missing_channels):
 def get_joingate_admin_text():
     channels = list_join_channels_db()
     verified_count = get_verified_count_db()
-    recheck_hours = JOIN_GATE_RECHECK_SECONDS // 3600
     lines = [
         "🔔 **مدیریت جوین اجباری**\n",
         f"تعداد کانال‌ها: {len(channels)}",
-        f"کاربران تأییدشده (حداکثر تا {recheck_hours} ساعت اخیر): {verified_count}\n",
-        "ℹ️ عضویت هر کاربر همیشگی نیست: هر چند ساعت یک‌بار و هر بار که کانال‌های این "
-        "لیست تغییر کند (افزوده/حذف/غیرفعال شود)، دوباره از تلگرام استعلام می‌شود.\n",
+        f"کاربران تأییدشده تاکنون: {verified_count}\n",
         "برای مدیریت هر کانال روی آن کلیک کنید:"
     ]
     return "\n".join(lines)
@@ -2483,30 +2191,6 @@ def get_joingate_delete_confirm_keyboard(cid):
         [styled_button("🗑 بله، حذف شود", f"admin_joingate_delete_confirm_{cid}".encode(), style=STYLE_OFF)],
         [styled_button("➜ بازگشت", f"admin_joingate_manage_{cid}".encode(), style=STYLE_OFF)]
     ]
-
-# ======================== رابط کاربری قفل سراسری قابلیت‌ها (پنل ادمین) ========================
-def get_globallock_menu_text():
-    count = len(global_feature_locks)
-    return (
-        "🌐 **قفل سراسری قابلیت‌ها**\n\n"
-        f"تعداد قابلیت‌های قفل‌شده برای همه‌ی کاربران: {count}\n\n"
-        "روی هر قابلیت کلیک کنید تا وضعیت قفل/باز آن برای **همه‌ی کاربران** عوض شود:"
-    )
-
-def get_globallock_menu_keyboard():
-    buttons = []
-    row = []
-    for key, label in FEATURE_LOCK_DEFS:
-        locked = key in global_feature_locks
-        text = f"{label} 🔒" if locked else label
-        row.append(styled_button(text, f"admin_globallock_toggle_{key}".encode(), style=STYLE_OFF if locked else STYLE_ON))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
-    return buttons
 
 # ======================== رابط کاربری سیستم بکاپ (پنل ادمین) ========================
 def _format_bytes(n):
@@ -2837,34 +2521,28 @@ def get_settings_root_keyboard(user_id):
     """صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی."""
     locks = feature_locks.get(user_id, set())
 
-    def btn(key, text, callback):
-        # قفل سراسری (برای همه‌ی کاربران) با رنگ قرمز نشان داده می‌شود تا از قفل
-        # شخصیِ همان کاربر (که فقط 🔒 می‌گیرد ولی آبی می‌ماند) قابل تشخیص باشد.
-        if key in global_feature_locks:
-            return styled_button(f"{text} 🔒", callback, style=STYLE_OFF)
-        if key in locks:
-            return styled_button(f"{text} 🔒", callback, style=STYLE_INFO)
-        return styled_button(text, callback, style=STYLE_INFO)
+    def lbl(key, text):
+        return f"{text} 🔒" if key in locks else text
 
     return [
         [
-            btn("date", "📅 تاریخ", b"menu_date"),
-            btn("actions", "🎭 اکشن", b"menu_actions"),
-            btn("time", "⌚ ساعت", b"menu_time"),
+            styled_button(lbl("date", "📅 تاریخ"), b"menu_date", style=STYLE_INFO),
+            styled_button(lbl("actions", "🎭 اکشن"), b"menu_actions", style=STYLE_INFO),
+            styled_button(lbl("time", "⌚ ساعت"), b"menu_time", style=STYLE_INFO),
         ],
         [
-            btn("textmode", "🖊️ حالت متن", b"menu_textmode"),
-            btn("secretary", "🧑‍💼 منشی پیوی", b"menu_secretary"),
+            styled_button(lbl("textmode", "🖊️ حالت متن"), b"menu_textmode", style=STYLE_INFO),
+            styled_button(lbl("secretary", "🧑‍💼 منشی پیوی"), b"menu_secretary", style=STYLE_INFO),
         ],
         [
-            btn("tag", "🏷️ تگ", b"menu_tag"),
-            btn("meow", "🐱 میو", b"menu_meow"),
-            btn("ping", "🏓 پینگ", b"menu_ping"),
+            styled_button(lbl("tag", "🏷️ تگ"), b"menu_tag", style=STYLE_INFO),
+            styled_button(lbl("meow", "🐱 میو"), b"menu_meow", style=STYLE_INFO),
+            styled_button(lbl("ping", "🏓 پینگ"), b"menu_ping", style=STYLE_INFO),
         ],
         [
-            btn("autoreply", "🤖 پاسخ خودکار", b"menu_autoreply"),
-            btn("reaction", "👍 ریکت", b"menu_reaction"),
-            btn("whois", "🪪 اطلاعات", b"menu_whois"),
+            styled_button(lbl("autoreply", "🤖 پاسخ خودکار"), b"menu_autoreply", style=STYLE_INFO),
+            styled_button(lbl("reaction", "👍 ریکت"), b"menu_reaction", style=STYLE_INFO),
+            styled_button(lbl("whois", "🪪 اطلاعات"), b"menu_whois", style=STYLE_INFO),
         ],
         [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
@@ -3200,14 +2878,9 @@ def get_meow_menu_keyboard(user_id, user):
 
     def sub_button(key, label, flag, callback):
         text = toggle_label(label, flag)
-        if key in global_feature_locks:
+        if key in locks:
             text += " 🔒"
-            style = STYLE_OFF
-        elif key in locks:
-            text += " 🔒"
-            style = STYLE_ON if flag else STYLE_OFF
-        else:
-            style = STYLE_ON if flag else STYLE_OFF
+        style = STYLE_ON if flag else STYLE_OFF
         return styled_button(text, callback, style=style)
 
     return [
@@ -3489,8 +3162,7 @@ def get_code_keyboard(current_code=""):
             styled_button("❌ پاک کردن", b"k_clear", style=STYLE_OFF),
             Button.inline("0", b"k_0"),
             styled_button("✅ تایید", b"k_submit", style=STYLE_ON),
-        ],
-        [styled_button("✕ لغو نصب", b"install_cancel", style=STYLE_OFF)]
+        ]
     ]
 
 # ======================== خرید الماس (کیبورد عددی + State Machine) ========================
@@ -3597,7 +3269,6 @@ def get_admin_main_menu():
         [styled_button("🎁 مدیریت کدهای هدیه", b"admin_giftcodes", style=STYLE_INFO)],
         [styled_button("🧾 پیام‌های ارسالی", b"admin_messages_list", style=STYLE_INFO)],
         [styled_button("🔔 جوین اجباری", b"admin_joingate", style=STYLE_INFO)],
-        [styled_button("🌐 قفل سراسری قابلیت‌ها", b"admin_globallock", style=STYLE_INFO)],
         [styled_button("💾 سیستم بکاپ", b"admin_backup", style=STYLE_INFO)],
         [styled_button("📜 لاگ‌های مدیریتی اخیر", b"admin_logs", style=STYLE_INFO)],
         [styled_button("🔄 بروزرسانی همه کاربران", b"admin_refresh_all", style=STYLE_INFO)]
@@ -5457,10 +5128,11 @@ async def start_handler(event):
     user = user_data[user_id]
 
     # جوین اجباری: ادمین‌ها معاف هستند تا هیچ‌وقت خودشان از پنل قفل نشوند.
-    if needs_join_check(user_id):
+    if join_channels_cache and user_id not in verified_users and not is_admin(user_id):
         all_joined, missing = await check_user_joined_all(user_id)
         if all_joined:
-            _mark_user_verified(user_id)
+            verified_users.add(user_id)
+            mark_user_verified_db(user_id)
         else:
             await _send_join_gate(event, user_id, missing)
             return
@@ -5524,15 +5196,6 @@ async def callback_handler(event):
 
         if real_action == "panel_close":
             await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
-            # برای شلوغ‌نشدنِ چت، خودِ پیامِ «پنل بسته شد» هم بعد از چند ثانیه
-            # به‌صورت خودکار پاک می‌شود (در پس‌زمینه، بدون بلاک‌کردن هندلر).
-            async def _auto_delete_closed_panel():
-                await asyncio.sleep(3)
-                try:
-                    await event.delete()
-                except Exception:
-                    pass
-            _spawn_background_task(_auto_delete_closed_panel())
             return
 
         user_id = owner_id
@@ -5546,27 +5209,14 @@ async def callback_handler(event):
     if data == b"join_verify_check":
         all_joined, missing = await check_user_joined_all(user_id)
         if all_joined:
-            _mark_user_verified(user_id)
+            verified_users.add(user_id)
+            mark_user_verified_db(user_id)
             user = user_data.get(user_id) or make_default_user(step="menu")
             user_data[user_id] = user
             await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
         else:
             await event.answer("برای استفاده از ربات، ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
         return
-
-    # ====== گیت جوین اجباری (بندِ بازسازی): فقط دکمه‌ی «تایید عضویت» بالا از این
-    # گیت معاف است. این چک روی هر کلیکی اجرا می‌شود (نه فقط /start) تا کاربری که
-    # مدت‌هاست /start نزده یا از کانال لفت داده، همچنان از استفاده باز نماند.
-    # چون needs_join_check سبک است (lookup در حافظه)، تماس واقعاً سنگین با API
-    # تلگرام (check_user_joined_all) فقط وقتی واقعاً لازم باشد اجرا می‌شود.
-    if needs_join_check(user_id):
-        all_joined, missing = await check_user_joined_all(user_id)
-        if all_joined:
-            _mark_user_verified(user_id)
-        else:
-            await event.answer("⛔ ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
-            await _send_join_gate(event, user_id, missing)
-            return
 
     # ====== منوی ادمین ======
     if is_admin(user_id):
@@ -5667,29 +5317,6 @@ async def callback_handler(event):
                 f"⚠️ حذف کانال «{ch['title']}»؟ این عملیات غیرقابل بازگشت است.",
                 buttons=get_joingate_delete_confirm_keyboard(cid)
             )
-            return
-
-        # ====================================================================
-        # ====================== قفل سراسری قابلیت‌ها =========================
-        # ====================================================================
-        if data == b"admin_globallock":
-            await safe_edit(event, get_globallock_menu_text(), buttons=get_globallock_menu_keyboard())
-            return
-
-        if data.startswith(b"admin_globallock_toggle_"):
-            key = data.decode().split("admin_globallock_toggle_", 1)[1]
-            if key not in FEATURE_LOCK_LABELS:
-                await event.answer("❌ قابلیت نامعتبر است.", alert=True)
-                return
-            if key in global_feature_locks:
-                unlock_feature_globally_db(key)
-                global_feature_locks.discard(key)
-                log_admin_action(user_id, 0, "global_unlock", key)
-            else:
-                lock_feature_globally_db(key)
-                global_feature_locks.add(key)
-                log_admin_action(user_id, 0, "global_lock", key)
-            await safe_edit(event, get_globallock_menu_text(), buttons=get_globallock_menu_keyboard())
             return
 
         # ====================================================================
@@ -5810,7 +5437,6 @@ async def callback_handler(event):
                 load_reactions_cache()
                 load_autoreplies_cache()
                 load_feature_locks_cache()
-                load_global_locks_cache()
             except Exception as e:
                 log_internal_error("post_restore_cache_reload", e)
 
@@ -6455,21 +6081,8 @@ async def callback_handler(event):
         await safe_edit(event,
             "📞 **مرحله اول: وارد کردن شماره**\n\n"
             "لطفاً شماره تلفن خود را به همراه کد کشور وارد کنید.\n"
-            "مثال: `+989123456789`",
-            buttons=[[styled_button("❌ لغو نصب", b"install_cancel", style=STYLE_OFF)]]
+            "مثال: `+989123456789`"
         )
-        return
-
-    if data == b"install_cancel":
-        if user_id in generator_data:
-            del generator_data[user_id]
-        if user_id in active_signins:
-            try:
-                await active_signins[user_id].disconnect()
-            except Exception as e:
-                log_internal_error("cancel_install_disconnect", e)
-            del active_signins[user_id]
-        await safe_edit(event, "❌ عملیات نصب/بازیابی نوا سلف لغو شد.", buttons=get_start_root_keyboard(user))
         return
 
     if data == b"account_recover_session":
@@ -6496,8 +6109,7 @@ async def callback_handler(event):
             "موجودی، تنظیمات و رفرال شما دست‌نخورده باقی می‌ماند و فقط نشستِ اتصال حساب "
             "دوباره ساخته می‌شود.\n\n"
             "لطفاً شماره تلفن حساب خود را به همراه کد کشور وارد کنید.\n"
-            "مثال: `+989123456789`",
-            buttons=[[styled_button("❌ لغو نصب", b"install_cancel", style=STYLE_OFF)]]
+            "مثال: `+989123456789`"
         )
         return
 
@@ -7561,9 +7173,7 @@ async def message_handler(event):
     }
     _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
 
-    if text == "/cancel" and (
-        user_id in broadcast_data or user_id in admin_action_data or user_id in generator_data or _has_pending_step
-    ):
+    if text == "/cancel" and (user_id in broadcast_data or user_id in admin_action_data or _has_pending_step):
         # لغو یک خرید در حالِ انتظارِ رسید فقط State را ریست می‌کند؛ سفارشی که از قبل
         # در دیتابیس با وضعیت 'invoice' ثبت شده دست‌نخورده می‌ماند (کاربر می‌تواند بعداً
         # دوباره از حساب کاربری وارد بخش خرید شود، البته سفارش قدیمی دیگر از UI قابل
@@ -7574,36 +7184,12 @@ async def message_handler(event):
         purchase_data.pop(user_id, None)
         autoreply_draft.pop(user_id, None)
         backup_upload_pending.pop(user_id, None)
-
-        if user_id in generator_data:
-            del generator_data[user_id]
-        if user_id in active_signins:
-            try:
-                await active_signins[user_id].disconnect()
-            except Exception as e:
-                log_internal_error("cancel_install_disconnect", e)
-            del active_signins[user_id]
-
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
         await event.respond("❌ عملیات لغو شد.")
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
         return
-
-    # ====== گیت جوین اجباری ======
-    # این چک هم اینجا (نه فقط روی /start) تکرار می‌شود تا کاربرانی که مدت‌ها با
-    # ربات کار کرده‌اند و دیگر /start نمی‌زنند هم از قلم نیفتند. عمداً وقتی کاربر
-    # وسط فرآیند نصب سلف (وارد کردن شماره/کد/رمز دو مرحله‌ای) است این گیت اجرا
-    # نمی‌شود؛ چون OTP تلگرام زمان محدودی دارد و متوقف‌کردنِ کاربر وسط آن فرآیند
-    # برای اجبار به جوین، می‌تواند باعث از‌دست‌رفتن کدِ ورود شود.
-    if user_id not in generator_data and user_id not in active_signins and needs_join_check(user_id):
-        all_joined, missing = await check_user_joined_all(user_id)
-        if all_joined:
-            _mark_user_verified(user_id)
-        else:
-            await _send_join_gate(event, user_id, missing)
-            return
 
     # ====== افزودن پاسخ خودکار (دو مرحله‌ای: Trigger سپس Response) ======
     if user_id in user_data and user_data[user_id].get("step") == "autoreply_get_trigger":
@@ -7790,94 +7376,35 @@ async def message_handler(event):
                 await event.respond("❌ لطفاً یک نام معتبر ارسال کنید.", buttons=cancel_kb)
                 return
             action["title"] = title[:64]
+            action["step"] = "get_identifier"
+            await event.respond(
+                "حالا شناسه‌ی کانال را ارسال کنید:\n"
+                "برای کانال عمومی: `@channel_username`\n"
+                "برای کانال خصوصی: آیدی عددی کانال (باید ربات از قبل ادمین آن کانال باشد)",
+                buttons=cancel_kb
+            )
+            return
+
+        if action["step"] == "get_identifier":
+            identifier = text.strip().lstrip("@")
+            if not identifier:
+                await event.respond("❌ شناسه نامعتبر است.", buttons=cancel_kb)
+                return
+            action["identifier"] = identifier
             action["step"] = "get_link"
             await event.respond(
-                "حالا **لینک عضویت کانال** را ارسال کنید (نه شناسه یا فوروارد پیام):\n\n"
-                "• کانال عمومی: `https://t.me/channel_username` یا `@channel_username`\n"
-                "• کانال خصوصی: لینک `t.me/+xxxx` را **به‌عنوان لینکِ نمایشی به کاربران** بفرستید "
-                "(برای شناسایی کانال کار نمی‌کند؛ توضیح پایین را ببینید)\n\n"
-                "⚠️ ربات باید از قبل واقعاً در این کانال عضو باشد (ترجیحاً با دسترسی ادمین). "
-                "برای کانال **خصوصی بدون یوزرنیم عمومی**: چون طبق قوانین تلگرام بات‌ها اجازه‌ی "
-                "استعلام لینک دعوت را ندارند، اول یک پیامِ تازه مستقیماً در همان کانال پست کنید "
-                "(نه فوروارد)، بعد همین‌جا آیدی عددی کانال (مثلاً `-1001234567890` یا `1234567890`) "
-                "را بفرستید.",
+                "حالا لینک عضویت کانال را ارسال کنید (مثال: `https://t.me/channel_username`):",
                 buttons=cancel_kb
             )
             return
 
         if action["step"] == "get_link":
-            # رفعِ باگِ واقعی («ربات از قبل ادمین بود ولی حتی با فوروارد هم گفت
-            # ادمین نیست»): سه تلاش قبلی هیچ‌کدام برای اکانت بات قابل‌اعتماد نبودند:
-            #   ۱) fwd.chat / fwd.get_chat فقط وقتی چیزی برمی‌گردانند که Telegram
-            #      از قبل entity کامل را در کش/همان پیام گنجانده باشد؛ برای اولین
-            #      برخورد بات با یک کانال خصوصی، معمولاً یک نسخه‌ی ناقص/min
-            #      (بدون access_hash معتبر) برمی‌گردد که چک عضویت رویش شکست می‌خورد.
-            #   ۲) bot.iter_dialogs() اصلاً برای اکانت بات کار نمی‌کند («bot accounts
-            #      do not have dialogs»)، پس آن fallback همیشه شکست می‌خورد.
-            #   ۳) CheckChatInviteRequest هم طبق پیامِ رسمیِ خودِ تلگرام
-            #      («The API access for bot users is restricted... cannot be
-            #      executed as a bot») اصلاً برای بات مجاز نیست — این محدودیتِ
-            #      خودِ پلتفرم است، نه چیزی قابل دور‌زدن.
-            # راه‌حل واقعی برای کانال خصوصی: بعد از اینکه ادمین یک پست تازه مستقیماً
-            # در کانال بگذارد (نه فوروارد)، بات آن پست را به‌صورت آپدیت مستقیم
-            # دریافت و access_hash را خودش کش می‌کند؛ از آن لحظه به بعد، آیدی عددی
-            # خام (یا یوزرنیمِ عمومی، اگر کانال داشته باشد) به‌راحتی resolve می‌شود.
-            text_in = text.strip()
-
-            if text_in.startswith("http") or text_in.startswith("@"):
-                resolved_entity, resolution_error = await _resolve_channel_from_link(text_in)
-            else:
-                candidate = text_in
-                try:
-                    candidate = int(candidate)
-                except ValueError:
-                    pass
-                try:
-                    resolved_entity = await bot.get_entity(candidate)
-                    resolution_error = None
-                except Exception as e:
-                    resolved_entity = None
-                    resolution_error = e
-
-            if resolved_entity is None:
-                await event.respond(
-                    "❌ **این کانال پیدا نشد.**\n\n"
-                    f"جزئیات: `{resolution_error}`\n\n"
-                    "مطمئن شوید لینک درست است و ربات از قبل واقعاً در این کانال عضو است "
-                    "(نه اکانت سلف — خودِ ربات).",
-                    buttons=cancel_kb
-                )
+            link = text.strip()
+            if not link.startswith("http"):
+                await event.respond("❌ لینک باید با http یا https شروع شود.", buttons=cancel_kb)
                 return
 
-            # اعتبارسنجی نهایی: بات باید حداقل عضو (ترجیحاً ادمین) این کانال باشد.
-            #
-            # باگِ واقعیِ همین چک (که بارها هرچه درست بود باز «ادمین نیست» نشان
-            # می‌داد): get_permissions(entity) بدون مشخص‌کردنِ کاربر، اصلاً وضعیتِ
-            # خودِ بات را چک نمی‌کند — طبق مستندات رسمی Telethon، این حالت
-            # «مجوزهای پیش‌فرضِ کلیِ چت» (default banned rights) را برمی‌گرداند که
-            # هیچ ربطی به ادمین‌بودنِ بات ندارد. برای همین همیشه is_admin/is_creator/
-            # is_member همه False بودند و خودِ همین کد (نه تلگرام) خطای مصنوعیِ
-            # ChatAdminRequiredError صادر می‌کرد. برای چک‌کردنِ وضعیتِ خودِ بات، باید
-            # صریحاً 'me' را به‌عنوان کاربر پاس بدهیم.
-            try:
-                my_perms = await bot.get_permissions(resolved_entity, 'me')
-                if not my_perms or not (my_perms.is_admin or getattr(my_perms, "is_creator", False) or my_perms.is_member):
-                    raise ChatAdminRequiredError(request=None)
-            except Exception as e:
-                bot_mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "ربات"
-                await event.respond(
-                    f"❌ **{bot_mention} هنوز عضو/ادمین این کانال نیست.**\n\n"
-                    f"جزئیات: `{e}`\n\n"
-                    f"باید خودِ ربات ({bot_mention}) را (نه اکانت سلف) در کانال عضو کنید — "
-                    "ترجیحاً با دسترسی ادمین — سپس همین لینک را دوباره ارسال کنید.",
-                    buttons=cancel_kb
-                )
-                return
-
-            identifier = str(resolved_entity.id)
-            resolved_title = getattr(resolved_entity, "title", None) or getattr(resolved_entity, "username", None)
-
-            new_id = create_join_channel_db(action["title"], identifier, link)
+            new_id = create_join_channel_db(action["title"], action["identifier"], link)
             del admin_action_data[user_id]
 
             if new_id is None:
@@ -7887,8 +7414,8 @@ async def message_handler(event):
             reload_join_channels_cache()
             log_admin_action(user_id, 0, "add_joingate", f"id={new_id} title={action['title']}")
             await event.respond(
-                f"✅ کانال «{action['title']}» (شناسایی‌شده به‌عنوان «{resolved_title or identifier}») "
-                "با موفقیت اضافه شد و بررسی شد که ربات به آن دسترسی دارد.",
+                f"✅ کانال «{action['title']}» با موفقیت اضافه شد.\n\n"
+                "⚠️ یادت باشه که ربات باید از قبل عضو/ادمین این کانال باشه تا بتونه عضویت کاربرا رو چک کنه.",
                 buttons=get_joingate_admin_keyboard()
             )
             return
@@ -8213,30 +7740,20 @@ async def message_handler(event):
         generator = generator_data[user_id]
 
         if generator["step"] == "get_phone":
-            # جلوگیری از اسپم: اگر کاربر قبلاً شماره‌ی اشتباه فرستاده (چه به‌خاطر
-            # فرمت نامعتبر، چه رد شدن توسط خود تلگرام)، تا پایان زمان انتظار
-            # (۳۰ ثانیه بار اول، ۶۰ ثانیه از بار دوم به بعد) اجازه‌ی تلاش مجدد
-            # داده نمی‌شود. هر دو مسیر خطا از یک شمارنده‌ی مشترک استفاده می‌کنند.
+            # جلوگیری از اسپم: اگر کاربر قبلاً شماره‌ی اشتباه فرستاده، تا پایان
+            # زمان انتظار (۳۰ ثانیه بار اول، ۶۰ ثانیه بار دوم به بعد) اجازه‌ی
+            # تلاش مجدد داده نمی‌شود.
             wait_until = generator.get("phone_wait_until")
             if wait_until and tehran_now() < wait_until:
                 remaining = int((wait_until - tehran_now()).total_seconds()) + 1
                 await event.respond(f"⏳ لطفاً {remaining} ثانیه دیگر صبر کنید و دوباره شماره را ارسال کنید.")
                 return
 
-            def _apply_phone_penalty():
-                attempts = generator.get("phone_attempts", 0) + 1
-                generator["phone_attempts"] = attempts
-                wait_seconds = 30 if attempts == 1 else 60
-                generator["phone_wait_until"] = tehran_now() + timedelta(seconds=wait_seconds)
-                return wait_seconds
-
             normalized_phone, phone_error = normalize_phone_number(text)
             if phone_error:
-                wait_seconds = _apply_phone_penalty()
                 await event.respond(
                     f"{phone_error}\n\n"
-                    "نمونه‌های قابل قبول: `0912xxxxxxx`، `912xxxxxxx`، `+98912xxxxxxx`\n\n"
-                    f"⏳ لطفاً {wait_seconds} ثانیه صبر کنید و دوباره امتحان کنید."
+                    "نمونه‌های قابل قبول: `0912xxxxxxx`، `912xxxxxxx`، `+98912xxxxxxx`"
                 )
                 return  # در همان مرحله می‌ماند تا کاربر دوباره امتحان کند (بدون کرش)
 
@@ -8277,7 +7794,10 @@ async def message_handler(event):
                 if user_id in active_signins:
                     del active_signins[user_id]
             except Exception as e:
-                wait_seconds = _apply_phone_penalty()
+                attempts = generator.get("phone_attempts", 0) + 1
+                generator["phone_attempts"] = attempts
+                wait_seconds = 30 if attempts == 1 else 60
+                generator["phone_wait_until"] = tehran_now() + timedelta(seconds=wait_seconds)
 
                 await event.respond(
                     f"❌ **خطا در ارسال کد:**\n\n`{str(e)}`\n\n"
@@ -8572,7 +8092,6 @@ if __name__ == "__main__":
     load_reactions_cache()
     load_autoreplies_cache()
     load_feature_locks_cache()
-    load_global_locks_cache()
     load_join_gate_cache()
 
     loop = asyncio.get_event_loop()
@@ -8595,8 +8114,6 @@ if __name__ == "__main__":
         format_diamonds=format_diamonds,
         diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
         allowed_origin=MINIAPP_ORIGIN,
-        is_feature_locked=is_feature_locked,
-        is_feature_globally_locked=is_feature_globally_locked,
     )
     loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
 
