@@ -32,7 +32,7 @@ from telethon.tl.types import (
     MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
-    DocumentAttributeAnimated,
+    DocumentAttributeAnimated, ChannelParticipantLeft, ChannelParticipantBanned,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -2103,23 +2103,44 @@ def load_join_gate_cache():
 async def check_user_joined_all(user_id):
     """
     بررسی عضویت کاربر در تمام کانال‌های فعالِ جوین اجباری با کلاینت بات.
-    اگر بات خودش عضو یکی از کانال‌ها نباشد یا شناسه نامعتبر باشد، آن کانال را
-    به‌عنوان مانع در نظر نمی‌گیرد (Fail-open) تا یک تنظیم اشتباه کل ربات را قفل نکند.
+
+    نکته‌ی مهم (باگ نسخه‌ی قبلی): وقتی کاربر اصلاً عضو کانال نبود، متد
+    bot.get_permissions روی GetParticipantRequest، خطای UserNotParticipantError
+    پرتاب می‌کرد؛ این خطا در except عمومیِ پایین فقط لاگ می‌شد و کانال هرگز به
+    لیست missing اضافه نمی‌شد - یعنی در عمل هر کاربری (حتی کسی که اصلاً عضو
+    نبود) رد می‌شد و جوین اجباری عملاً کار نمی‌کرد.
+
+    اینجا دقیقاً مثل منطق join.py عمل می‌کنیم: وضعیتِ واقعیِ عضویت کاربر
+    (participant) را می‌گیریم و اگر «ترک کرده» یا «بن شده» بود (یا اصلاً عضو
+    نبود) آن کانال را «باقیمانده» در نظر می‌گیریم. فقط وقتی خودِ خطا مربوط به
+    پیکربندیِ کانال باشد (کانال خصوصی/نامعتبر یا بات دسترسی کافی ندارد) آن
+    کانال را نادیده می‌گیریم تا یک تنظیم اشتباه کل ربات را قفل نکند.
+
     خروجی: (all_joined: bool, missing_channels: list[dict])
     """
     missing = []
     for ch in join_channels_cache:
+        identifier = ch["identifier"]
         try:
-            identifier = ch["identifier"]
-            try:
-                identifier = int(identifier)
-            except (ValueError, TypeError):
-                pass
-            perms = await bot.get_permissions(identifier, user_id)
-            if not perms or not perms.is_member:
+            identifier = int(identifier)
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            channel_entity = await bot.get_entity(identifier)
+            participant = await bot(GetParticipantRequest(channel_entity, user_id))
+            if isinstance(participant.participant, (ChannelParticipantLeft, ChannelParticipantBanned)):
                 missing.append(ch)
+        except UserNotParticipantError:
+            # کاربر اصلاً عضو کانال نیست -> باید حتماً در لیست باقیمانده باشد
+            missing.append(ch)
+        except (ChannelPrivateError, ChatAdminRequiredError, ValueError) as e:
+            # مشکل از خودِ کانال/بات است (نه اینکه کاربر عضو نیست)، پس این کانال
+            # را نادیده می‌گیریم تا کل ربات قفل نشود
+            log_internal_error("check_joined", f"channel_id={ch.get('id')} err={e}")
         except Exception as e:
             log_internal_error("check_joined", f"channel_id={ch.get('id')} err={e}")
+
     return (len(missing) == 0), missing
 
 # ======================== رابط کاربری جوین اجباری (سمت کاربر) ========================
@@ -8121,3 +8142,4 @@ if __name__ == "__main__":
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
     bot.run_until_disconnected()
+
