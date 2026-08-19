@@ -204,7 +204,8 @@ autoreply_draft = {}    # {owner_id: {"trigger_text":...}} وضعیت موقت �
 feature_locks = {}      # {user_id: {feature_key, ...}} کش قفل قابلیت‌ها توسط ادمین
 backup_upload_pending = {}  # {admin_id: dump_dict} بکاپ آپلودشده‌ای که هنوز تأیید نشده
 join_channels_cache = []  # لیست کانال‌های فعالِ جوین اجباری (کش)
-verified_users = set()    # {user_id, ...} کاربرانی که عضویتشان قبلاً تأیید شده
+# توجه: دیگر هیچ کش/دیتابیسی از «کاربران تأییدشده» نگه‌داشته نمی‌شود؛ عضویت هر
+# بار که لازم باشد، زنده و مستقیم از تلگرام چک می‌شود (check_user_joined_all).
 _background_tasks = set()  # نگه‌داشتن رفرنس Taskهای پس‌زمینه‌ی کوتاه‌مدت تا با GC زودهنگام لغو نشوند
 
 def _spawn_background_task(coro):
@@ -515,13 +516,11 @@ def init_db():
         ''')
         conn.commit()
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS novaself_join_verified (
-                user_id BIGINT PRIMARY KEY,
-                verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
+        # توجه: جدول novaself_join_verified قبلاً اینجا ساخته می‌شد تا عضویتِ
+        # تأییدشده‌ی هر کاربر برای همیشه ذخیره شود. طبق درخواست صریح، این کش/جدول
+        # دیگر استفاده نمی‌شود: عضویت باید هر بار به‌صورت زنده از تلگرام چک شود
+        # (نه یک‌بار برای همیشه)، وگرنه کاربری که بعداً کانال را ترک کند همچنان
+        # به‌اشتباه «تأییدشده» باقی می‌ماند.
 
         # ---------- سیستم بکاپ ----------
         cursor.execute('''
@@ -1832,51 +1831,11 @@ def delete_join_channel_db(channel_id):
         if conn:
             conn.close()
 
-def mark_user_verified_db(user_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO novaself_join_verified (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
-            (user_id,)
-        )
-        conn.commit()
-    except Exception as e:
-        logging.error(f"❌ خطا در ثبت تأیید عضویت کاربر {user_id}: {e}")
-        if conn:
-            conn.rollback()
-    finally:
-        if conn:
-            conn.close()
-
-def get_all_verified_users_db():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM novaself_join_verified")
-        return [row[0] for row in cursor.fetchall()]
-    except Exception as e:
-        logging.error(f"❌ خطا در بارگذاری کاربران تأییدشده: {e}")
-        return []
-    finally:
-        if conn:
-            conn.close()
-
-def get_verified_count_db():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM novaself_join_verified")
-        return cursor.fetchone()[0]
-    except Exception as e:
-        logging.error(f"❌ خطا در شمارش کاربران تأییدشده: {e}")
-        return 0
-    finally:
-        if conn:
-            conn.close()
+# توجه: توابع mark_user_verified_db / get_all_verified_users_db / get_verified_count_db
+# قبلاً اینجا بودند و عضویتِ تأییدشده را برای همیشه در دیتابیس ذخیره می‌کردند.
+# طبق درخواست صریح حذف شدند: دیگر هیچ وضعیت عضویتی در دیتابیس ثبت نمی‌شود؛
+# هر بار که لازم باشد، عضویت مستقیماً و زنده از تلگرام (check_user_joined_all)
+# پرسیده می‌شود.
 
 # ======================== سیستم بکاپ ========================
 # لیست تمام جداول قابل بکاپ به‌همراه (کلید اصلی، ستون‌های محافظت‌شده که هنگام
@@ -1893,7 +1852,6 @@ BACKUP_TABLE_PKS = {
     "novaself_autoreplies": (["id"], []),
     "novaself_feature_locks": (["user_id", "feature_key"], []),
     "novaself_join_channels": (["id"], []),
-    "novaself_join_verified": (["user_id"], []),
     "novaself_admin_logs": (["id"], []),
 }
 
@@ -2094,11 +2052,12 @@ def reload_join_channels_cache():
     join_channels_cache = list(list_join_channels_db(active_only=True))
 
 def load_join_gate_cache():
-    """بارگذاری اولیه‌ی کش‌های جوین اجباری در استارتاپ."""
-    global verified_users
+    """بارگذاری اولیه‌ی کش کانال‌های جوین اجباری در استارتاپ."""
     reload_join_channels_cache()
-    verified_users = set(get_all_verified_users_db())
-    logging.info(f"🔐 جوین اجباری: {len(join_channels_cache)} کانال فعال، {len(verified_users)} کاربر تأییدشده.")
+    logging.info(
+        f"🔐 جوین اجباری: {len(join_channels_cache)} کانال فعال "
+        f"(عضویت هر بار زنده چک می‌شود، بدون ذخیره‌سازی وضعیت تأیید)."
+    )
 
 async def check_user_joined_all(user_id):
     """
@@ -2168,14 +2127,29 @@ def get_join_required_keyboard(missing_channels):
 async def _send_join_gate(event, user_id, missing_channels):
     await event.respond(JOIN_REQUIRED_TEXT, buttons=get_join_required_keyboard(missing_channels))
 
+async def enforce_join_gate(user_id):
+    """
+    نگهبانِ عمومیِ جوین اجباری - باید قبل از نمایش هر پنل/قابلیتی از سلف صدا زده
+    شود (نه فقط /start). هر بار زنده و مستقیم از تلگرام چک می‌کند (بدون تکیه به
+    هیچ کش/دیتابیسی)، تا کاربری که قبلاً عضو بوده ولی الان یکی از کانال‌ها را
+    ترک کرده، دوباره و بلافاصله مسدود شود.
+
+    خروجی: (blocked: bool, missing: list) - وقتی blocked=True است، فراخواننده
+    باید پیام جوین اجباری را نشان دهد و از ادامه‌ی پردازش (باز کردن هر منو/قابلیت
+    دیگری) صرف‌نظر کند.
+    """
+    if not join_channels_cache or is_admin(user_id):
+        return False, []
+    all_joined, missing = await check_user_joined_all(user_id)
+    return (not all_joined), missing
+
 # ======================== مدیریت جوین اجباری در پنل ادمین ========================
 def get_joingate_admin_text():
     channels = list_join_channels_db()
-    verified_count = get_verified_count_db()
     lines = [
         "🔔 **مدیریت جوین اجباری**\n",
         f"تعداد کانال‌ها: {len(channels)}",
-        f"کاربران تأییدشده تاکنون: {verified_count}\n",
+        "(عضویت هر بار زنده از تلگرام چک می‌شود؛ آماری از «تأییدشده‌ها» ذخیره نمی‌شود)\n",
         "برای مدیریت هر کانال روی آن کلیک کنید:"
     ]
     return "\n".join(lines)
@@ -5122,6 +5096,19 @@ async def inline_panel_handler(event):
         await event.answer([result], cache_time=0)
         return
 
+    # جوین اجباری: پنل درون‌چتی هم نباید برای کاربری که الان (زنده) عضو همه‌ی
+    # کانال‌ها نیست ساخته شود.
+    blocked, missing = await enforce_join_gate(owner_id)
+    if blocked:
+        builder = event.builder
+        result = builder.article(
+            "🔔 عضویت لازم است",
+            text=JOIN_REQUIRED_TEXT,
+            buttons=get_join_required_keyboard(missing),
+        )
+        await event.answer([result], cache_time=0)
+        return
+
     builder = event.builder
     keyboard = wrap_panel_buttons(get_panel_root_keyboard(user), owner_id)
     result = builder.article(
@@ -5157,15 +5144,12 @@ async def start_handler(event):
 
     user = user_data[user_id]
 
-    # جوین اجباری: ادمین‌ها معاف هستند تا هیچ‌وقت خودشان از پنل قفل نشوند.
-    if join_channels_cache and user_id not in verified_users and not is_admin(user_id):
-        all_joined, missing = await check_user_joined_all(user_id)
-        if all_joined:
-            verified_users.add(user_id)
-            mark_user_verified_db(user_id)
-        else:
-            await _send_join_gate(event, user_id, missing)
-            return
+    # جوین اجباری: هر بار زنده چک می‌شود (بدون کش/دیتابیس)؛ ادمین‌ها معاف هستند
+    # تا هیچ‌وقت خودشان از پنل قفل نشوند.
+    blocked, missing = await enforce_join_gate(user_id)
+    if blocked:
+        await _send_join_gate(event, user_id, missing)
+        return
 
     await event.respond(
         get_start_root_text(),
@@ -5239,13 +5223,20 @@ async def callback_handler(event):
     if data == b"join_verify_check":
         all_joined, missing = await check_user_joined_all(user_id)
         if all_joined:
-            verified_users.add(user_id)
-            mark_user_verified_db(user_id)
             user = user_data.get(user_id) or make_default_user(step="menu")
             user_data[user_id] = user
             await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
         else:
             await event.answer("برای استفاده از ربات، ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
+        return
+
+    # ====== نگهبانِ جوین اجباری (روی همه‌ی کلیک‌های دیگر، هر بار زنده) ======
+    # بدون این چک، کاربری که یک‌بار وارد پنل شده ولی الان از یکی از کانال‌ها
+    # لفت داده، همچنان می‌توانست با کلیک روی دکمه‌های داخل پنل به همه‌ی قابلیت‌ها
+    # دسترسی داشته باشد. اینجا (نه فقط توی /start) دوباره زنده چک می‌شود.
+    blocked, missing = await enforce_join_gate(user_id)
+    if blocked:
+        await safe_edit(event, JOIN_REQUIRED_TEXT, buttons=get_join_required_keyboard(missing))
         return
 
     # ====== منوی ادمین ======
