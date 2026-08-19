@@ -22,7 +22,7 @@ from telethon.errors import (
     UserNotParticipantError, ChatAdminRequiredError,
 )
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest
+from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest, SendReactionRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import (
@@ -33,6 +33,7 @@ from telethon.tl.types import (
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
     DocumentAttributeAnimated, ChannelParticipantLeft, ChannelParticipantBanned,
+    ReactionEmoji,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -4143,14 +4144,20 @@ def make_reaction_handler(user_id):
                         return
 
                     emoji = cur_targets[sender_id]["emoji"]
-                    # روی نسخه‌های مختلف Telethon، پارامتر reaction گاهی یک رشته و
-                    # گاهی لیستی از رشته/ReactionEmoji قبول می‌کند؛ برای اطمینان از کار
-                    # کردن ریکت (باگ گزارش‌شده: «ثبت می‌شود ولی ریکت اعمال نمی‌شود»)،
-                    # اول به شکل رشته‌ی تکی امتحان می‌شود و در صورت خطا، به شکل لیست.
-                    try:
-                        await safe_call(client.send_reaction, input_chat, message_id, reaction=emoji)
-                    except TypeError:
-                        await safe_call(client.send_reaction, input_chat, message_id, reaction=[emoji])
+                    # به‌جای متد میان‌راهیِ client.send_reaction (که وجودش/امضایش
+                    # بین نسخه‌های مختلف Telethon یکسان نیست و همین منبعِ اصلیِ باگِ
+                    # «ثبت می‌شود ولی ریکت اعمال نمی‌شود» بود)، مستقیماً از خودِ
+                    # درخواست خام تلگرام (messages.sendReaction) استفاده می‌کنیم که
+                    # امضای ثابت و تضمین‌شده دارد.
+                    await safe_call(
+                        client,
+                        SendReactionRequest(
+                            peer=input_chat,
+                            msg_id=message_id,
+                            reaction=[ReactionEmoji(emoticon=emoji)],
+                            add_to_recent=True,
+                        )
+                    )
                 except asyncio.CancelledError:
                     pass
                 except FloodWaitError as e:
@@ -6113,18 +6120,16 @@ async def callback_handler(event):
             "code_buffer": "",
             "recovery": False
         }
-        await safe_edit(event,
-            "📞 **مرحله اول: ارسال شماره**\n\n"
-            "برای جلوگیری از ثبت شماره‌های فیک/غیرواقعی، شماره باید فقط از طریق "
-            "دکمه‌ی «ارسال شماره تلفن» (پایین صفحه) فرستاده شود؛ با این دکمه، "
-            "خودِ تلگرام از شما تأیید می‌گیرد و شماره‌ی واقعیِ همین اکانت ارسال می‌شود.\n\n"
-            "روی دکمه‌ی «📞 ارسال شماره تلفن» بزنید و در پنجره‌ای که تلگرام باز می‌کند، "
-            "«Share My Phone Number» را تأیید کنید."
-        )
+        await safe_edit(event, "📞 در حال آماده‌سازی مرحله‌ی ارسال شماره...")
         await bot.send_message(
             user_id,
-            "برای ادامه، از دکمه‌ی زیر استفاده کنید 👇",
-            buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+            "📞 مرحله اول: ارسال شماره\n\n"
+            "برای استفاده از نوا سلف لازم است ابتدا شماره خود را از طریق دکمه زیر ارسال کنید\n\n"
+            "⚠️ روی دکمه‌ی «📞 ارسال شماره تلفن» بزنید و در پنجره باز شده «Share My Phone Number» "
+            "یا «اشتراک گذاری شماره تلفن من» را کلیک کنید.\n\n"
+            "⁉️ توجه داشته باشید نوا سلف تنها پیش نیاز های لازم برای اجرا سلف را از شما دریافت می کند "
+            "و تمامی اطلاعات شما پیش ما محفوظ است!",
+            buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
         )
         return
 
@@ -6147,17 +6152,17 @@ async def callback_handler(event):
             "code_buffer": "",
             "recovery": True
         }
-        await safe_edit(event,
-            "🔄 **بازیابی نشست**\n\n"
-            "موجودی، تنظیمات و رفرال شما دست‌نخورده باقی می‌ماند و فقط نشستِ اتصال حساب "
-            "دوباره ساخته می‌شود.\n\n"
-            "برای جلوگیری از ثبت شماره‌های فیک/غیرواقعی، شماره باید فقط از طریق "
-            "دکمه‌ی «ارسال شماره تلفن» (پایین صفحه) فرستاده شود."
-        )
+        await safe_edit(event, "🔄 در حال آماده‌سازی بازیابی نشست...")
         await bot.send_message(
             user_id,
-            "برای ادامه، از دکمه‌ی زیر استفاده کنید 👇",
-            buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+            "📞 مرحله اول: ارسال شماره\n\n"
+            "موجودی، تنظیمات و رفرال شما دست‌نخورده باقی می‌ماند و فقط نشستِ اتصال حساب دوباره "
+            "ساخته می‌شود؛ برای ادامه لازم است شماره‌ی حساب خود را از طریق دکمه زیر ارسال کنید\n\n"
+            "⚠️ روی دکمه‌ی «📞 ارسال شماره تلفن» بزنید و در پنجره باز شده «Share My Phone Number» "
+            "یا «اشتراک گذاری شماره تلفن من» را کلیک کنید.\n\n"
+            "⁉️ توجه داشته باشید نوا سلف تنها پیش نیاز های لازم برای اجرا سلف را از شما دریافت می کند "
+            "و تمامی اطلاعات شما پیش ما محفوظ است!",
+            buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
         )
         return
 
@@ -7826,7 +7831,7 @@ async def message_handler(event):
                 await event.respond(
                     "❌ لطفاً شماره را فقط با دکمه‌ی «📞 ارسال شماره تلفن» (پایین صفحه) ارسال کنید؛ "
                     "تایپ دستیِ شماره دیگر پذیرفته نمی‌شود.",
-                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
                 )
                 return
 
@@ -7834,7 +7839,7 @@ async def message_handler(event):
                 await event.respond(
                     "❌ فقط شماره‌ی خودتان قابل قبول است. لطفاً از دکمه‌ی «📞 ارسال شماره تلفن» "
                     "استفاده کنید (نه فوروارد کردن مخاطب دیگری).",
-                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
                 )
                 return
 
@@ -7843,7 +7848,7 @@ async def message_handler(event):
                 await event.respond(
                     f"{phone_error}\n\n"
                     "لطفاً دوباره با دکمه‌ی «📞 ارسال شماره تلفن» اقدام کنید.",
-                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
                 )
                 return  # در همان مرحله می‌ماند تا کاربر دوباره امتحان کند (بدون کرش)
 
@@ -7875,7 +7880,7 @@ async def message_handler(event):
                 await event.respond(
                     f"⏳ تلگرام درخواست شما را موقتاً محدود کرده است.\n"
                     f"لطفاً {e.seconds} ثانیه دیگر دوباره شماره را ارسال کنید.",
-                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
                 )
                 if client:
                     try:
@@ -7893,7 +7898,7 @@ async def message_handler(event):
                 await event.respond(
                     f"❌ **خطا در ارسال کد:**\n\n`{str(e)}`\n\n"
                     f"لطفاً {wait_seconds} ثانیه صبر کنید و دوباره شماره را ارسال کنید.",
-                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن", resize=True)]]
                 )
                 # generator_data عمداً حذف نمی‌شود تا کاربر مجبور به /start دوباره
                 # نشود؛ فقط در همین مرحله با محدودیت زمانی می‌ماند.
