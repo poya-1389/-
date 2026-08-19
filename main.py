@@ -4111,8 +4111,21 @@ def make_reaction_handler(user_id):
                 return
 
             emoji = targets[sender_id]["emoji"]
-            chat_id = event.chat_id
             message_id = event.id
+
+            # نکته‌ی مهم (باگ گزارش‌شده: «بعد از ثبت تازه‌ی سلف، ریکت روی کاربرِ
+            # ثبت‌شده اعمال نمی‌شود»): بلافاصله بعد از لاگین، کلاینتِ تازه‌ساخته‌شده
+            # هنوز هیچ کشِ Entity ندارد (چون get_dialogs یا مشابه آن اجرا نشده).
+            # send_reaction با یک chat_id خامِ int سعی می‌کند خودش Entity را از کش
+            # Resolve کند و همان لحظه (روی چت‌هایی که کلاینت تازه اولین پیامشان را
+            # می‌بیند) با خطای «entity پیدا نشد» شکست می‌خورد. اینجا به‌جای chat_id،
+            # از خودِ input_chat که مستقیماً از همین Update فعلی ساخته می‌شود
+            # استفاده می‌کنیم؛ این یکی از قبل Access Hash کامل دارد و نیازی به کش
+            # قدیمی ندارد.
+            try:
+                input_chat = await event.get_input_chat()
+            except Exception:
+                input_chat = event.chat_id  # فallback؛ بهتر از هیچ
 
             async def _delayed_react():
                 try:
@@ -4135,14 +4148,15 @@ def make_reaction_handler(user_id):
                     # کردن ریکت (باگ گزارش‌شده: «ثبت می‌شود ولی ریکت اعمال نمی‌شود»)،
                     # اول به شکل رشته‌ی تکی امتحان می‌شود و در صورت خطا، به شکل لیست.
                     try:
-                        await safe_call(client.send_reaction, chat_id, message_id, reaction=emoji)
+                        await safe_call(client.send_reaction, input_chat, message_id, reaction=emoji)
                     except TypeError:
-                        await safe_call(client.send_reaction, chat_id, message_id, reaction=[emoji])
+                        await safe_call(client.send_reaction, input_chat, message_id, reaction=[emoji])
                 except asyncio.CancelledError:
                     pass
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
+                    logging.warning(f"⚠️ ریکت روی کاربر {sender_id} برای Self {user_id} اعمال نشد: {e}")
                     log_internal_error("apply_reaction", f"user={user_id} target={sender_id} err={e}")
 
             _spawn_background_task(_delayed_react())
@@ -6100,9 +6114,17 @@ async def callback_handler(event):
             "recovery": False
         }
         await safe_edit(event,
-            "📞 **مرحله اول: وارد کردن شماره**\n\n"
-            "لطفاً شماره تلفن خود را به همراه کد کشور وارد کنید.\n"
-            "مثال: `+989123456789`"
+            "📞 **مرحله اول: ارسال شماره**\n\n"
+            "برای جلوگیری از ثبت شماره‌های فیک/غیرواقعی، شماره باید فقط از طریق "
+            "دکمه‌ی «ارسال شماره تلفن» (پایین صفحه) فرستاده شود؛ با این دکمه، "
+            "خودِ تلگرام از شما تأیید می‌گیرد و شماره‌ی واقعیِ همین اکانت ارسال می‌شود.\n\n"
+            "روی دکمه‌ی «📞 ارسال شماره تلفن» بزنید و در پنجره‌ای که تلگرام باز می‌کند، "
+            "«Share My Phone Number» را تأیید کنید."
+        )
+        await bot.send_message(
+            user_id,
+            "برای ادامه، از دکمه‌ی زیر استفاده کنید 👇",
+            buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
         )
         return
 
@@ -6129,8 +6151,13 @@ async def callback_handler(event):
             "🔄 **بازیابی نشست**\n\n"
             "موجودی، تنظیمات و رفرال شما دست‌نخورده باقی می‌ماند و فقط نشستِ اتصال حساب "
             "دوباره ساخته می‌شود.\n\n"
-            "لطفاً شماره تلفن حساب خود را به همراه کد کشور وارد کنید.\n"
-            "مثال: `+989123456789`"
+            "برای جلوگیری از ثبت شماره‌های فیک/غیرواقعی، شماره باید فقط از طریق "
+            "دکمه‌ی «ارسال شماره تلفن» (پایین صفحه) فرستاده شود."
+        )
+        await bot.send_message(
+            user_id,
+            "برای ادامه، از دکمه‌ی زیر استفاده کنید 👇",
+            buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
         )
         return
 
@@ -7193,12 +7220,28 @@ async def message_handler(event):
         "autoreply_get_trigger", "autoreply_get_response", "autoreply_get_delete_id",
     }
     _has_pending_step = user_id in user_data and user_data[user_id].get("step") in _pending_steps
+    # مراحل ساخت خودکار حساب (شماره/کد تایید/رمز دو مرحله‌ای) هم باید با /cancel
+    # قابل خروج باشند؛ قبلاً /cancel این حالت‌ها را نمی‌شناخت و کاربری که مثلاً
+    # وسط وارد کردن کد تایید گیر می‌کرد، هیچ راهی برای خروج نداشت.
+    _has_pending_login = user_id in generator_data
 
-    if text == "/cancel" and (user_id in broadcast_data or user_id in admin_action_data or _has_pending_step):
+    if text == "/cancel" and (user_id in broadcast_data or user_id in admin_action_data
+                               or _has_pending_step or _has_pending_login or user_id in purchase_data):
         # لغو یک خرید در حالِ انتظارِ رسید فقط State را ریست می‌کند؛ سفارشی که از قبل
         # در دیتابیس با وضعیت 'invoice' ثبت شده دست‌نخورده می‌ماند (کاربر می‌تواند بعداً
         # دوباره از حساب کاربری وارد بخش خرید شود، البته سفارش قدیمی دیگر از UI قابل
         # دسترسی نیست مگر مستقیماً توسط ادمین در دیتابیس بررسی شود).
+
+        # اگر وسط مراحل ورود (شماره/کد/رمز دو مرحله‌ای) گیر کرده، کلاینتِ موقتِ
+        # لاگین باید درست قطع شود؛ وگرنه یک اتصال باز و بی‌مصرف به تلگرام می‌ماند.
+        pending_client = active_signins.pop(user_id, None)
+        if pending_client:
+            try:
+                await pending_client.disconnect()
+            except Exception:
+                pass
+        generator_data.pop(user_id, None)
+
         broadcast_data.pop(user_id, None)
         admin_action_data.pop(user_id, None)
         transfer_data.pop(user_id, None)
@@ -7207,7 +7250,9 @@ async def message_handler(event):
         backup_upload_pending.pop(user_id, None)
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
-        await event.respond("❌ عملیات لغو شد.")
+        # buttons=Button.clear() هم چون ممکن است هنگام لغو، دکمه‌ی «ارسال شماره
+        # تلفن» (کیبورد پایین صفحه) هنوز باز باشد.
+        await event.respond("❌ عملیات لغو شد.", buttons=Button.clear())
         if is_admin(user_id):
             await event.respond("👑 پنل ادمین:", buttons=get_admin_main_menu())
         return
@@ -7770,17 +7815,41 @@ async def message_handler(event):
                 await event.respond(f"⏳ لطفاً {remaining} ثانیه دیگر صبر کنید و دوباره شماره را ارسال کنید.")
                 return
 
-            normalized_phone, phone_error = normalize_phone_number(text)
+            # شماره فقط از طریق دکمه‌ی «ارسال شماره تلفن» (Request Contact) پذیرفته
+            # می‌شود، نه با تایپ دستی. این‌طور تلگرام خودش تأیید می‌گیرد و همیشه
+            # شماره‌ی واقعیِ خودِ همین اکانت ارسال می‌شود؛ جلوی وارد کردن شماره‌های
+            # فیک/الکی که باعث درخواست کد اسپم به یک شماره‌ی نامرتبط می‌شد گرفته
+            # می‌شود. contact.user_id باید دقیقاً همان فرستنده باشد تا کسی نتواند
+            # با فوروارد کردن یک مخاطبِ دیگر این چک را دور بزند.
+            contact = getattr(event.message, "contact", None)
+            if not contact or not getattr(contact, "phone_number", None):
+                await event.respond(
+                    "❌ لطفاً شماره را فقط با دکمه‌ی «📞 ارسال شماره تلفن» (پایین صفحه) ارسال کنید؛ "
+                    "تایپ دستیِ شماره دیگر پذیرفته نمی‌شود.",
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                )
+                return
+
+            if getattr(contact, "user_id", None) != user_id:
+                await event.respond(
+                    "❌ فقط شماره‌ی خودتان قابل قبول است. لطفاً از دکمه‌ی «📞 ارسال شماره تلفن» "
+                    "استفاده کنید (نه فوروارد کردن مخاطب دیگری).",
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
+                )
+                return
+
+            normalized_phone, phone_error = normalize_phone_number(contact.phone_number)
             if phone_error:
                 await event.respond(
                     f"{phone_error}\n\n"
-                    "نمونه‌های قابل قبول: `0912xxxxxxx`، `912xxxxxxx`، `+98912xxxxxxx`"
+                    "لطفاً دوباره با دکمه‌ی «📞 ارسال شماره تلفن» اقدام کنید.",
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
                 )
                 return  # در همان مرحله می‌ماند تا کاربر دوباره امتحان کند (بدون کرش)
 
             generator["phone"] = normalized_phone
 
-            await event.respond("⏳ در حال اتصال به سرورهای تلگرام...")
+            await event.respond("⏳ در حال اتصال به سرورهای تلگرام...", buttons=Button.clear())
 
             client = None
             try:
@@ -7805,7 +7874,8 @@ async def message_handler(event):
                 generator["phone_wait_until"] = tehran_now() + timedelta(seconds=e.seconds)
                 await event.respond(
                     f"⏳ تلگرام درخواست شما را موقتاً محدود کرده است.\n"
-                    f"لطفاً {e.seconds} ثانیه دیگر دوباره شماره را ارسال کنید."
+                    f"لطفاً {e.seconds} ثانیه دیگر دوباره شماره را ارسال کنید.",
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
                 )
                 if client:
                     try:
@@ -7822,7 +7892,8 @@ async def message_handler(event):
 
                 await event.respond(
                     f"❌ **خطا در ارسال کد:**\n\n`{str(e)}`\n\n"
-                    f"لطفاً {wait_seconds} ثانیه صبر کنید و دوباره شماره را ارسال کنید."
+                    f"لطفاً {wait_seconds} ثانیه صبر کنید و دوباره شماره را ارسال کنید.",
+                    buttons=[[Button.request_phone("📞 ارسال شماره تلفن")]]
                 )
                 # generator_data عمداً حذف نمی‌شود تا کاربر مجبور به /start دوباره
                 # نشود؛ فقط در همین مرحله با محدودیت زمانی می‌ماند.
