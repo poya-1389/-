@@ -25,6 +25,7 @@ from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest, SendReactionRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
@@ -230,6 +231,19 @@ REACTION_SET_PREFIXES = (".ریکت ", ".react ")
 REACTION_REMOVE_TRIGGERS = {".حذف ریکت", ".remove react"}
 REACTION_APPLY_DELAY = 1.0  # طبق بند «اجرای خودکار»: حدود ۱ ثانیه تأخیر قبل از ریکت
 AUTOREPLY_MATCH_TYPES = {"exact": "برابر", "prefix": "پیشوند", "contains": "شامل"}
+
+# ====== آپدیت جدید: حذف/پاکسازی، بلاک/آن‌بلاک ======
+CLEANUP_COMMAND_RE = re.compile(r"^\.(?:حذف|delete)\s+([0-9۰-۹٠-٩]+)$", re.IGNORECASE)
+CLEANUP_MAX_COUNT = 100  # سقف امنیتی برای جلوگیری از فشار/FloodWait بیش از حد در یک اجرا
+
+_ZWNJ = "\u200c"
+
+def _normalize_block_cmd(s):
+    """نیم‌فاصله و فاصله‌های اضافی را حذف می‌کند تا اشکال مختلف نوشتاریِ دستور تشخیص داده شوند."""
+    return s.replace(_ZWNJ, "").replace(" ", "")
+
+BLOCK_TRIGGERS_NORMALIZED = {".بلاک", ".block"}
+UNBLOCK_TRIGGERS_NORMALIZED = {".آنبلاک", ".unblock"}
 MAX_AUTOREPLY_MEDIA_MB = 15
 MAX_AUTOREPLY_MEDIA_BYTES = MAX_AUTOREPLY_MEDIA_MB * 1024 * 1024
 
@@ -369,6 +383,7 @@ def init_db():
             ("reaction_enabled", "BOOLEAN DEFAULT FALSE"),
             ("autoreply_enabled", "BOOLEAN DEFAULT FALSE"),
             ("autoreply_match_type", "TEXT DEFAULT 'exact'"),
+            ("autoseen_enabled", "BOOLEAN DEFAULT FALSE"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -558,7 +573,8 @@ def get_all_users():
                    streetcat_enabled,
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                    fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
-                   meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type
+                   meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
+                   autoseen_enabled
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -611,6 +627,7 @@ def get_all_users():
                 "reaction_enabled": bool(row['reaction_enabled']),
                 "autoreply_enabled": bool(row['autoreply_enabled']),
                 "autoreply_match_type": row['autoreply_match_type'] or "exact",
+                "autoseen_enabled": bool(row['autoseen_enabled']) if row['autoseen_enabled'] is not None else False,
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -648,8 +665,9 @@ def save_user(user_id, user):
                  streetcat_enabled,
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
-                 meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
+                 autoseen_enabled)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -686,7 +704,8 @@ def save_user(user_id, user):
                 meow_chat_title = EXCLUDED.meow_chat_title,
                 reaction_enabled = EXCLUDED.reaction_enabled,
                 autoreply_enabled = EXCLUDED.autoreply_enabled,
-                autoreply_match_type = EXCLUDED.autoreply_match_type
+                autoreply_match_type = EXCLUDED.autoreply_match_type,
+                autoseen_enabled = EXCLUDED.autoseen_enabled
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -710,7 +729,7 @@ def save_user(user_id, user):
             user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
             user.get("meow_chat_title"),
             user.get("reaction_enabled", False), user.get("autoreply_enabled", False),
-            user.get("autoreply_match_type", "exact")
+            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False)
         ))
         conn.commit()
         cursor.close()
@@ -2336,6 +2355,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "reaction_enabled": False,
         "autoreply_enabled": False,
         "autoreply_match_type": "exact",
+        "autoseen_enabled": False,
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
         "fish_last_run_at": None,
@@ -2531,24 +2551,29 @@ def get_settings_root_keyboard(user_id):
 
     return [
         [
-            styled_button(lbl("date", "📅 تاریخ"), b"menu_date", style=STYLE_INFO),
-            styled_button(lbl("actions", "🎭 اکشن"), b"menu_actions", style=STYLE_INFO),
             styled_button(lbl("time", "⌚ ساعت"), b"menu_time", style=STYLE_INFO),
+            styled_button(lbl("actions", "🎭 اکشن"), b"menu_actions", style=STYLE_INFO),
+            styled_button(lbl("date", "📅 تاریخ"), b"menu_date", style=STYLE_INFO),
         ],
         [
-            styled_button(lbl("textmode", "🖊️ حالت متن"), b"menu_textmode", style=STYLE_INFO),
             styled_button(lbl("secretary", "🧑‍💼 منشی پیوی"), b"menu_secretary", style=STYLE_INFO),
+            styled_button(lbl("textmode", "🖊️ حالت متن"), b"menu_textmode", style=STYLE_INFO),
         ],
         [
-            styled_button(lbl("tag", "🏷️ تگ"), b"menu_tag", style=STYLE_INFO),
-            styled_button(lbl("meow", "🐱 میو"), b"menu_meow", style=STYLE_INFO),
             styled_button(lbl("ping", "🏓 پینگ"), b"menu_ping", style=STYLE_INFO),
+            styled_button(lbl("meow", "🐱 میو"), b"menu_meow", style=STYLE_INFO),
+            styled_button(lbl("tag", "🏷️ تگ"), b"menu_tag", style=STYLE_INFO),
         ],
         [
-            styled_button(lbl("autoreply", "🤖 پاسخ خودکار"), b"menu_autoreply", style=STYLE_INFO),
-            styled_button(lbl("reaction", "👍 ریکت"), b"menu_reaction", style=STYLE_INFO),
             styled_button(lbl("whois", "🪪 اطلاعات"), b"menu_whois", style=STYLE_INFO),
+            styled_button(lbl("reaction", "👍 ریکت"), b"menu_reaction", style=STYLE_INFO),
+            styled_button(lbl("autoreply", "🤖 پاسخ خودکار"), b"menu_autoreply", style=STYLE_INFO),
         ],
+        [
+            styled_button(lbl("blockmgmt", "🚫 بلاک و آن‌بلاک"), b"menu_blockmgmt", style=STYLE_INFO),
+            styled_button(lbl("cleanup", "🧹 حذف و پاکسازی"), b"menu_cleanup", style=STYLE_INFO),
+        ],
+        [styled_button(lbl("autoseen", "👁️ سین خودکار"), b"menu_autoseen", style=STYLE_INFO)],
         [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
 
@@ -2859,6 +2884,46 @@ def get_tag_menu_text():
 
 def get_tag_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
+
+# ======================== منوی حذف و پاکسازی ========================
+def get_cleanup_menu_text():
+    return (
+        "🧹 **حذف و پاکسازی**\n\n"
+        "این قابلیت با ارسال دستور زیر (توسط خودتان) در هر چتی فعال می‌شود:\n\n"
+        "▫️ `.حذف` + تعداد پیام\n"
+        "— حذف تعداد مشخصی از پیام‌های اخیر همان چت\n\n"
+        "مثال:\n"
+        "`.حذف 10`\n"
+        "یا:\n"
+        "`.حذف ۱۰`\n\n"
+        f"حداکثر {CLEANUP_MAX_COUNT} پیام در هر اجرا (برای جلوگیری از محدودیت تلگرام)."
+    )
+
+def get_cleanup_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
+
+# ======================== منوی بلاک و آن‌بلاک ========================
+def get_blockmgmt_menu_text():
+    return (
+        "🚫 **بلاک و آن‌بلاک**\n\n"
+        "این قابلیت با Reply روی پیام شخص موردنظر و ارسال یکی از دستورات زیر (توسط خودتان) کار می‌کند:\n\n"
+        "▫️ `.بلاک` — بلاک‌کردن همان کاربر\n"
+        "▫️ `.آن بلاک` — آن‌بلاک‌کردن همان کاربر\n\n"
+        "نکته: حتماً باید روی پیام همان شخص Reply کرده باشید."
+    )
+
+def get_blockmgmt_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
+
+# ======================== منوی سین خودکار ========================
+def get_autoseen_menu_text(user):
+    return f"👁️ **قابلیت سین خودکار**\n\nوضعیت: {status_icon(user.get('autoseen_enabled', False))}"
+
+def get_autoseen_menu_keyboard(user):
+    return [
+        [toggle_button("سین خودکار", user.get("autoseen_enabled", False), b"autoseen_toggle")],
+        [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
+    ]
 
 def get_secretary_menu_text(user):
     status = status_icon(user.get("secretary_enabled"))
@@ -3854,6 +3919,173 @@ async def handle_remove_reaction_command(event, user_id):
     except Exception as e:
         log_internal_error("remove_reaction_command", e)
 
+# ======================== دستور .حذف (پاکسازی پیام‌ها) ========================
+async def handle_cleanup_command(event, user_id, raw_count_text):
+    """
+    اجرای `.حذف N` (یا `.delete N`): عدد را (فارسی یا انگلیسی) تشخیص می‌دهد، خودِ
+    پیامِ دستور را حذف می‌کند و به‌علاوه N پیامِ اخیرِ ماقبلِ آن در همان چت را نیز
+    حذف می‌کند. اگر عدد نامعتبر/صفر/منفی بود، به‌جای حذف، فقط همان پیامِ دستور
+    با توضیح خطا ویرایش می‌شود (چیزی حذف نمی‌شود) تا کاربر متوجهِ ایرادِ کار شود.
+    """
+    try:
+        client = event.client
+        chat_id = event.chat_id
+
+        normalized = raw_count_text.translate(_PHONE_DIGIT_TRANSLATION)
+        try:
+            count = int(normalized)
+        except ValueError:
+            await safe_call(client.edit_message, chat_id, event.id,
+                             "❌ عدد نامعتبر است. مثال صحیح: `.حذف 10`")
+            return
+
+        if count <= 0:
+            await safe_call(client.edit_message, chat_id, event.id,
+                             "❌ تعداد باید بزرگ‌تر از صفر باشد.")
+            return
+
+        capped_note = ""
+        if count > CLEANUP_MAX_COUNT:
+            count = CLEANUP_MAX_COUNT
+            capped_note = f" (برای جلوگیری از محدودیت تلگرام، حداکثر {CLEANUP_MAX_COUNT} پیام در هر اجرا حذف می‌شود)"
+
+        # پیام‌های اخیرِ همین چت را (بدون خودِ پیامِ دستور) واکشی می‌کنیم
+        ids_to_delete = [event.id]
+        try:
+            older_msgs = await client.get_messages(chat_id, limit=count, offset_id=event.id)
+            ids_to_delete.extend(m.id for m in older_msgs)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            try:
+                older_msgs = await client.get_messages(chat_id, limit=count, offset_id=event.id)
+                ids_to_delete.extend(m.id for m in older_msgs)
+            except Exception as e2:
+                log_internal_error("cleanup_fetch_retry", f"user={user_id} err={e2}")
+        except Exception as e:
+            log_internal_error("cleanup_fetch", f"user={user_id} err={e}")
+
+        try:
+            await safe_call(client.delete_messages, chat_id, ids_to_delete)
+        except FloodWaitError:
+            raise  # خودِ safe_call قبلاً صبر و تلاش مجدد کرده؛ اگر بازم نشد بگذار به except بیرونی برسد
+        except Exception as e:
+            log_internal_error("cleanup_delete", f"user={user_id} chat={chat_id} err={e}")
+            # عدم موفقیت در حذف (مثلاً Permission در گروه) نباید کرش کند؛ فقط لاگ می‌شود.
+            if capped_note:
+                logging.info(f"🧹 پاکسازی{capped_note} برای کاربر {user_id} در چت {chat_id}")
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("cleanup_command", e)
+
+# ======================== دستورات .بلاک و .آن بلاک ========================
+def _display_name_of(entity):
+    name = " ".join(filter(None, [getattr(entity, "first_name", None), getattr(entity, "last_name", None)]))
+    if name:
+        return name
+    username = getattr(entity, "username", None)
+    if username:
+        return f"@{username}"
+    return str(getattr(entity, "id", "کاربر"))
+
+async def handle_block_command(event, user_id):
+    try:
+        if not event.is_reply:
+            await event.reply("❌ برای بلاک کردن باید روی پیام همان کاربر Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not reply.sender_id:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        client = event.client
+        try:
+            target = await reply.get_sender()
+        except Exception as e:
+            log_internal_error("block_get_sender", e)
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        if not target:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        name = _display_name_of(target)
+
+        try:
+            await safe_call(client, BlockRequest(id=target))
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception as e:
+            log_internal_error("block_command", f"user={user_id} target={getattr(target,'id',None)} err={e}")
+            await event.reply(f"❌ بلاک کردن {name} با خطا مواجه شد.")
+            return
+
+        await asyncio.sleep(0.2)
+        try:
+            await safe_call(client.edit_message, event.chat_id, event.id, f"کاربر {name} بلاک شد.")
+        except MessageNotModifiedError:
+            pass
+        except Exception as e:
+            log_internal_error("block_edit_message", e)
+
+        log_settings_change(user_id, "blocked_user", str(getattr(target, "id", "")))
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("block_command_unexpected", e)
+
+async def handle_unblock_command(event, user_id):
+    try:
+        if not event.is_reply:
+            await event.reply("❌ برای آن‌بلاک کردن باید روی پیام همان کاربر Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not reply.sender_id:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        client = event.client
+        try:
+            target = await reply.get_sender()
+        except Exception as e:
+            log_internal_error("unblock_get_sender", e)
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        if not target:
+            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            return
+
+        name = _display_name_of(target)
+
+        try:
+            await safe_call(client, UnblockRequest(id=target))
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception as e:
+            log_internal_error("unblock_command", f"user={user_id} target={getattr(target,'id',None)} err={e}")
+            await event.reply(f"❌ آن‌بلاک کردن {name} با خطا مواجه شد.")
+            return
+
+        await asyncio.sleep(0.2)
+        try:
+            await safe_call(client.edit_message, event.chat_id, event.id, f"کاربر {name} آن بلاک شد.")
+        except MessageNotModifiedError:
+            pass
+        except Exception as e:
+            log_internal_error("unblock_edit_message", e)
+
+        log_settings_change(user_id, "unblocked_user", str(getattr(target, "id", "")))
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("unblock_command_unexpected", e)
+
 def make_outgoing_handler(user_id):
     async def handler(event):
         try:
@@ -3900,6 +4132,30 @@ def make_outgoing_handler(user_id):
                     return
                 if lowered_cmd in REACTION_REMOVE_TRIGGERS:
                     await handle_remove_reaction_command(event, user_id)
+                    return
+
+            # --- حذف/پاکسازی پیام‌ها (.حذف N / .delete N — در هر نوع چتی) ---
+            if text_stripped:
+                cleanup_match = CLEANUP_COMMAND_RE.match(text_stripped)
+                if cleanup_match:
+                    if is_feature_locked(user_id, "cleanup"):
+                        await event.reply("این قابلیت برای شما قفل شده است.")
+                        return
+                    await handle_cleanup_command(event, user_id, cleanup_match.group(1))
+                    return
+
+            # --- بلاک / آن‌بلاک (.بلاک / .آن بلاک — در هر نوع چتی، فقط با Reply) ---
+            if text_stripped:
+                normalized_cmd = _normalize_block_cmd(text_stripped.lower())
+                is_block_cmd = normalized_cmd in BLOCK_TRIGGERS_NORMALIZED or normalized_cmd in UNBLOCK_TRIGGERS_NORMALIZED
+                if is_block_cmd and is_feature_locked(user_id, "blockmgmt"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
+                if normalized_cmd in BLOCK_TRIGGERS_NORMALIZED:
+                    await handle_block_command(event, user_id)
+                    return
+                if normalized_cmd in UNBLOCK_TRIGGERS_NORMALIZED:
+                    await handle_unblock_command(event, user_id)
                     return
 
             # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
@@ -4084,16 +4340,16 @@ def make_streetcat_handler(user_id):
 # ======================== قابلیت ریکت (اجرای خودکار) ========================
 def make_reaction_handler(user_id):
     """
-    وقتی یکی از کاربران داخل «لیست ریکت» در گروهی که Self هم عضو آن است پیام
-    جدیدی بفرستد، بعد از ~۱ ثانیه Delay، همان ایموجی روی پیامش ریکت زده می‌شود.
-    طبق بند «ریکت در چت‌هایی اجرا شود که Self و کاربر هدف هر دو در آن حضور دارند»
-    (یعنی گروه/سوپرگروه مشترک)، در پیوی اجرا نمی‌شود. هر کاربر مستقل مدیریت می‌شود؛
-    چون Delay فقط ۱ ثانیه است، برای هر پیام یک Task کوتاه‌مدت جدید ساخته می‌شود
-    (نه یک Task دائمی) تا با پیام‌های پی‌درپی تداخل/تجمع پیدا نکند.
+    وقتی یکی از کاربران داخل «لیست ریکت» پیام جدیدی بفرستد، بعد از ~۱ ثانیه Delay،
+    همان ایموجی روی پیامش ریکت زده می‌شود. طبق آپدیت جدید، این قابلیت هم در
+    گروه/سوپرگروه مشترک و هم در چت خصوصی (وقتی همان کاربر مستقیماً به صاحب سلف
+    پیام بدهد) کار می‌کند. هر کاربر مستقل مدیریت می‌شود؛ چون Delay فقط ۱ ثانیه
+    است، برای هر پیام یک Task کوتاه‌مدت جدید ساخته می‌شود (نه یک Task دائمی) تا
+    با پیام‌های پی‌درپی تداخل/تجمع پیدا نکند.
     """
     async def handler(event):
         try:
-            if event.out or event.is_private:
+            if event.out:
                 return
 
             user = user_data.get(user_id)
@@ -4170,6 +4426,43 @@ def make_reaction_handler(user_id):
         except Exception as e:
             logging.error(f"⚠️ خطای هندلر ریکت برای کاربر {user_id}: {e}")
             log_internal_error("reaction_handler_unexpected", e)
+
+    return handler
+
+# ======================== قابلیت سین خودکار ========================
+def make_autoseen_handler(user_id):
+    """
+    وقتی قابلیت روشن است، هر پیام خصوصیِ دریافتی از یک کاربرِ واقعی (نه بات)
+    بلافاصله Seen/Read می‌شود. طبق درخواست صریح، برای بات‌ها اجرا نمی‌شود و
+    محدود به یک چت خاص نیست — روی همه‌ی چت‌های خصوصی صاحب سلف فعال است.
+    """
+    async def handler(event):
+        try:
+            if event.out or not event.is_private:
+                return
+
+            user = user_data.get(user_id)
+            if not user or not user.get("status") or not user.get("autoseen_enabled"):
+                return
+
+            if is_feature_locked(user_id, "autoseen"):
+                return
+
+            try:
+                chat = await event.get_chat()
+            except Exception as e:
+                log_internal_error("autoseen_get_chat", f"user={user_id} err={e}")
+                return
+
+            if not chat or getattr(chat, "bot", False):
+                return  # طبق درخواست صریح: فقط Userهای واقعی، نه Botها
+
+            client = event.client
+            await safe_call(client.send_read_acknowledge, event.chat_id)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log_internal_error("autoseen_handler", f"user={user_id} err={e}")
 
     return handler
 
@@ -4293,6 +4586,7 @@ def register_active_client(user_id, client):
     client.add_event_handler(make_streetcat_handler(user_id), events.NewMessage(incoming=True))
     client.add_event_handler(make_reaction_handler(user_id), events.NewMessage(incoming=True))
     client.add_event_handler(make_autoreply_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_autoseen_handler(user_id), events.NewMessage(incoming=True))
 
     loop = asyncio.get_event_loop()
     if user_id in user_data:
@@ -6674,6 +6968,34 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event, get_whois_menu_text(), buttons=get_whois_menu_keyboard())
+        return
+
+    if data == b"menu_cleanup":
+        if is_feature_locked(user_id, "cleanup"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_cleanup_menu_text(), buttons=get_cleanup_menu_keyboard())
+        return
+
+    if data == b"menu_blockmgmt":
+        if is_feature_locked(user_id, "blockmgmt"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_blockmgmt_menu_text(), buttons=get_blockmgmt_menu_keyboard())
+        return
+
+    if data == b"menu_autoseen":
+        if is_feature_locked(user_id, "autoseen"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_autoseen_menu_text(user), buttons=get_autoseen_menu_keyboard(user))
+        return
+
+    if data == b"autoseen_toggle":
+        user["autoseen_enabled"] = not user.get("autoseen_enabled", False)
+        save_user(user_id, user)
+        log_settings_change(user_id, "autoseen_enabled", user["autoseen_enabled"])
+        await safe_edit(event, get_autoseen_menu_text(user), buttons=get_autoseen_menu_keyboard(user))
         return
 
     # ====================================================================
