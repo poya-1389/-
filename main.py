@@ -13,6 +13,11 @@ import psycopg2
 import jdatetime
 from hijridate import Gregorian
 from psycopg2.extras import DictCursor
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events, Button, helpers
 from telethon.sessions import StringSession
@@ -21,7 +26,7 @@ from telethon.errors import (
     ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
     UserNotParticipantError, ChatAdminRequiredError,
 )
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.account import UpdateProfileRequest, UpdateStatusRequest
 from telethon.tl.functions.messages import SetTypingRequest, GetFullChatRequest, SendReactionRequest
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.channels import GetParticipantRequest
@@ -244,6 +249,7 @@ def _normalize_block_cmd(s):
 
 BLOCK_TRIGGERS_NORMALIZED = {".بلاک", ".block"}
 UNBLOCK_TRIGGERS_NORMALIZED = {".آنبلاک", ".unblock"}
+VIDEOMESSAGE_TRIGGERS = {".ویدیو مسیج", ".video message", ".videomessage"}
 MAX_AUTOREPLY_MEDIA_MB = 15
 MAX_AUTOREPLY_MEDIA_BYTES = MAX_AUTOREPLY_MEDIA_MB * 1024 * 1024
 
@@ -384,6 +390,7 @@ def init_db():
             ("autoreply_enabled", "BOOLEAN DEFAULT FALSE"),
             ("autoreply_match_type", "TEXT DEFAULT 'exact'"),
             ("autoseen_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("always_online_enabled", "BOOLEAN DEFAULT FALSE"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -574,7 +581,7 @@ def get_all_users():
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                    fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                    meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                   autoseen_enabled
+                   autoseen_enabled, always_online_enabled
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -628,6 +635,7 @@ def get_all_users():
                 "autoreply_enabled": bool(row['autoreply_enabled']),
                 "autoreply_match_type": row['autoreply_match_type'] or "exact",
                 "autoseen_enabled": bool(row['autoseen_enabled']) if row['autoseen_enabled'] is not None else False,
+                "always_online_enabled": bool(row['always_online_enabled']) if row['always_online_enabled'] is not None else False,
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -666,8 +674,8 @@ def save_user(user_id, user):
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                  meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                 autoseen_enabled)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 autoseen_enabled, always_online_enabled)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -705,7 +713,8 @@ def save_user(user_id, user):
                 reaction_enabled = EXCLUDED.reaction_enabled,
                 autoreply_enabled = EXCLUDED.autoreply_enabled,
                 autoreply_match_type = EXCLUDED.autoreply_match_type,
-                autoseen_enabled = EXCLUDED.autoseen_enabled
+                autoseen_enabled = EXCLUDED.autoseen_enabled,
+                always_online_enabled = EXCLUDED.always_online_enabled
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -729,7 +738,8 @@ def save_user(user_id, user):
             user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
             user.get("meow_chat_title"),
             user.get("reaction_enabled", False), user.get("autoreply_enabled", False),
-            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False)
+            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False),
+            user.get("always_online_enabled", False)
         ))
         conn.commit()
         cursor.close()
@@ -1676,6 +1686,10 @@ FEATURE_LOCK_DEFS = [
     ("whois", "🪪 اطلاعات"),
     ("reaction", "👍 ریکت"),
     ("autoreply", "🤖 پاسخ خودکار"),
+    ("cleanup", "🧹 حذف و پاکسازی"),
+    ("blockmgmt", "🚫 بلاک و آن‌بلاک"),
+    ("autoseen", "👁️ سین خودکار"),
+    ("videomessage", "🎥 ویدیو مسیج"),
 ]
 FEATURE_LOCK_LABELS = dict(FEATURE_LOCK_DEFS)
 
@@ -2356,6 +2370,7 @@ def make_default_user(session=None, status=False, step="menu"):
         "autoreply_enabled": False,
         "autoreply_match_type": "exact",
         "autoseen_enabled": False,
+        "always_online_enabled": False,
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
         "fish_last_run_at": None,
@@ -2543,37 +2558,47 @@ def get_panel_root_keyboard(user):
     ]
 
 def get_settings_root_keyboard(user_id):
-    """صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی."""
+    """
+    صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی.
+    وقتی قابلیتی برای کاربر قفل باشد: به‌جای ایموجی مخصوص همان قابلیت، ایموجی
+    🔒 نمایش داده می‌شود و رنگ دکمه هم قرمز (STYLE_OFF) می‌شود.
+    """
     locks = feature_locks.get(user_id, set())
 
-    def lbl(key, text):
-        return f"{text} 🔒" if key in locks else text
+    def btn(key, emoji, text, cb_data):
+        locked = key in locks
+        icon = "🔒" if locked else emoji
+        style = STYLE_OFF if locked else STYLE_INFO
+        return styled_button(f"{icon} {text}", cb_data, style=style)
 
     return [
         [
-            styled_button(lbl("time", "⌚ ساعت"), b"menu_time", style=STYLE_INFO),
-            styled_button(lbl("actions", "🎭 اکشن"), b"menu_actions", style=STYLE_INFO),
-            styled_button(lbl("date", "📅 تاریخ"), b"menu_date", style=STYLE_INFO),
+            btn("time", "⌚", "ساعت", b"menu_time"),
+            btn("actions", "🎭", "اکشن", b"menu_actions"),
+            btn("date", "📅", "تاریخ", b"menu_date"),
         ],
         [
-            styled_button(lbl("secretary", "🧑‍💼 منشی پیوی"), b"menu_secretary", style=STYLE_INFO),
-            styled_button(lbl("textmode", "🖊️ حالت متن"), b"menu_textmode", style=STYLE_INFO),
+            btn("secretary", "🧑‍💼", "منشی پیوی", b"menu_secretary"),
+            btn("textmode", "🖊️", "حالت متن", b"menu_textmode"),
         ],
         [
-            styled_button(lbl("ping", "🏓 پینگ"), b"menu_ping", style=STYLE_INFO),
-            styled_button(lbl("meow", "🐱 میو"), b"menu_meow", style=STYLE_INFO),
-            styled_button(lbl("tag", "🏷️ تگ"), b"menu_tag", style=STYLE_INFO),
+            btn("ping", "🏓", "پینگ", b"menu_ping"),
+            btn("meow", "🐱", "میو", b"menu_meow"),
+            btn("tag", "🏷️", "تگ", b"menu_tag"),
         ],
         [
-            styled_button(lbl("whois", "🪪 اطلاعات"), b"menu_whois", style=STYLE_INFO),
-            styled_button(lbl("reaction", "👍 ریکت"), b"menu_reaction", style=STYLE_INFO),
-            styled_button(lbl("autoreply", "🤖 پاسخ خودکار"), b"menu_autoreply", style=STYLE_INFO),
+            btn("whois", "🪪", "اطلاعات", b"menu_whois"),
+            btn("reaction", "👍", "ریکت", b"menu_reaction"),
+            btn("autoreply", "🤖", "پاسخ خودکار", b"menu_autoreply"),
         ],
         [
-            styled_button(lbl("blockmgmt", "🚫 بلاک و آن‌بلاک"), b"menu_blockmgmt", style=STYLE_INFO),
-            styled_button(lbl("cleanup", "🧹 حذف و پاکسازی"), b"menu_cleanup", style=STYLE_INFO),
+            btn("blockmgmt", "🚫", "بلاک و آن‌بلاک", b"menu_blockmgmt"),
+            btn("cleanup", "🧹", "حذف و پاکسازی", b"menu_cleanup"),
         ],
-        [styled_button(lbl("autoseen", "👁️ سین خودکار"), b"menu_autoseen", style=STYLE_INFO)],
+        [
+            btn("autoseen", "👁️", "سین خودکار", b"menu_autoseen"),
+            btn("videomessage", "🎥", "ویدیو مسیج", b"menu_videomessage"),
+        ],
         [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
 
@@ -2781,7 +2806,7 @@ def get_fonts_menu_keyboard(current_font_id):
     buttons.append([styled_button("➜ بازگشت", b"menu_time", style=STYLE_OFF)])
     return buttons
 
-def get_actions_menu_keyboard(current_action):
+def get_actions_menu_keyboard(current_action, always_online_enabled=False):
     buttons = []
     row = []
 
@@ -2796,6 +2821,9 @@ def get_actions_menu_keyboard(current_action):
 
     if row:
         buttons.append(row)
+
+    # حالت جدید: همیشه آنلاین (مستقل از انتخاب بالا، On/Off جداگانه)
+    buttons.append([toggle_button("🟢 همیشه آنلاین", always_online_enabled, b"always_online_toggle")])
 
     buttons.append([styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)])
     return buttons
@@ -2924,6 +2952,17 @@ def get_autoseen_menu_keyboard(user):
         [toggle_button("سین خودکار", user.get("autoseen_enabled", False), b"autoseen_toggle")],
         [styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]
     ]
+
+# ======================== منوی ویدیو مسیج ========================
+def get_videomessage_menu_text():
+    return (
+        "🎥 **قابلیت ویدیو مسیج**\n\n"
+        "▫️ `.ویدیو مسیج` + ریپلای\n\n"
+        "روی یک ویدیو ریپلای کنید و خروجی را به‌صورت ویدیو مسیج یا ویدیو گرد دریافت کنید"
+    )
+
+def get_videomessage_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 def get_secretary_menu_text(user):
     status = status_icon(user.get("secretary_enabled"))
@@ -3523,6 +3562,10 @@ ADMIN_MANAGEABLE_FEATURES = [
     ("bio_time", "ساعت بیو"),
     ("date_enabled", "تاریخ بیو"),
     ("secretary_enabled", "منشی پیوی"),
+    ("reaction_enabled", "ریکت"),
+    ("autoreply_enabled", "پاسخ خودکار"),
+    ("autoseen_enabled", "سین خودکار"),
+    ("always_online_enabled", "همیشه آنلاین"),
 ]
 
 def get_user_features_text(user_id):
@@ -4086,6 +4129,45 @@ async def handle_unblock_command(event, user_id):
     except Exception as e:
         log_internal_error("unblock_command_unexpected", e)
 
+# ======================== دستور .ویدیو مسیج ========================
+async def handle_videomessage_command(event, user_id):
+    """
+    اجرای `.ویدیو مسیج` روی یک پیامِ ویدیوییِ Reply‌شده: همان ویدیو را (بدون
+    دانلود جداگانه، مستقیم از خودِ رسانه‌ی پیام) به‌صورت ویدیو مسیج/ویدیو گرد
+    تلگرام دوباره در همان چت ارسال می‌کند.
+
+    نکته: تلگرام برای ویدیو مسیج محدودیت‌های فنی دارد (باید مربعی و با فرمت
+    استاندارد mp4/h264 باشد)؛ اگر ویدیوی ورودی این شرایط را نداشته باشد، تلگرام
+    خودش خطا برمی‌گرداند که اینجا بدون کرش، با پیام روشن به کاربر مدیریت می‌شود.
+    """
+    try:
+        if not event.is_reply:
+            await event.reply("❌ برای این قابلیت باید روی یک ویدیو Reply کنید.")
+            return
+
+        reply = await event.get_reply_message()
+        if not reply or not getattr(reply, "video", None):
+            await event.reply("❌ باید روی یک پیامِ ویدیویی Reply کنید.")
+            return
+
+        client = event.client
+        try:
+            await safe_call(client.send_file, event.chat_id, reply.media, video_note=True)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception as e:
+            log_internal_error("videomessage_command", f"user={user_id} err={e}")
+            await event.reply(
+                "❌ تبدیل به ویدیو مسیج ناموفق بود؛ ویدیو باید مربعی، کوتاه و با فرمت "
+                "استاندارد mp4 باشد."
+            )
+            return
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("videomessage_command_unexpected", e)
+
 def make_outgoing_handler(user_id):
     async def handler(event):
         try:
@@ -4157,6 +4239,14 @@ def make_outgoing_handler(user_id):
                 if normalized_cmd in UNBLOCK_TRIGGERS_NORMALIZED:
                     await handle_unblock_command(event, user_id)
                     return
+
+            # --- ویدیو مسیج (.ویدیو مسیج — در هر نوع چتی، فقط با Reply روی ویدیو) ---
+            if text_stripped and text_stripped.lower() in VIDEOMESSAGE_TRIGGERS:
+                if is_feature_locked(user_id, "videomessage"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
+                await handle_videomessage_command(event, user_id)
+                return
 
             # --- دستورات تگ (فقط داخل گروه/سوپرگروه) ---
             if text_stripped and not event.is_private:
@@ -4728,6 +4818,19 @@ async def self_bot_action_worker(user_id, client):
                 break
 
             user = user_data[user_id]
+
+            # حالت جدید «همیشه آنلاین»: مستقل از انتخابِ اکشنِ تایپ/آپلود است، پس اینجا
+            # (قبل از early-continueِ مربوط به action_key) هر ۴ ثانیه وضعیت آنلاینِ واقعیِ
+            # اکانت را تازه نگه می‌دارد (وگرنه تلگرام بعد از چند ثانیه بی‌کاری خودکار
+            # Offline نشان می‌دهد).
+            if user.get("always_online_enabled"):
+                try:
+                    await client(UpdateStatusRequest(offline=False))
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds)
+                except Exception as e:
+                    log_internal_error("always_online", f"user={user_id} err={e}")
+
             action_key = user["active_action"]
 
             if action_key == 'none' or action_key not in ACTIONS:
@@ -5391,6 +5494,146 @@ async def autostart_saved_users():
             log_internal_error("autostart_saved_users", e)
 
 # ======================== هندلرهای ربات ========================
+def _load_card_font(size, bold=True):
+    """فونت لاتین برای کارت پنل؛ روی چند مسیر رایج امتحان می‌شود و در نبودشان
+    به فونت پیش‌فرض Pillow برمی‌گردد (بدون کرش)."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+def _card_text_width(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0]
+
+async def build_panel_card_image(owner_id, user):
+    """
+    ساخت تصویر «کارت پنل» با ظاهر دیجیتالی برای دستور `.پنل`: بالای تصویر
+    NOVA SELF، وسط عکسِ پروفایلِ کاربر در دایره‌ای متوسط با حلقه‌ی نئونی، و
+    زیرش یوزرنیم و آیدی عددی‌اش.
+
+    اگر Pillow نصب نباشد، یا دانلود عکس پروفایل/هر بخش دیگر با خطا مواجه شود،
+    None برمی‌گرداند تا پنل بدون تصویر (دقیقاً مثل قبل، فقط متنی) کار کند و
+    قابلیت اصلیِ باز شدنِ پنل هرگز به‌خاطر این افزوده به‌هم نریزد.
+    """
+    if not _PIL_AVAILABLE:
+        return None
+    try:
+        W, H = 800, 820
+        bg_top, bg_bottom = (6, 8, 24), (22, 8, 46)
+        img = Image.new("RGB", (W, H), bg_top)
+        draw = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y / H
+            r = int(bg_top[0] + (bg_bottom[0] - bg_top[0]) * t)
+            g = int(bg_top[1] + (bg_bottom[1] - bg_top[1]) * t)
+            b = int(bg_top[2] + (bg_bottom[2] - bg_top[2]) * t)
+            draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+        grid_color = (32, 50, 78)
+        for x in range(0, W, 44):
+            draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
+        for y in range(0, H, 44):
+            draw.line([(0, y), (W, y)], fill=grid_color, width=1)
+
+        accent = (0, 220, 255)
+        bl, pad, lw = 46, 34, 4
+        for (cx, cy, dx, dy) in [(pad, pad, 1, 1), (W - pad, pad, -1, 1),
+                                  (pad, H - pad, 1, -1), (W - pad, H - pad, -1, -1)]:
+            draw.line([(cx, cy), (cx + dx * bl, cy)], fill=accent, width=lw)
+            draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
+
+        title_font = _load_card_font(64, bold=True)
+        sub_font_small = _load_card_font(20, bold=False)
+        title_text = "NOVA SELF"
+
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_layer)
+        tw = _card_text_width(glow_draw, title_text, title_font)
+        title_x, title_y = (W - tw) / 2, 66
+        glow_draw.text((title_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(12))
+        img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        draw.text((title_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
+
+        sub_text = "S E L F   M A N A G E M E N T   P A N E L"
+        sw = _card_text_width(draw, sub_text, sub_font_small)
+        draw.text(((W - sw) / 2, title_y + 80), sub_text, font=sub_font_small, fill=(120, 170, 220))
+        draw.line([(W // 2 - 140, title_y + 120), (W // 2 + 140, title_y + 120)], fill=(0, 150, 190), width=2)
+
+        avatar_size = 260
+        avatar_x, avatar_y = (W - avatar_size) // 2, 300
+
+        avatar_img = None
+        try:
+            photo_bytes = await bot.download_profile_photo(owner_id, file=bytes)
+            if photo_bytes:
+                avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+        except Exception as e:
+            log_internal_error("panel_card_avatar_download", f"user={owner_id} err={e}")
+            avatar_img = None
+
+        if avatar_img is None:
+            avatar_img = Image.new("RGB", (avatar_size, avatar_size), (26, 30, 54))
+            ad = ImageDraw.Draw(avatar_img)
+            initial_source = user.get("username") or str(owner_id)
+            initial = initial_source[0].upper()
+            init_font = _load_card_font(110)
+            iw = _card_text_width(ad, initial, init_font)
+            ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 55), initial, font=init_font, fill=(0, 220, 255))
+        else:
+            # مربعی‌کردن (Crop از وسط) قبل از دایره‌ای‌کردن، تا عکس‌های غیرمربعی کش نیایند
+            w0, h0 = avatar_img.size
+            side = min(w0, h0)
+            left, top = (w0 - side) // 2, (h0 - side) // 2
+            avatar_img = avatar_img.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size))
+
+        mask = Image.new("L", (avatar_size, avatar_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+
+        ring_pad = 14
+        ring_size = avatar_size + ring_pad * 2
+        ring_layer = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
+        ring_draw = ImageDraw.Draw(ring_layer)
+        ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=6)
+        ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(6))
+        img.paste(ring_blur, (avatar_x - ring_pad, avatar_y - ring_pad), ring_blur)
+        img.paste(ring_layer, (avatar_x - ring_pad, avatar_y - ring_pad), ring_layer)
+        img.paste(avatar_img, (avatar_x, avatar_y), mask)
+
+        draw = ImageDraw.Draw(img)
+        info_font = _load_card_font(34, bold=True)
+        sub_font = _load_card_font(24, bold=False)
+        # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
+        # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
+        username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
+        id_text = f"ID: {owner_id}"
+        uw = _card_text_width(draw, username_text, info_font)
+        draw.text(((W - uw) / 2, avatar_y + avatar_size + 45), username_text, font=info_font, fill=(255, 255, 255))
+        iw2 = _card_text_width(draw, id_text, sub_font)
+        draw.text(((W - iw2) / 2, avatar_y + avatar_size + 95), id_text, font=sub_font, fill=(140, 195, 255))
+
+        tag_font = _load_card_font(16, bold=False)
+        tag_text = "NOVASELF • DIGITAL IDENTITY CARD"
+        tgw = _card_text_width(draw, tag_text, tag_font)
+        draw.text(((W - tgw) / 2, H - 56), tag_text, font=tag_font, fill=(80, 110, 150))
+
+        out = io.BytesIO()
+        out.name = "novaself_panel.png"
+        img.save(out, "PNG")
+        out.seek(0)
+        return out
+    except Exception as e:
+        log_internal_error("panel_card_image", e)
+        return None
+
 @bot.on(events.InlineQuery)
 async def inline_panel_handler(event):
     """
@@ -5426,12 +5669,25 @@ async def inline_panel_handler(event):
 
     builder = event.builder
     keyboard = wrap_panel_buttons(get_panel_root_keyboard(user), owner_id)
+
+    card_image = await build_panel_card_image(owner_id, user)
+    if card_image is not None:
+        try:
+            result = builder.photo(card_image, text=PANEL_TEXT, buttons=keyboard)
+            await event.answer([result], cache_time=0)
+            return
+        except Exception as e:
+            # اگر آپلود تصویر هر دلیلی شکست خورد، به حالت متنیِ قبلی برمی‌گردیم
+            # (کاربر هیچ‌وقت نباید به‌خاطر این افزوده اصلاً پنلی دریافت نکند).
+            log_internal_error("panel_card_photo_result", e)
+
     result = builder.article(
-        "🔗 پنل NovaSelf",
+        "پـنـل مـدیـریـت نـوا سـلـف",
         text=PANEL_TEXT,
         buttons=keyboard,
     )
     await event.answer([result], cache_time=0)
+
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -5477,7 +5733,8 @@ async def admin_handler(event):
     user_id = event.sender_id
 
     if not is_admin(user_id):
-        await event.respond("❌ شما دسترسی ادمین ندارید!")
+        # طبق درخواست صریح: کاربران غیرِادمین دیگر هیچ پاسخی دریافت نمی‌کنند
+        # (قبلاً پیام «❌ شما دسترسی ادمین ندارید!» نمایش داده می‌شد).
         return
 
     await event.respond(
@@ -6011,6 +6268,7 @@ async def callback_handler(event):
                     if user.get("secretary_enabled") else status_icon(False)
                 )
                 username_display = f"@{user.get('username')}" if user.get("username") else "ثبت نشده"
+                expiry_text = format_expiry(user.get("diamonds", 0))
 
                 await safe_edit(event,
                     f"👤 **جزئیات کاربر:**\n\n"
@@ -6018,6 +6276,7 @@ async def callback_handler(event):
                     f"💡 یوزرنیم: {username_display}\n"
                     f"📊 وضعیت: {status_text}\n"
                     f"💎 موجودی الماس: {format_diamonds(user.get('diamonds', 0))} ({format_toman(user.get('diamonds', 0))} تومان)\n"
+                    f"⏳ انقضا: {expiry_text}\n"
                     f"👥 تعداد رفرال: {user.get('referral_count', 0)}\n"
                     f"🔤 فونت: {font_name}\n"
                     f"⌚ ساعت نام: {status_icon(user['name_time'])}\n"
@@ -6026,6 +6285,10 @@ async def callback_handler(event):
                     f"🖊️ حالت متن: {textmode_text}\n"
                     f"🧑‍💼 منشی پیوی: {secretary_text}\n"
                     f"🎭 اکشن: {action_name}\n"
+                    f"🟢 همیشه آنلاین: {status_icon(user.get('always_online_enabled', False))}\n"
+                    f"👍 ریکت: {status_icon(user.get('reaction_enabled', False))}\n"
+                    f"🤖 پاسخ خودکار: {status_icon(user.get('autoreply_enabled', False))}\n"
+                    f"👁️ سین خودکار: {status_icon(user.get('autoseen_enabled', False))}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
                     buttons=get_user_detail_buttons(target_id)
@@ -6560,7 +6823,7 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             "با انتخاب هر گزینه، وضعیت شما به‌صورت مداوم برای دیگران نمایش داده می‌شود:",
-            buttons=get_actions_menu_keyboard(user["active_action"])
+            buttons=get_actions_menu_keyboard(user["active_action"], user.get("always_online_enabled", False))
         )
         return
 
@@ -6665,7 +6928,21 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
-            buttons=get_actions_menu_keyboard(user["active_action"])
+            buttons=get_actions_menu_keyboard(user["active_action"], user.get("always_online_enabled", False))
+        )
+        return
+
+    if data == b"always_online_toggle":
+        if is_feature_locked(user_id, "actions"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        user["always_online_enabled"] = not user.get("always_online_enabled", False)
+        save_user(user_id, user)
+        log_settings_change(user_id, "always_online_enabled", user["always_online_enabled"])
+        await safe_edit(event,
+            "🎭 **مدیریت اکشن‌های فیک**\n\n"
+            f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
+            buttons=get_actions_menu_keyboard(user["active_action"], user["always_online_enabled"])
         )
         return
 
@@ -6989,6 +7266,13 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event, get_autoseen_menu_text(user), buttons=get_autoseen_menu_keyboard(user))
+        return
+
+    if data == b"menu_videomessage":
+        if is_feature_locked(user_id, "videomessage"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_videomessage_menu_text(), buttons=get_videomessage_menu_keyboard())
         return
 
     if data == b"autoseen_toggle":
