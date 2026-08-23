@@ -8,11 +8,18 @@ import pickle
 import json
 import base64
 import io
+import tempfile
+import shutil
 import pytz
 import psycopg2
 import jdatetime
 from hijridate import Gregorian
 from psycopg2.extras import DictCursor
+try:
+    import imageio_ffmpeg
+    _FFMPEG_AVAILABLE = True
+except ImportError:
+    _FFMPEG_AVAILABLE = False
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     _PIL_AVAILABLE = True
@@ -39,7 +46,7 @@ from telethon.tl.types import (
     MessageEntityStrike, MessageEntitySpoiler, MessageEntityCode,
     MessageEntityBlockquote, ChannelParticipantsAdmins, InputMessageEntityMentionName,
     DocumentAttributeAnimated, ChannelParticipantLeft, ChannelParticipantBanned,
-    ReactionEmoji,
+    ReactionEmoji, DocumentAttributeVideo,
 )
 import logging
 from webapp_api import create_webapp_app, run_webapp_server
@@ -296,7 +303,12 @@ ACTIONS = {
     'doc': ('در حال ارسال سند', SendMessageUploadDocumentAction(0)),
     'video': ('در حال ارسال ویدیو', SendMessageUploadVideoAction(0)),
     'game': ('در حال بازی', SendMessageGamePlayAction()),
-    'sticker': ('در حال انتخاب استیکر', SendMessageChooseStickerAction())
+    'sticker': ('در حال انتخاب استیکر', SendMessageChooseStickerAction()),
+    # نکته: «همیشه آنلاین» مثل بقیه‌ی اکشن‌ها فقط یکی از آن‌ها هم‌زمان قابل انتخاب
+    # است، اما مکانیزم اجرایش با بقیه فرق دارد (UpdateStatusRequest به‌جای
+    # SetTypingRequest) - همین‌جا در self_bot_action_worker قبل از حلقه‌ی
+    # تایپ/آپلود جداگانه هندل می‌شود، پس مقدار دومِ تاپل اینجا استفاده نمی‌شود.
+    'online': ('همیشه آنلاین', None),
 }
 
 # ======================== انواع تاریخ ========================
@@ -390,7 +402,6 @@ def init_db():
             ("autoreply_enabled", "BOOLEAN DEFAULT FALSE"),
             ("autoreply_match_type", "TEXT DEFAULT 'exact'"),
             ("autoseen_enabled", "BOOLEAN DEFAULT FALSE"),
-            ("always_online_enabled", "BOOLEAN DEFAULT FALSE"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -581,7 +592,7 @@ def get_all_users():
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                    fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                    meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                   autoseen_enabled, always_online_enabled
+                   autoseen_enabled
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -635,7 +646,6 @@ def get_all_users():
                 "autoreply_enabled": bool(row['autoreply_enabled']),
                 "autoreply_match_type": row['autoreply_match_type'] or "exact",
                 "autoseen_enabled": bool(row['autoseen_enabled']) if row['autoseen_enabled'] is not None else False,
-                "always_online_enabled": bool(row['always_online_enabled']) if row['always_online_enabled'] is not None else False,
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -674,8 +684,8 @@ def save_user(user_id, user):
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                  meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                 autoseen_enabled, always_online_enabled)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 autoseen_enabled)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -713,8 +723,7 @@ def save_user(user_id, user):
                 reaction_enabled = EXCLUDED.reaction_enabled,
                 autoreply_enabled = EXCLUDED.autoreply_enabled,
                 autoreply_match_type = EXCLUDED.autoreply_match_type,
-                autoseen_enabled = EXCLUDED.autoseen_enabled,
-                always_online_enabled = EXCLUDED.always_online_enabled
+                autoseen_enabled = EXCLUDED.autoseen_enabled
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -738,8 +747,7 @@ def save_user(user_id, user):
             user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
             user.get("meow_chat_title"),
             user.get("reaction_enabled", False), user.get("autoreply_enabled", False),
-            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False),
-            user.get("always_online_enabled", False)
+            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False)
         ))
         conn.commit()
         cursor.close()
@@ -2370,7 +2378,6 @@ def make_default_user(session=None, status=False, step="menu"):
         "autoreply_enabled": False,
         "autoreply_match_type": "exact",
         "autoseen_enabled": False,
-        "always_online_enabled": False,
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
         "fish_last_run_at": None,
@@ -2806,7 +2813,11 @@ def get_fonts_menu_keyboard(current_font_id):
     buttons.append([styled_button("➜ بازگشت", b"menu_time", style=STYLE_OFF)])
     return buttons
 
-def get_actions_menu_keyboard(current_action, always_online_enabled=False):
+def get_actions_menu_keyboard(current_action):
+    """
+    شبکه‌ی انتخابِ اکشن‌ها؛ همه از ACTIONS خوانده می‌شوند (شامل «همیشه آنلاین»)،
+    پس فقط یکی می‌تواند هم‌زمان فعال باشد - دقیقاً مثل بقیه‌ی اکشن‌ها.
+    """
     buttons = []
     row = []
 
@@ -2821,9 +2832,6 @@ def get_actions_menu_keyboard(current_action, always_online_enabled=False):
 
     if row:
         buttons.append(row)
-
-    # حالت جدید: همیشه آنلاین (مستقل از انتخاب بالا، On/Off جداگانه)
-    buttons.append([toggle_button("🟢 همیشه آنلاین", always_online_enabled, b"always_online_toggle")])
 
     buttons.append([styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)])
     return buttons
@@ -3565,7 +3573,11 @@ ADMIN_MANAGEABLE_FEATURES = [
     ("reaction_enabled", "ریکت"),
     ("autoreply_enabled", "پاسخ خودکار"),
     ("autoseen_enabled", "سین خودکار"),
-    ("always_online_enabled", "همیشه آنلاین"),
+    ("meow_enabled", "میو"),
+    ("fish_enabled", "ماهی"),
+    ("meowpoint_enabled", "میو پوینت"),
+    ("streetcat_enabled", "نجات پیشی"),
+    ("fridge_enabled", "یخچال میویی"),
 ]
 
 def get_user_features_text(user_id):
@@ -4130,16 +4142,62 @@ async def handle_unblock_command(event, user_id):
         log_internal_error("unblock_command_unexpected", e)
 
 # ======================== دستور .ویدیو مسیج ========================
+VIDEO_NOTE_MAX_SIDE = 640       # حداکثر ابعاد استانداردِ ویدیو مسیج تلگرام
+VIDEO_NOTE_MAX_DURATION = 60    # ثانیه؛ محدودیت رایج طول ویدیو مسیج
+
+async def _convert_to_video_note(input_path, output_path):
+    """
+    با ffmpeg (باینریِ مستقلِ بسته‌شده در imageio-ffmpeg، بدون نیاز به نصب سیستمی
+    روی هاست) ویدیو را واقعاً مربعی (Crop از مرکز)، حداکثر ۶۴۰ پیکسل، و حداکثر
+    ۶۰ ثانیه می‌کند تا تلگرام واقعاً آن را به‌صورت گرد/دایره‌ای نمایش دهد - برخلاف
+    فقط علامت‌زدن video_note=True روی ویدیوی نامربعِ اصلی که تلگرام آن را به‌صورت
+    ویدیوی معمولی نشان می‌دهد، نه گرد.
+    خروجی: (success: bool, duration_seconds: float, error_message: str|None)
+    """
+    if not _FFMPEG_AVAILABLE:
+        return False, 0.0, "imageio-ffmpeg نصب نیست"
+
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    vf = f"crop='min(iw,ih)':'min(iw,ih)',scale={VIDEO_NOTE_MAX_SIDE}:{VIDEO_NOTE_MAX_SIDE}"
+    cmd = [
+        ffmpeg_path, "-y", "-i", input_path,
+        "-t", str(VIDEO_NOTE_MAX_DURATION),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+    except Exception as e:
+        return False, 0.0, str(e)
+
+    stderr_text = stderr.decode(errors="ignore") if stderr else ""
+    duration = 0.0
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr_text)
+    if match:
+        h, m, s = match.groups()
+        duration = min(int(h) * 3600 + int(m) * 60 + float(s), VIDEO_NOTE_MAX_DURATION)
+
+    if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return False, 0.0, (stderr_text[-500:] if stderr_text else f"ffmpeg exit={proc.returncode}")
+
+    return True, duration, None
+
 async def handle_videomessage_command(event, user_id):
     """
-    اجرای `.ویدیو مسیج` روی یک پیامِ ویدیوییِ Reply‌شده: همان ویدیو را (بدون
-    دانلود جداگانه، مستقیم از خودِ رسانه‌ی پیام) به‌صورت ویدیو مسیج/ویدیو گرد
-    تلگرام دوباره در همان چت ارسال می‌کند.
-
-    نکته: تلگرام برای ویدیو مسیج محدودیت‌های فنی دارد (باید مربعی و با فرمت
-    استاندارد mp4/h264 باشد)؛ اگر ویدیوی ورودی این شرایط را نداشته باشد، تلگرام
-    خودش خطا برمی‌گرداند که اینجا بدون کرش، با پیام روشن به کاربر مدیریت می‌شود.
+    اجرای `.ویدیو مسیج` روی یک پیامِ ویدیوییِ Reply‌شده: ویدیو دانلود، با ffmpeg
+    واقعاً مربعی/کوتاه‌شده می‌شود و به‌صورت ویدیو مسیج/ویدیو گردِ واقعیِ تلگرام
+    (round_message + ابعاد مربعیِ صریح، طبق نیازِ مستندِ تلگرام برای این نوع
+    پیام) در همان چت ارسال می‌شود. تمام خطاهای احتمالی (فرمت نامعتبر، حجم/طول
+    زیاد، FloodWait) بدون کرش مدیریت می‌شوند و فایل‌های موقت همیشه پاک می‌شوند.
     """
+    tmp_dir = None
+    status_msg = None
     try:
         if not event.is_reply:
             await event.reply("❌ برای این قابلیت باید روی یک ویدیو Reply کنید.")
@@ -4150,23 +4208,89 @@ async def handle_videomessage_command(event, user_id):
             await event.reply("❌ باید روی یک پیامِ ویدیویی Reply کنید.")
             return
 
+        if not _FFMPEG_AVAILABLE:
+            await event.reply("❌ این قابلیت روی سرور فعال نیست (imageio-ffmpeg نصب نشده است).")
+            return
+
         client = event.client
+        tmp_dir = tempfile.mkdtemp(prefix="novaself_vnote_")
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+
         try:
-            await safe_call(client.send_file, event.chat_id, reply.media, video_note=True)
+            status_msg = await event.reply("⏳ در حال تبدیل به ویدیو مسیج...")
+        except Exception:
+            status_msg = None
+
+        try:
+            await safe_call(client.download_media, reply, input_path)
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
             return
         except Exception as e:
-            log_internal_error("videomessage_command", f"user={user_id} err={e}")
-            await event.reply(
-                "❌ تبدیل به ویدیو مسیج ناموفق بود؛ ویدیو باید مربعی، کوتاه و با فرمت "
-                "استاندارد mp4 باشد."
-            )
+            log_internal_error("videomessage_download", f"user={user_id} err={e}")
+            err_text = "❌ دانلود ویدیو ناموفق بود."
+            if status_msg:
+                try:
+                    await status_msg.edit(err_text)
+                except Exception:
+                    pass
+            else:
+                await event.reply(err_text)
             return
+
+        success, duration, err = await _convert_to_video_note(input_path, output_path)
+        if not success:
+            log_internal_error("videomessage_convert", f"user={user_id} err={err}")
+            err_text = "❌ تبدیل ویدیو به ویدیو مسیج ناموفق بود؛ فرمت ویدیو پشتیبانی نمی‌شود."
+            if status_msg:
+                try:
+                    await status_msg.edit(err_text)
+                except Exception:
+                    pass
+            else:
+                await event.reply(err_text)
+            return
+
+        attributes = [DocumentAttributeVideo(
+            duration=int(duration) if duration else 1,
+            w=VIDEO_NOTE_MAX_SIDE, h=VIDEO_NOTE_MAX_SIDE,
+            round_message=True,
+            supports_streaming=True,
+        )]
+
+        try:
+            await safe_call(client.send_file, event.chat_id, output_path, attributes=attributes)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+            return
+        except Exception as e:
+            log_internal_error("videomessage_send", f"user={user_id} err={e}")
+            err_text = "❌ ارسال ویدیو مسیج ناموفق بود."
+            if status_msg:
+                try:
+                    await status_msg.edit(err_text)
+                except Exception:
+                    pass
+            else:
+                await event.reply(err_text)
+            return
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
         log_internal_error("videomessage_command_unexpected", e)
+    finally:
+        if tmp_dir:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 def make_outgoing_handler(user_id):
     async def handler(event):
@@ -4818,20 +4942,21 @@ async def self_bot_action_worker(user_id, client):
                 break
 
             user = user_data[user_id]
+            action_key = user["active_action"]
 
-            # حالت جدید «همیشه آنلاین»: مستقل از انتخابِ اکشنِ تایپ/آپلود است، پس اینجا
-            # (قبل از early-continueِ مربوط به action_key) هر ۴ ثانیه وضعیت آنلاینِ واقعیِ
-            # اکانت را تازه نگه می‌دارد (وگرنه تلگرام بعد از چند ثانیه بی‌کاری خودکار
-            # Offline نشان می‌دهد).
-            if user.get("always_online_enabled"):
+            # «همیشه آنلاین» حالا دقیقاً مثل بقیه‌ی اکشن‌ها، فقط یکی از آن‌ها به‌طور
+            # هم‌زمان قابل انتخاب است (از طریق همون active_action)؛ فقط مکانیزم اجرایش
+            # با بقیه فرق دارد: به‌جای SetTypingRequest، هر ۴ ثانیه UpdateStatusRequest
+            # می‌فرستد تا تلگرام کاربر را واقعاً آنلاین نشان دهد.
+            if action_key == "online":
                 try:
                     await client(UpdateStatusRequest(offline=False))
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
                     log_internal_error("always_online", f"user={user_id} err={e}")
-
-            action_key = user["active_action"]
+                await asyncio.sleep(4)
+                continue
 
             if action_key == 'none' or action_key not in ACTIONS:
                 await asyncio.sleep(4)
@@ -5514,9 +5639,9 @@ def _card_text_width(draw, text, font):
 
 async def build_panel_card_image(owner_id, user):
     """
-    ساخت تصویر «کارت پنل» با ظاهر دیجیتالی برای دستور `.پنل`: بالای تصویر
-    NOVA SELF، وسط عکسِ پروفایلِ کاربر در دایره‌ای متوسط با حلقه‌ی نئونی، و
-    زیرش یوزرنیم و آیدی عددی‌اش.
+    ساخت تصویر «کارت پنل» با ظاهر دیجیتالی برای دستور `.پنل` (افقی، 960×560):
+    سمت چپ عکسِ پروفایلِ کاربر در دایره‌ای بزرگ با حلقه‌ی نئونی، سمت راست عنوان
+    NOVA SELF و زیرش یوزرنیم و آیدی عددی‌اش.
 
     اگر Pillow نصب نباشد، یا دانلود عکس پروفایل/هر بخش دیگر با خطا مواجه شود،
     None برمی‌گرداند تا پنل بدون تصویر (دقیقاً مثل قبل، فقط متنی) کار کند و
@@ -5525,8 +5650,8 @@ async def build_panel_card_image(owner_id, user):
     if not _PIL_AVAILABLE:
         return None
     try:
-        W, H = 800, 820
-        bg_top, bg_bottom = (6, 8, 24), (22, 8, 46)
+        W, H = 960, 560
+        bg_top, bg_bottom = (6, 8, 24), (24, 8, 48)
         img = Image.new("RGB", (W, H), bg_top)
         draw = ImageDraw.Draw(img)
         for y in range(H):
@@ -5536,40 +5661,23 @@ async def build_panel_card_image(owner_id, user):
             b = int(bg_top[2] + (bg_bottom[2] - bg_top[2]) * t)
             draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-        grid_color = (32, 50, 78)
-        for x in range(0, W, 44):
+        grid_color = (34, 52, 82)
+        for x in range(0, W, 46):
             draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
-        for y in range(0, H, 44):
+        for y in range(0, H, 46):
             draw.line([(0, y), (W, y)], fill=grid_color, width=1)
 
         accent = (0, 220, 255)
-        bl, pad, lw = 46, 34, 4
+        bl, pad, lw = 50, 30, 5
         for (cx, cy, dx, dy) in [(pad, pad, 1, 1), (W - pad, pad, -1, 1),
                                   (pad, H - pad, 1, -1), (W - pad, H - pad, -1, -1)]:
             draw.line([(cx, cy), (cx + dx * bl, cy)], fill=accent, width=lw)
             draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
 
-        title_font = _load_card_font(64, bold=True)
-        sub_font_small = _load_card_font(20, bold=False)
-        title_text = "NOVA SELF"
-
-        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        glow_draw = ImageDraw.Draw(glow_layer)
-        tw = _card_text_width(glow_draw, title_text, title_font)
-        title_x, title_y = (W - tw) / 2, 66
-        glow_draw.text((title_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
-        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(12))
-        img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
-        draw = ImageDraw.Draw(img)
-        draw.text((title_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
-
-        sub_text = "S E L F   M A N A G E M E N T   P A N E L"
-        sw = _card_text_width(draw, sub_text, sub_font_small)
-        draw.text(((W - sw) / 2, title_y + 80), sub_text, font=sub_font_small, fill=(120, 170, 220))
-        draw.line([(W // 2 - 140, title_y + 120), (W // 2 + 140, title_y + 120)], fill=(0, 150, 190), width=2)
-
-        avatar_size = 260
-        avatar_x, avatar_y = (W - avatar_size) // 2, 300
+        # ---- آواتار سمت چپ ----
+        avatar_size = 320
+        avatar_x = 90
+        avatar_y = (H - avatar_size) // 2
 
         avatar_img = None
         try:
@@ -5585,9 +5693,9 @@ async def build_panel_card_image(owner_id, user):
             ad = ImageDraw.Draw(avatar_img)
             initial_source = user.get("username") or str(owner_id)
             initial = initial_source[0].upper()
-            init_font = _load_card_font(110)
+            init_font = _load_card_font(140)
             iw = _card_text_width(ad, initial, init_font)
-            ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 55), initial, font=init_font, fill=(0, 220, 255))
+            ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 70), initial, font=init_font, fill=(0, 220, 255))
         else:
             # مربعی‌کردن (Crop از وسط) قبل از دایره‌ای‌کردن، تا عکس‌های غیرمربعی کش نیایند
             w0, h0 = avatar_img.size
@@ -5598,32 +5706,58 @@ async def build_panel_card_image(owner_id, user):
         mask = Image.new("L", (avatar_size, avatar_size), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
 
-        ring_pad = 14
+        ring_pad = 16
         ring_size = avatar_size + ring_pad * 2
         ring_layer = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
         ring_draw = ImageDraw.Draw(ring_layer)
-        ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=6)
-        ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(6))
+        ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=7)
+        ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(7))
         img.paste(ring_blur, (avatar_x - ring_pad, avatar_y - ring_pad), ring_blur)
         img.paste(ring_layer, (avatar_x - ring_pad, avatar_y - ring_pad), ring_layer)
         img.paste(avatar_img, (avatar_x, avatar_y), mask)
 
+        # ---- بلوکِ متنیِ سمت راست ----
+        right_x = avatar_x + avatar_size + 70
+        right_margin = 40
+        max_text_width = W - right_x - right_margin
+
+        title_font = _load_card_font(68, bold=True)
+        sub_font_small = _load_card_font(24, bold=False)
+        title_text = "NOVA SELF"
+        title_y = 110
+
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_layer)
+        glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(12))
+        img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
         draw = ImageDraw.Draw(img)
-        info_font = _load_card_font(34, bold=True)
-        sub_font = _load_card_font(24, bold=False)
+        draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
+
+        sub_text = "SELF MANAGEMENT PANEL"
+        draw.text((right_x + 4, title_y + 92), sub_text, font=sub_font_small, fill=(120, 170, 220))
+        draw.line([(right_x, title_y + 140), (right_x + 340, title_y + 140)], fill=(0, 150, 190), width=3)
+
+        info_font = _load_card_font(42, bold=True)
+        sub_font = _load_card_font(30, bold=False)
         # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
         # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
         username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
         id_text = f"ID: {owner_id}"
-        uw = _card_text_width(draw, username_text, info_font)
-        draw.text(((W - uw) / 2, avatar_y + avatar_size + 45), username_text, font=info_font, fill=(255, 255, 255))
-        iw2 = _card_text_width(draw, id_text, sub_font)
-        draw.text(((W - iw2) / 2, avatar_y + avatar_size + 95), id_text, font=sub_font, fill=(140, 195, 255))
 
-        tag_font = _load_card_font(16, bold=False)
-        tag_text = "NOVASELF • DIGITAL IDENTITY CARD"
+        # اگر یوزرنیم طولانی بود، فونت را تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود
+        uw = _card_text_width(draw, username_text, info_font)
+        while uw > max_text_width and info_font.size > 22:
+            info_font = _load_card_font(info_font.size - 2, bold=True)
+            uw = _card_text_width(draw, username_text, info_font)
+
+        draw.text((right_x, title_y + 175), username_text, font=info_font, fill=(255, 255, 255))
+        draw.text((right_x, title_y + 230), id_text, font=sub_font, fill=(150, 205, 255))
+
+        tag_font = _load_card_font(18, bold=False)
+        tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
         tgw = _card_text_width(draw, tag_text, tag_font)
-        draw.text(((W - tgw) / 2, H - 56), tag_text, font=tag_font, fill=(80, 110, 150))
+        draw.text(((W - tgw) / 2, H - 46), tag_text, font=tag_font, fill=(85, 115, 155))
 
         out = io.BytesIO()
         out.name = "novaself_panel.png"
@@ -6285,10 +6419,14 @@ async def callback_handler(event):
                     f"🖊️ حالت متن: {textmode_text}\n"
                     f"🧑‍💼 منشی پیوی: {secretary_text}\n"
                     f"🎭 اکشن: {action_name}\n"
-                    f"🟢 همیشه آنلاین: {status_icon(user.get('always_online_enabled', False))}\n"
                     f"👍 ریکت: {status_icon(user.get('reaction_enabled', False))}\n"
                     f"🤖 پاسخ خودکار: {status_icon(user.get('autoreply_enabled', False))}\n"
                     f"👁️ سین خودکار: {status_icon(user.get('autoseen_enabled', False))}\n"
+                    f"🐱 میو: {status_icon(user.get('meow_enabled', False))}\n"
+                    f"🐟 ماهی: {status_icon(user.get('fish_enabled', False))}\n"
+                    f"🪙 میو پوینت: {status_icon(user.get('meowpoint_enabled', False))}\n"
+                    f"🐈 نجات پیشی: {status_icon(user.get('streetcat_enabled', False))}\n"
+                    f"❄️ یخچال میویی: {status_icon(user.get('fridge_enabled', False))}\n"
                     f"📅 تاریخ ثبت: {user.get('joined_at', 'نامشخص')}\n\n"
                     f"💡 برای مدیریت این کاربر از دکمه‌های زیر استفاده کنید:",
                     buttons=get_user_detail_buttons(target_id)
@@ -6823,7 +6961,7 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             "با انتخاب هر گزینه، وضعیت شما به‌صورت مداوم برای دیگران نمایش داده می‌شود:",
-            buttons=get_actions_menu_keyboard(user["active_action"], user.get("always_online_enabled", False))
+            buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
 
@@ -6928,21 +7066,7 @@ async def callback_handler(event):
         await safe_edit(event,
             "🎭 **مدیریت اکشن‌های فیک**\n\n"
             f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
-            buttons=get_actions_menu_keyboard(user["active_action"], user.get("always_online_enabled", False))
-        )
-        return
-
-    if data == b"always_online_toggle":
-        if is_feature_locked(user_id, "actions"):
-            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
-            return
-        user["always_online_enabled"] = not user.get("always_online_enabled", False)
-        save_user(user_id, user)
-        log_settings_change(user_id, "always_online_enabled", user["always_online_enabled"])
-        await safe_edit(event,
-            "🎭 **مدیریت اکشن‌های فیک**\n\n"
-            f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
-            buttons=get_actions_menu_keyboard(user["active_action"], user["always_online_enabled"])
+            buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
 
