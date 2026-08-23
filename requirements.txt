@@ -5,3 +5,4 @@ jdatetime
 hijridate
 aiohttp
 Pillow
+imageio-ffmpeg
