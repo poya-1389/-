@@ -58,13 +58,14 @@ from nova_state import (
     FISH_RARITY_TO_FIELD, FISH_OPERATION_LABELS, FISH_OPERATION_FALLBACK_MARKERS,
     MEOWPOINT_RESPONSE_TIMEOUT,
     REACTION_APPLY_DELAY, TAG_ADMIN_TRIGGERS, TAG_MEMBERS_TRIGGERS,
-    PANEL_TRIGGERS, PING_TRIGGERS, WHOIS_TRIGGERS,
+    PANEL_TRIGGERS, PING_TRIGGERS, WHOIS_TRIGGERS, BALANCE_TRIGGERS,
     REACTION_SET_PREFIXES, REACTION_REMOVE_TRIGGERS,
     BLOCK_TRIGGERS_NORMALIZED, UNBLOCK_TRIGGERS_NORMALIZED, VIDEOMESSAGE_TRIGGERS,
     CLEANUP_COMMAND_RE, CLEANUP_MAX_COUNT, _PHONE_DIGIT_TRANSLATION,
     GAME_CLICK_MAX_ATTEMPTS, GAME_CLICK_RETRY_DELAY,
     tehran_now, apply_font, format_date, build_format_entities,
     make_blockquote_entity, is_admin, _spawn_background_task, _normalize_block_cmd,
+    format_diamonds,
 )
 from nova_db import (
     save_user, update_username_db, charge_diamonds_db,
@@ -238,6 +239,25 @@ async def handle_ping_command(event, user_id):
     except Exception as e:
         log_internal_error("ping_command", e)
 
+# ======================== دستور .موجودی ========================
+async def handle_balance_command(event, user_id):
+    """همان پیامِ دستور ویرایش و موجودیِ الماسِ کاربر به‌صورت نقل‌قول نمایش داده می‌شود."""
+    try:
+        client = event.client
+        current_user = user_data.get(user_id, {})
+        balance_text = format_diamonds(current_user.get("diamonds", 0))
+        result_text = f"💎 موجودی الماس شما: {balance_text}"
+        surrogated = helpers.add_surrogate(result_text)
+        entities = [make_blockquote_entity(0, len(surrogated))]
+
+        await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
+    except MessageNotModifiedError:
+        pass
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("balance_command", e)
+
 # ======================== دستور .آیدی ========================
 async def handle_whois_command(event, user_id):
     """فقط زمانی کار می‌کند که دستور روی پیام یک کاربر Reply شده باشد."""
@@ -358,7 +378,15 @@ async def handle_set_reaction_command(event, user_id):
             log_settings_change(user_id, "reaction_enabled", True)
             note = "\n\n(قابلیت ریکت هم به‌صورت خودکار فعال شد.)"
 
-        await event.reply(f"✅ از این به بعد پیام‌های این کاربر به‌صورت خودکار با {emoji} ریکت می‌شوند.{note}")
+        # طبق درخواست صریح: به‌جای ارسال یک پیامِ تازه، خودِ پیامِ دستور ویرایش
+        # می‌شود و به‌صورت نقل‌قول (Blockquote) نمایش داده می‌شود.
+        result_text = f"✅ از این به بعد پیام‌های این کاربر به‌صورت خودکار با {emoji} ریکت می‌شوند.{note}"
+        surrogated = helpers.add_surrogate(result_text)
+        entities = [make_blockquote_entity(0, len(surrogated))]
+        client = event.client
+        await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
+    except MessageNotModifiedError:
+        pass
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -382,9 +410,17 @@ async def handle_remove_reaction_command(event, user_id):
 
         if removed:
             log_settings_change(user_id, "reaction_target_removed", str(target_id))
-            await event.reply("✅ ریکت این کاربر حذف شد.")
+            # طبق درخواست صریح: ویرایشِ خودِ پیامِ دستور به‌جای ارسال پیامِ تازه،
+            # به‌صورت نقل‌قول.
+            result_text = "✅ ریکت این کاربر حذف شد."
+            surrogated = helpers.add_surrogate(result_text)
+            entities = [make_blockquote_entity(0, len(surrogated))]
+            client = event.client
+            await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
         else:
             await event.reply("❌ این کاربر در لیست ریکت شما نبود.")
+    except MessageNotModifiedError:
+        pass
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -496,7 +532,10 @@ async def handle_block_command(event, user_id):
 
         await asyncio.sleep(0.2)
         try:
-            await safe_call(client.edit_message, event.chat_id, event.id, f"کاربر {name} بلاک شد.")
+            result_text = f"کاربر {name} بلاک شد."
+            surrogated = helpers.add_surrogate(result_text)
+            entities = [make_blockquote_entity(0, len(surrogated))]
+            await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
         except MessageNotModifiedError:
             pass
         except Exception as e:
@@ -545,7 +584,10 @@ async def handle_unblock_command(event, user_id):
 
         await asyncio.sleep(0.2)
         try:
-            await safe_call(client.edit_message, event.chat_id, event.id, f"کاربر {name} آن بلاک شد.")
+            result_text = f"کاربر {name} آن بلاک شد."
+            surrogated = helpers.add_surrogate(result_text)
+            entities = [make_blockquote_entity(0, len(surrogated))]
+            await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
         except MessageNotModifiedError:
             pass
         except Exception as e:
@@ -732,6 +774,14 @@ def make_outgoing_handler(user_id):
                     await event.reply("این قابلیت برای شما قفل شده است.")
                     return
                 await handle_ping_command(event, user_id)
+                return
+
+            # --- موجودی (در هر نوع چتی) ---
+            if text_stripped and text_stripped.lower() in BALANCE_TRIGGERS:
+                if is_feature_locked(user_id, "balance"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
+                await handle_balance_command(event, user_id)
                 return
 
             # --- اطلاعات/آیدی (در هر نوع چتی، فقط با Reply) ---
@@ -2033,4 +2083,3 @@ async def autostart_saved_users():
             # کاربران باید مستقل از این، در همین چرخه‌ی استارتاپ راه‌اندازی شوند.
             logging.error(f"❌ خطا در autostart برای کاربر {user_id}: {e}")
             log_internal_error("autostart_saved_users", e)
-
