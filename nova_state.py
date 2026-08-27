@@ -126,11 +126,14 @@ _PHONE_DIGIT_TRANSLATION = str.maketrans(
 
 def normalize_phone_number(raw):
     """
-    نرمال‌سازی هوشمند شماره تلفن قبل از ارسال به تلگرام: اعداد فارسی/عربی به
-    انگلیسی، حذف فاصله/نیم‌فاصله/خط‌تیره/پرانتز، تشخیص صفر ابتدایی و حالت بدون
-    +۹۸، و افزودن خودکار +۹۸. تمام حالت‌های 0912x../912x../+98912x../۰۹۱۲x../۹۱۲x..
-    پشتیبانی می‌شوند. هرگز Exception نمی‌دهد — همیشه (normalized یا None, پیام خطا یا None)
-    برمی‌گرداند.
+    نرمال‌سازی شماره تلفن قبل از ارسال به تلگرام.
+
+    آپدیت جدید: دیگر فقط شماره‌های ایران پذیرفته نمی‌شوند. چون منبع شماره
+    الان همیشه دکمه‌ی رسمیِ تلگرام «ارسال شماره تلفن» است (نه تایپ دستی)،
+    شماره‌ی هر کشوری که تلگرام برگرداند پذیرفته می‌شود؛ فقط طبق استاندارد
+    بین‌المللیِ E.164 اعتبارسنجی می‌شود (۷ تا ۱۵ رقم، با یا بدون + یا ۰۰
+    ابتدایی). هرگز Exception نمی‌دهد — همیشه (normalized یا None، پیام خطا
+    یا None) برمی‌گرداند.
     خروجی: (normalized: str|None, error_message: str|None)
     """
     try:
@@ -150,31 +153,19 @@ def normalize_phone_number(raw):
         has_plus = cleaned.startswith("+")
         digits = cleaned[1:] if has_plus else cleaned
 
-        example_error = (
-            "❌ فرمت شماره تشخیص داده نشد.\n"
-            "نمونه‌های معتبر: `0912xxxxxxx` یا `+98912xxxxxxx`"
-        )
+        # حذف ۰۰ ابتدایی (شکلِ رایجِ نمایشِ بین‌المللی به‌جای +)
+        if not has_plus and digits.startswith("00"):
+            digits = digits[2:]
 
-        if digits.startswith("0098"):
-            digits = digits[4:]
-        elif digits.startswith("98") and len(digits) == 12:
-            pass
-        elif digits.startswith("0") and len(digits) == 11:
-            digits = digits[1:]
-        elif len(digits) == 10 and digits.startswith("9"):
-            pass
-        else:
-            return None, example_error
+        # استاندارد E.164: حداکثر ۱۵ رقم؛ کوتاه‌ترین شماره‌های بین‌المللیِ واقعی
+        # (کدِ کشور + شماره‌ی محلی) هم معمولاً حداقل ۷ رقم‌اند.
+        if not (7 <= len(digits) <= 15):
+            return None, (
+                "❌ فرمت شماره تشخیص داده نشد.\n"
+                "لطفاً شماره را همراه با کد کشور ارسال کنید."
+            )
 
-        if not digits.startswith("98"):
-            digits = "98" + digits
-
-        normalized = "+" + digits
-
-        if not re.fullmatch(r"\+989\d{9}", normalized):
-            return None, example_error
-
-        return normalized, None
+        return "+" + digits, None
     except Exception as e:
         logging.error(f"⚠️ خطا در نرمال‌سازی شماره تلفن: {e}")
         return None, "❌ خطا در پردازش شماره تلفن. لطفاً دوباره ارسال کنید."
@@ -221,6 +212,7 @@ TAG_MEMBERS_TRIGGERS = {".تگ اعضا", ".تگاعضا", ".tagall"}
 PANEL_TRIGGERS = {".پنل", ".panel"}
 PING_TRIGGERS = {".پینگ", ".ping"}
 WHOIS_TRIGGERS = {".آیدی", ".id"}
+BALANCE_TRIGGERS = {".موجودی", ".balance"}
 REACTION_SET_PREFIXES = (".ریکت ", ".react ")
 REACTION_REMOVE_TRIGGERS = {".حذف ریکت", ".remove react"}
 REACTION_APPLY_DELAY = 1.0  # طبق بند «اجرای خودکار»: حدود ۱ ثانیه تأخیر قبل از ریکت
@@ -313,10 +305,13 @@ TEXTMODE_NAMES = {
 }
 
 def format_diamonds(value):
+    """
+    نمایش موجودی الماس همیشه به‌صورت گردشده (بدون اعشار) در تمام قسمت‌های
+    ربات - طبق درخواست صریح، حتی اگر مقدار واقعی در دیتابیس اعشاری باشد
+    (مثلاً به‌خاطر محاسبه‌ی لحظه‌ایِ کسر ساعتی).
+    """
     value = float(value or 0)
-    if value == int(value):
-        return f"{int(value):,}"
-    return f"{value:,.2f}"
+    return f"{round(value):,}"
 
 def format_toman(diamonds):
     toman = float(diamonds or 0) * DIAMOND_PRICE_TOMAN
@@ -535,4 +530,3 @@ async def safe_edit(event, text, buttons=None):
         await event.answer()
     except Exception:
         pass
-
