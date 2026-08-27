@@ -76,6 +76,7 @@ from nova_menus import (
     get_autoreply_view_keyboard, get_autoreply_view_text,
     get_autoseen_menu_keyboard, get_autoseen_menu_text,
     get_backup_delete_confirm_keyboard, get_backup_list_keyboard,
+    get_balance_menu_keyboard, get_balance_menu_text,
     get_backup_list_text, get_backup_manage_keyboard, get_backup_manage_text,
     get_backup_menu_keyboard, get_backup_menu_text,
     get_backup_restore_confirm_keyboard, get_backup_restore_confirm_text,
@@ -270,6 +271,14 @@ async def callback_handler(event):
 
         if real_action == "panel_close":
             await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
+            # طبق درخواست: بعد از ۳ ثانیه خودِ پیامِ «پنل بسته شد» هم پاک شود.
+            async def _delete_after_delay():
+                try:
+                    await asyncio.sleep(3)
+                    await event.delete()
+                except Exception as e:
+                    log_internal_error("panel_close_auto_delete", e)
+            asyncio.create_task(_delete_after_delay())
             return
 
         user_id = owner_id
@@ -1268,7 +1277,11 @@ async def callback_handler(event):
         return
 
     if data == b"settings_root":
-        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard(user_id))
+        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard(user_id, page=1))
+        return
+
+    if data == b"settings_page2":
+        await safe_edit(event, PANEL_TEXT, buttons=get_settings_root_keyboard(user_id, page=2))
         return
 
     if data == b"panel_account":
@@ -1632,7 +1645,7 @@ async def callback_handler(event):
         user["step"] = "transfer_get_target"
         await safe_edit(event,
             "💸 **انتقال الماس**\n\n"
-            "لطفاً آیدی عددی کاربر مقصد را ارسال کنید:",
+            "لطفاً آیدی عددی یا یوزرنیمِ کاربر مقصد را ارسال کنید:",
             buttons=get_transfer_cancel_keyboard()
         )
         return
@@ -1751,6 +1764,13 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event, get_videomessage_menu_text(), buttons=get_videomessage_menu_keyboard())
+        return
+
+    if data == b"menu_balance":
+        if is_feature_locked(user_id, "balance"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_balance_menu_text(), buttons=get_balance_menu_keyboard())
         return
 
     if data == b"autoseen_toggle":
@@ -3094,10 +3114,31 @@ async def message_handler(event):
         return
 
     if user_id in user_data and user_data[user_id].get("step") == "transfer_get_target":
-        try:
-            target_id = int(text)
-        except ValueError:
-            await event.respond("❌ آیدی عددی معتبر نیست. لطفاً فقط عدد ارسال کنید.", buttons=get_transfer_cancel_keyboard())
+        raw_target = text.strip()
+        target_id = None
+
+        if raw_target.lstrip("+-").isdigit():
+            try:
+                target_id = int(raw_target)
+            except ValueError:
+                target_id = None
+        else:
+            # جستجو بر اساس یوزرنیم (با یا بدون @، غیرحساس به بزرگی/کوچکیِ حروف) -
+            # دقیقاً همان شرط آیدی عددی: فقط اگر کاربر واقعاً در ربات ثبت‌نام
+            # کرده باشد (یوزرنیمش در user_data ذخیره شده) پیدا می‌شود.
+            uname = raw_target.lstrip("@").lower()
+            if uname:
+                for uid, udata in user_data.items():
+                    stored_uname = (udata.get("username") or "").lower()
+                    if stored_uname and stored_uname == uname:
+                        target_id = uid
+                        break
+
+        if target_id is None:
+            await event.respond(
+                "❌ کاربر پیدا نشد. لطفاً آیدی عددی یا یوزرنیمِ معتبر ارسال کنید.",
+                buttons=get_transfer_cancel_keyboard()
+            )
             return
 
         if target_id == user_id:
@@ -3105,14 +3146,17 @@ async def message_handler(event):
             return
 
         if target_id not in user_data or not user_data[target_id].get("session"):
-            await event.respond("❌ کاربری با این آیدی در سیستم ثبت‌نام نکرده است.", buttons=get_transfer_cancel_keyboard())
+            await event.respond("❌ کاربری با این مشخصات در سیستم ثبت‌نام نکرده است.", buttons=get_transfer_cancel_keyboard())
             return
 
         transfer_data[user_id] = {"target_id": target_id}
         user_data[user_id]["step"] = "transfer_get_amount"
 
+        target_username = user_data[target_id].get("username")
+        target_label = f"`{target_id}`" + (f" (@{target_username})" if target_username else "")
+
         await event.respond(
-            f"✅ کاربر مقصد یافت شد: `{target_id}`\n\n"
+            f"✅ کاربر مقصد یافت شد: {target_label}\n\n"
             "💎 حالا مقدار الماس موردنظر برای انتقال را وارد کنید:",
             buttons=get_transfer_cancel_keyboard()
         )
