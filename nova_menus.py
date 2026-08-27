@@ -62,6 +62,7 @@ FEATURE_LOCK_DEFS = [
     ("blockmgmt", "🚫 بلاک و آن‌بلاک"),
     ("autoseen", "👁️ سین خودکار"),
     ("videomessage", "🎥 ویدیو مسیج"),
+    ("balance", "💎 موجودی"),
 ]
 FEATURE_LOCK_LABELS = dict(FEATURE_LOCK_DEFS)
 
@@ -236,11 +237,11 @@ def get_panel_root_keyboard(user):
         ],
     ]
 
-def get_settings_root_keyboard(user_id):
+def get_settings_root_keyboard(user_id, page=1):
     """
-    صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی.
-    وقتی قابلیتی برای کاربر قفل باشد: به‌جای ایموجی مخصوص همان قابلیت، ایموجی
-    🔒 نمایش داده می‌شود و رنگ دکمه هم قرمز (STYLE_OFF) می‌شود.
+    صفحه‌ی «⚙ تنظیمات سلف» — دسترسی به تمام قابلیت‌های سلف، طبق چیدمان درخواستی،
+    حالا در ۲ صفحه. وقتی قابلیتی برای کاربر قفل باشد: به‌جای ایموجی مخصوص همان
+    قابلیت، ایموجی 🔒 نمایش داده می‌شود و رنگ دکمه هم قرمز (STYLE_OFF) می‌شود.
     """
     locks = feature_locks.get(user_id, set())
 
@@ -250,34 +251,49 @@ def get_settings_root_keyboard(user_id):
         style = STYLE_OFF if locked else STYLE_INFO
         return styled_button(f"{icon} {text}", cb_data, style=style)
 
+    # دکمه‌های شماره‌ی صفحه: بدون رنگ، فقط صفحه‌ی فعلی سبز می‌شود. از چپ «１»
+    # (صفحه‌ی اول) و از راست «２» (صفحه‌ی دوم) - ترتیب هرگز عوض نمی‌شود.
+    page_row = [
+        styled_button("１", b"settings_root", style=(STYLE_ON if page == 1 else None)),
+        styled_button("２", b"settings_page2", style=(STYLE_ON if page == 2 else None)),
+    ]
+
+    if page == 2:
+        return [
+            [btn("balance", "💎", "موجودی", b"menu_balance")],
+            page_row,
+            [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
+        ]
+
     return [
         [
-            btn("time", "⌚", "ساعت", b"menu_time"),
-            btn("actions", "🎭", "اکشن", b"menu_actions"),
             btn("date", "📅", "تاریخ", b"menu_date"),
+            btn("actions", "🎭", "اکشن", b"menu_actions"),
+            btn("time", "⌚", "ساعت", b"menu_time"),
         ],
         [
-            btn("secretary", "🧑‍💼", "منشی پیوی", b"menu_secretary"),
             btn("textmode", "🖊️", "حالت متن", b"menu_textmode"),
+            btn("secretary", "🧑‍💼", "منشی پیوی", b"menu_secretary"),
         ],
         [
-            btn("ping", "🏓", "پینگ", b"menu_ping"),
-            btn("meow", "🐱", "میو", b"menu_meow"),
             btn("tag", "🏷️", "تگ", b"menu_tag"),
+            btn("meow", "🐱", "میو", b"menu_meow"),
+            btn("ping", "🏓", "پینگ", b"menu_ping"),
         ],
         [
-            btn("whois", "🪪", "اطلاعات", b"menu_whois"),
-            btn("reaction", "👍", "ریکت", b"menu_reaction"),
             btn("autoreply", "🤖", "پاسخ خودکار", b"menu_autoreply"),
+            btn("reaction", "👍", "ریکت", b"menu_reaction"),
+            btn("whois", "🪪", "اطلاعات", b"menu_whois"),
         ],
         [
-            btn("blockmgmt", "🚫", "بلاک و آن‌بلاک", b"menu_blockmgmt"),
             btn("cleanup", "🧹", "حذف و پاکسازی", b"menu_cleanup"),
+            btn("blockmgmt", "🚫", "بلاک و آن‌بلاک", b"menu_blockmgmt"),
         ],
         [
-            btn("autoseen", "👁️", "سین خودکار", b"menu_autoseen"),
             btn("videomessage", "🎥", "ویدیو مسیج", b"menu_videomessage"),
+            btn("autoseen", "👁️", "سین خودکار", b"menu_autoseen"),
         ],
+        page_row,
         [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
     ]
 
@@ -592,6 +608,16 @@ def get_tag_menu_text():
 
 def get_tag_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
+
+# ======================== منوی موجودی ========================
+def get_balance_menu_text():
+    return (
+        "💎 **قابلیت موجودی**\n\n"
+        "▫️ `.موجودی` — نمایش موجودی الماس سلف شما"
+    )
+
+def get_balance_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"settings_page2", style=STYLE_OFF)]]
 
 # ======================== منوی حذف و پاکسازی ========================
 def get_cleanup_menu_text():
@@ -1387,8 +1413,8 @@ async def build_panel_card_image(owner_id, user):
             draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
 
         # ---- آواتار سمت چپ ----
-        avatar_size = 320
-        avatar_x = 90
+        avatar_size = 340
+        avatar_x = 80
         avatar_y = (H - avatar_size) // 2
 
         avatar_img = None
@@ -1429,29 +1455,36 @@ async def build_panel_card_image(owner_id, user):
         img.paste(avatar_img, (avatar_x, avatar_y), mask)
 
         # ---- بلوکِ متنیِ سمت راست ----
-        right_x = avatar_x + avatar_size + 70
-        right_margin = 40
+        right_x = avatar_x + avatar_size + 60
+        right_margin = 30
         max_text_width = W - right_x - right_margin
 
-        title_font = _load_card_font(68, bold=True)
-        sub_font_small = _load_card_font(24, bold=False)
+        title_font = _load_card_font(74, bold=True)
+        sub_font_small = _load_card_font(28, bold=False)
         title_text = "NOVA SELF"
-        title_y = 110
+        title_y = 95
+
+        # اگر به هر دلیلی (مثلاً فونتِ Fallback) عنوان از عرضِ باقیمانده رد بشود،
+        # فونتش را تا حدی کوچک می‌کنیم که کامل جا شود (به‌جای بریده‌شدن).
+        tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
+        while tw_title > max_text_width and title_font.size > 40:
+            title_font = _load_card_font(title_font.size - 2, bold=True)
+            tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
 
         glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         glow_draw = ImageDraw.Draw(glow_layer)
         glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
-        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(12))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(14))
         img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
         draw = ImageDraw.Draw(img)
         draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
 
         sub_text = "SELF MANAGEMENT PANEL"
-        draw.text((right_x + 4, title_y + 92), sub_text, font=sub_font_small, fill=(120, 170, 220))
-        draw.line([(right_x, title_y + 140), (right_x + 340, title_y + 140)], fill=(0, 150, 190), width=3)
+        draw.text((right_x + 4, title_y + 118), sub_text, font=sub_font_small, fill=(120, 170, 220))
+        draw.line([(right_x, title_y + 172), (right_x + 380, title_y + 172)], fill=(0, 150, 190), width=3)
 
-        info_font = _load_card_font(42, bold=True)
-        sub_font = _load_card_font(30, bold=False)
+        info_font = _load_card_font(56, bold=True)
+        sub_font = _load_card_font(38, bold=False)
         # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
         # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
         username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
@@ -1459,14 +1492,14 @@ async def build_panel_card_image(owner_id, user):
 
         # اگر یوزرنیم طولانی بود، فونت را تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود
         uw = _card_text_width(draw, username_text, info_font)
-        while uw > max_text_width and info_font.size > 22:
+        while uw > max_text_width and info_font.size > 28:
             info_font = _load_card_font(info_font.size - 2, bold=True)
             uw = _card_text_width(draw, username_text, info_font)
 
-        draw.text((right_x, title_y + 175), username_text, font=info_font, fill=(255, 255, 255))
-        draw.text((right_x, title_y + 230), id_text, font=sub_font, fill=(150, 205, 255))
+        draw.text((right_x, title_y + 215), username_text, font=info_font, fill=(255, 255, 255))
+        draw.text((right_x, title_y + 285), id_text, font=sub_font, fill=(150, 205, 255))
 
-        tag_font = _load_card_font(18, bold=False)
+        tag_font = _load_card_font(20, bold=False)
         tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
         tgw = _card_text_width(draw, tag_text, tag_font)
         draw.text(((W - tgw) / 2, H - 46), tag_text, font=tag_font, fill=(85, 115, 155))
@@ -1479,4 +1512,3 @@ async def build_panel_card_image(owner_id, user):
     except Exception as e:
         log_internal_error("panel_card_image", e)
         return None
-
