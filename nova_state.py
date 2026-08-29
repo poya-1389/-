@@ -351,6 +351,11 @@ def make_default_user(session=None, status=False, step="menu"):
         "secretary_enabled": False,
         "secretary_text": "مشغولم، بعداً پاسخ می‌دهم ✅",
         "secretary_delay": 60,
+        "secretary_entities": None,
+        "secretary_media_kind": None,
+        "secretary_media_bytes": None,
+        "secretary_media_filename": None,
+        "secretary_media_mime": None,
         "diamonds": 0.0,
         "referral_count": 0,
         "username": None,
@@ -530,3 +535,4 @@ async def safe_edit(event, text, buttons=None):
         await event.answer()
     except Exception:
         pass
+

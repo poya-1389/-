@@ -81,6 +81,11 @@ def init_db():
             ("secretary_enabled", "INTEGER DEFAULT 0"),
             ("secretary_text", "TEXT DEFAULT 'مشغولم، بعداً پاسخ می‌دهم ✅'"),
             ("secretary_delay", "INTEGER DEFAULT 60"),
+            ("secretary_entities", "BYTEA"),
+            ("secretary_media_kind", "TEXT"),
+            ("secretary_media_bytes", "BYTEA"),
+            ("secretary_media_filename", "TEXT"),
+            ("secretary_media_mime", "TEXT"),
             ("diamonds", "DOUBLE PRECISION DEFAULT 0"),
             ("referral_count", "INTEGER DEFAULT 0"),
             ("username", "TEXT"),
@@ -262,6 +267,31 @@ def init_db():
         # (نه یک‌بار برای همیشه)، وگرنه کاربری که بعداً کانال را ترک کند همچنان
         # به‌اشتباه «تأییدشده» باقی می‌ماند.
 
+        # ---------- تنظیماتِ سراسری (Key-Value، برای مقادیری مثل جایزه/فعال‌بودنِ Referral) ----------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        conn.commit()
+
+        # ---------- سیستم Referral ----------
+        # referred_id به‌عنوان PRIMARY KEY یعنی هر کاربر فقط دقیقاً یک بار (و فقط
+        # با یک دعوت‌کننده) می‌تواند رفرال شود - از ثبت چندباره یا تغییر مصنوعیِ
+        # دعوت‌کننده در سطح خودِ دیتابیس جلوگیری می‌کند (نه فقط در سطح کد).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS novaself_referrals (
+                referred_id BIGINT PRIMARY KEY,
+                referrer_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reward_credited BOOLEAN DEFAULT FALSE,
+                reward_amount DOUBLE PRECISION DEFAULT 0,
+                credited_at TIMESTAMP
+            )
+        ''')
+        conn.commit()
+
         # ---------- سیستم بکاپ ----------
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS novaself_backups (
@@ -290,6 +320,8 @@ def get_all_users():
             SELECT user_id, session, font_id, status, name_time, bio_time, active_action,
                    joined_at, date_enabled, date_type, date_font, text_mode,
                    secretary_enabled, secretary_text, secretary_delay,
+                   secretary_entities, secretary_media_kind, secretary_media_bytes,
+                   secretary_media_filename, secretary_media_mime,
                    diamonds, referral_count, username, last_charge_at,
                    meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                    fish_enabled, fish_last_run_at, fish_interval_seconds,
@@ -310,6 +342,14 @@ def get_all_users():
         data = {}
         for row in rows:
             user_id = row['user_id']
+            secretary_entities = None
+            if row['secretary_entities']:
+                try:
+                    secretary_entities = pickle.loads(bytes(row['secretary_entities']))
+                except Exception as e:
+                    logging.error(f"❌ خطا در بازخوانیِ Entityهای منشیِ کاربر {user_id}: {e}")
+            secretary_media_bytes = bytes(row['secretary_media_bytes']) if row['secretary_media_bytes'] else None
+
             data[user_id] = {
                 "session": row['session'],
                 "font_id": row['font_id'] if row['font_id'] is not None else 1,
@@ -324,6 +364,11 @@ def get_all_users():
                 "secretary_enabled": bool(row['secretary_enabled']) if row['secretary_enabled'] is not None else False,
                 "secretary_text": row['secretary_text'] or "مشغولم، بعداً پاسخ می‌دهم ✅",
                 "secretary_delay": row['secretary_delay'] if row['secretary_delay'] is not None else 60,
+                "secretary_entities": secretary_entities,
+                "secretary_media_kind": row['secretary_media_kind'],
+                "secretary_media_bytes": secretary_media_bytes,
+                "secretary_media_filename": row['secretary_media_filename'],
+                "secretary_media_mime": row['secretary_media_mime'],
                 "diamonds": float(row['diamonds']) if row['diamonds'] is not None else 0.0,
                 "referral_count": row['referral_count'] if row['referral_count'] is not None else 0,
                 "username": row['username'],
@@ -382,6 +427,8 @@ def save_user(user_id, user):
                 (user_id, session, font_id, status, name_time, bio_time, active_action,
                  date_enabled, date_type, date_font, text_mode,
                  secretary_enabled, secretary_text, secretary_delay,
+                 secretary_entities, secretary_media_kind, secretary_media_bytes,
+                 secretary_media_filename, secretary_media_mime,
                  diamonds, referral_count, username, last_charge_at,
                  meow_enabled, meow_chat_id, meow_last_sent_at, meow_interval_seconds,
                  fish_enabled, fish_last_run_at, fish_interval_seconds,
@@ -391,7 +438,7 @@ def save_user(user_id, user):
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                  meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
                  autoseen_enabled)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -407,6 +454,11 @@ def save_user(user_id, user):
                 secretary_enabled = EXCLUDED.secretary_enabled,
                 secretary_text = EXCLUDED.secretary_text,
                 secretary_delay = EXCLUDED.secretary_delay,
+                secretary_entities = EXCLUDED.secretary_entities,
+                secretary_media_kind = EXCLUDED.secretary_media_kind,
+                secretary_media_bytes = EXCLUDED.secretary_media_bytes,
+                secretary_media_filename = EXCLUDED.secretary_media_filename,
+                secretary_media_mime = EXCLUDED.secretary_media_mime,
                 meow_enabled = EXCLUDED.meow_enabled,
                 meow_chat_id = EXCLUDED.meow_chat_id,
                 meow_last_sent_at = EXCLUDED.meow_last_sent_at,
@@ -438,6 +490,10 @@ def save_user(user_id, user):
             user.get("date_font", 1), user.get("text_mode", 0),
             int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
             user.get("secretary_delay", 60),
+            psycopg2.Binary(pickle.dumps(user["secretary_entities"])) if user.get("secretary_entities") else None,
+            user.get("secretary_media_kind"),
+            psycopg2.Binary(user["secretary_media_bytes"]) if user.get("secretary_media_bytes") else None,
+            user.get("secretary_media_filename"), user.get("secretary_media_mime"),
             user.get("diamonds", 0), user.get("referral_count", 0), user.get("username"),
             user.get("last_charge_at", tehran_now()),
             int(user.get("meow_enabled", False)), user.get("meow_chat_id"), user.get("meow_last_sent_at"),
@@ -888,6 +944,219 @@ def admin_set_referral_db(target_id, new_count):
         except Exception:
             pass
         return False, None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+# ======================== سیستم Referral ========================
+REFERRAL_REWARD_DEFAULT = 30  # مقدار پیش‌فرض جایزه (فقط وقتی هنوز تنظیمی در دیتابیس ثبت نشده)
+
+def get_setting_db(key, default=None):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM novaself_settings WHERE key = %s", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else default
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن تنظیمِ {key}: {e}")
+        return default
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def set_setting_db(key, value):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO novaself_settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        ''', (key, str(value)))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"❌ خطا در ذخیره‌ی تنظیمِ {key}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def get_referral_reward_db():
+    """مقدار جایزه‌ی هر رفرال (الماس). پیش‌فرض ۳۰، مگر ادمین تغییرش داده باشد."""
+    raw = get_setting_db("referral_reward")
+    if raw is None:
+        return REFERRAL_REWARD_DEFAULT
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return REFERRAL_REWARD_DEFAULT
+
+def set_referral_reward_db(amount):
+    return set_setting_db("referral_reward", max(float(amount), 0))
+
+def is_referral_enabled_db():
+    """وضعیتِ سراسریِ روشن/خاموشِ Referral. پیش‌فرض روشن، مگر ادمین خاموش کرده باشد."""
+    raw = get_setting_db("referral_enabled")
+    if raw is None:
+        return True
+    return raw == "1"
+
+def set_referral_enabled_db(enabled):
+    return set_setting_db("referral_enabled", "1" if enabled else "0")
+
+def create_pending_referral_db(referred_id, referrer_id):
+    """
+    ثبت یک رفرالِ «در انتظار» (هنوز جایزه داده نشده). به‌خاطر PRIMARY KEY روی
+    referred_id، اگر این کاربر قبلاً (با هر دعوت‌کننده‌ای) ثبت شده باشد، درخواست
+    دوم بی‌صدا نادیده گرفته می‌شود (ON CONFLICT DO NOTHING) - این دقیقاً همان
+    محافظتِ درخواست‌شده در برابر «ثبت چندباره» و «تغییر مصنوعیِ دعوت‌کننده» است.
+    خروجی: True فقط اگر این بار واقعاً ثبتِ تازه انجام شده باشد.
+    """
+    if referred_id == referrer_id:
+        return False  # جلوگیری از Self Referral
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO novaself_referrals (referred_id, referrer_id)
+            VALUES (%s, %s)
+            ON CONFLICT (referred_id) DO NOTHING
+        ''', (referred_id, referrer_id))
+        inserted = cursor.rowcount > 0
+        conn.commit()
+        return inserted
+    except Exception as e:
+        logging.error(f"❌ خطا در ثبت رفرالِ در انتظار ({referrer_id}->{referred_id}): {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def get_pending_referral_db(referred_id):
+    """اگر این کاربر یک رفرالِ هنوز-جایزه‌نگرفته دارد، آیدیِ دعوت‌کننده را برمی‌گرداند، وگرنه None."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT referrer_id FROM novaself_referrals WHERE referred_id = %s AND reward_credited = FALSE",
+            (referred_id,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن رفرالِ در انتظارِ {referred_id}: {e}")
+        return None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def credit_referral_db(referred_id, reward_amount):
+    """
+    اعتبارِ رفرال را - فقط اگر هنوز اعتبار داده نشده - به‌صورت اتمیک ثبت می‌کند
+    (شرطِ `reward_credited = FALSE` در خودِ UPDATE، نه یک چکِ جداگانه، تا حتی اگر
+    این تابع هم‌زمان چند بار صدا زده شود، جایزه فقط یک بار داده شود - محافظت در
+    برابر «استفاده چندباره از لینک برای گرفتن جایزه»).
+    خروجی: referrer_id در صورت موفقیت (اولین‌بار)، وگرنه None.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE novaself_referrals
+            SET reward_credited = TRUE, reward_amount = %s, credited_at = CURRENT_TIMESTAMP
+            WHERE referred_id = %s AND reward_credited = FALSE
+            RETURNING referrer_id
+        ''', (reward_amount, referred_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در اعتباردهیِ رفرالِ {referred_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def get_referral_stats_db():
+    """آمار کلی رفرال برای پنل ادمین: تعداد کل ثبت‌شده‌ها و تعداد جایزه‌دادهشده‌ها."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE reward_credited) FROM novaself_referrals")
+        row = cursor.fetchone()
+        return {"total": row[0] or 0, "credited": row[1] or 0}
+    except Exception as e:
+        logging.error(f"❌ خطا در خواندن آمار رفرال: {e}")
+        return {"total": 0, "credited": 0}
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def increment_referral_count_db(user_id):
+    """افزایشِ اتمیکِ شمارنده‌ی رفرالِ کاربر (بعد از اعتباردهیِ موفقِ یک رفرال)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE novaself_users SET referral_count = COALESCE(referral_count, 0) + 1 WHERE user_id = %s "
+            "RETURNING referral_count",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(f"❌ خطا در افزایش شمارنده‌ی رفرالِ {user_id}: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return None
     finally:
         try:
             if conn:

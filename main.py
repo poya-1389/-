@@ -23,7 +23,7 @@ import asyncio
 from datetime import timedelta
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, MessageNotModifiedError
 
 from webapp_api import create_webapp_app, run_webapp_server
 import nova_state
@@ -43,11 +43,15 @@ from nova_state import (
     autoreply_draft, backup_upload_pending, bot, broadcast_data, click_debouncer,
     feature_locks, format_diamonds, format_expiry, format_toman, generator_data,
     is_admin, make_default_user, meow_group_cache, normalize_phone_number,
+    _spawn_background_task,
     purchase_data, safe_edit, tehran_now, transfer_data, user_data,
 )
 from nova_db import (
     add_autoreply_db, add_broadcast_delivery_db, admin_adjust_diamonds_db,
     admin_set_referral_db, approve_order_db, check_user_joined_all,
+    create_pending_referral_db, credit_referral_db, get_pending_referral_db,
+    get_referral_reward_db, get_referral_stats_db, increment_referral_count_db,
+    is_referral_enabled_db, set_referral_enabled_db, set_referral_reward_db,
     create_backup_db, create_broadcast_record_db, create_gift_code_db,
     create_join_channel_db, create_order_db, delete_autoreply_db,
     delete_backup_db, delete_broadcast_record_db, delete_gift_code_db,
@@ -70,6 +74,7 @@ from nova_menus import (
     get_actions_menu_keyboard, get_admin_actions_grid_keyboard,
     get_admin_datefont_grid_keyboard, get_admin_font_grid_keyboard,
     get_admin_main_menu, get_admin_textmode_grid_keyboard,
+    get_admin_referral_text, get_admin_referral_keyboard,
     get_autoreply_list_keyboard, get_autoreply_list_text,
     get_autoreply_matchtype_keyboard, get_autoreply_matchtype_text,
     get_autoreply_menu_keyboard, get_autoreply_menu_text,
@@ -83,7 +88,7 @@ from nova_menus import (
     get_blockmgmt_menu_keyboard, get_blockmgmt_menu_text,
     get_broadcast_detail_keyboard, get_broadcast_detail_text,
     get_broadcasts_admin_keyboard, get_broadcasts_admin_text,
-    get_buy_amount_keyboard, get_buy_confirm_keyboard, get_buy_confirm_text,
+    get_buy_amount_keyboard, get_buy_amount_text, get_buy_confirm_keyboard, get_buy_confirm_text,
     get_buy_invoice_keyboard, get_buy_invoice_text, get_buy_payment_keyboard,
     get_buy_payment_text, get_buy_waiting_receipt_keyboard,
     get_buy_waiting_receipt_text, get_cleanup_menu_keyboard, get_cleanup_menu_text,
@@ -107,6 +112,7 @@ from nova_menus import (
     get_secretary_menu_keyboard, get_secretary_menu_text, get_settings_root_keyboard,
     get_start_about_keyboard, get_start_about_text, get_start_account_keyboard,
     get_start_account_text, get_start_manage_self_keyboard,
+    get_referral_page_text, get_referral_page_keyboard,
     get_start_manage_self_text, get_start_root_keyboard, get_start_root_text,
     get_streetcat_settings_keyboard, get_streetcat_settings_text,
     get_tag_menu_keyboard, get_tag_menu_text, get_textmode_menu_keyboard,
@@ -178,6 +184,53 @@ async def inline_panel_handler(event):
     await event.answer([result], cache_time=0)
 
 
+async def _try_credit_referral(referred_id):
+    """
+    اگر این کاربر یک رفرالِ «در انتظار» دارد (با لینکِ دعوت آمده ولی هنوز جایزه
+    داده نشده) و همین الان (این تابع فقط بعد از تأییدِ Join اجباری صدا زده
+    می‌شود) شرایط تکمیل شده، جایزه را نهایی می‌کند و به دعوت‌کننده اطلاع می‌دهد.
+
+    کاملاً Idempotent و امن برای صدازدنِ مکرر: credit_referral_db فقط دقیقاً
+    یک‌بار می‌تواند موفق شود (شرطِ reward_credited=FALSE در خودِ UPDATE)، پس
+    هیچ‌وقت یک نفر دو بار جایزه نمی‌گیرد، حتی اگر این تابع هم‌زمان چند بار
+    فراخوانی شود.
+    """
+    try:
+        pending_referrer = get_pending_referral_db(referred_id)
+        if not pending_referrer:
+            return
+
+        reward = get_referral_reward_db()
+        referrer_id = credit_referral_db(referred_id, reward)
+        if not referrer_id:
+            return  # قبلاً اعتبار داده شده یا اصلاً رفرالی در انتظار نبود
+
+        if reward > 0:
+            success, new_balance = admin_adjust_diamonds_db(referrer_id, reward)
+            if success and referrer_id in user_data and new_balance is not None:
+                # مقدار دقیقِ بازگشتی از دیتابیس (نه جمعِ دستیِ حافظه) منبعِ حقیقت است
+                user_data[referrer_id]["diamonds"] = new_balance
+
+        new_count = increment_referral_count_db(referrer_id)
+        if referrer_id in user_data and new_count is not None:
+            user_data[referrer_id]["referral_count"] = new_count
+
+        referred_user = user_data.get(referred_id, {})
+        referred_username = referred_user.get("username")
+        referred_label = f"@{referred_username}" if referred_username else "بدون یوزرنیم"
+
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 کاربر `{referred_id}` ({referred_label})\n"
+                "با لینک دعوت شما به NoVA SeLF پیوست.\n\n"
+                f"🎁 جایزه رفرال: {format_diamonds(reward)} 💎"
+            )
+        except Exception as e:
+            log_internal_error("referral_notify", e)
+    except Exception as e:
+        log_internal_error("try_credit_referral", e)
+
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """هندلر دستور /start - کاملاً یکسان برای همه کاربران"""
@@ -186,7 +239,20 @@ async def start_handler(event):
     if user_id in generator_data:
         return
 
-    if user_id not in user_data:
+    # پارسِ پارامترِ Referral از لینکِ دعوت (اگر /start با یک payload آمده باشد،
+    # مثلِ https://t.me/BotUsername?start=123456789 که تلگرام آن را به‌صورتِ
+    # پیامِ متنیِ «/start 123456789» تحویل می‌دهد).
+    referrer_id = None
+    _start_parts = (event.raw_text or "").split(maxsplit=1)
+    if len(_start_parts) > 1 and _start_parts[1].strip().isdigit():
+        try:
+            referrer_id = int(_start_parts[1].strip())
+        except ValueError:
+            referrer_id = None
+
+    is_new_user = user_id not in user_data
+
+    if is_new_user:
         sender = None
         try:
             sender = await event.get_sender()
@@ -202,6 +268,27 @@ async def start_handler(event):
         # این‌طوری در پنل ادمین/بکاپ هم از همان لحظه‌ی اول دیده می‌شود.
         save_user(user_id, user_data[user_id])
 
+        # ثبتِ رفرالِ «در انتظار» - طبق بندهای امنیتی: فقط برای کاربرِ واقعاً تازه
+        # (نه هر باری که /start می‌زند)، فقط اگر دعوت‌کننده واقعاً در ربات ثبت‌نام
+        # کرده باشد، و هرگز خودِ کاربر (Self Referral؛ create_pending_referral_db
+        # خودش هم این حالت را رد می‌کند). جایزه اینجا هنوز داده نمی‌شود - فقط
+        # پایین همین تابع، بعد از Join واقعیِ کانال‌های اجباری، اعتبار داده می‌شود.
+        if referrer_id and is_referral_enabled_db() and referrer_id in user_data:
+            create_pending_referral_db(user_id, referrer_id)
+    else:
+        # کاربرِ قبلاً ثبت‌شده: یوزرنیمش را هم همین‌جا تازه می‌کنیم (نه فقط بار
+        # اول)، چون این فیلد پایه‌ی جستجوی «انتقال الماس با یوزرنیم» است و اگر
+        # کاربر یوزرنیمش را عوض کرده باشد یا موقع اولین /start اصلاً یوزرنیم
+        # نداشته، بدون این بازتازه‌سازی برای همیشه قدیمی/خالی می‌ماند.
+        try:
+            sender = await event.get_sender()
+            current_username = getattr(sender, "username", None) if sender else None
+            if current_username and user_data[user_id].get("username") != current_username:
+                user_data[user_id]["username"] = current_username
+                save_user(user_id, user_data[user_id])
+        except Exception as e:
+            log_internal_error("start_refresh_username", e)
+
     user = user_data[user_id]
 
     # جوین اجباری: هر بار زنده چک می‌شود (بدون کش/دیتابیس)؛ ادمین‌ها معاف هستند
@@ -210,6 +297,11 @@ async def start_handler(event):
     if blocked:
         await _send_join_gate(event, user_id, missing)
         return
+
+    # طبق «سیستم Referral»: رفرال فقط بعد از تکمیل Join اجباری (همین بالا) نهایی
+    # می‌شود - این تابع خودش Idempotent است (اگر رفرالی در انتظار نبود یا قبلاً
+    # جایزه داده شده بود، هیچ کاری نمی‌کند)، پس امن است که هر بار /start صدا زده شود.
+    await _try_credit_referral(user_id)
 
     await event.respond(
         get_start_root_text(),
@@ -270,15 +362,23 @@ async def callback_handler(event):
             return
 
         if real_action == "panel_close":
+            if not click_debouncer.should_process(event.sender_id, data):
+                await event.answer()  # کلیک تکراری/سریع روی «بستن پنل»؛ تسکِ دوم ساخته نمی‌شود
+                return
             await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
             # طبق درخواست: بعد از ۳ ثانیه خودِ پیامِ «پنل بسته شد» هم پاک شود.
+            # نکته‌ی حیاتی: Task باید حتماً با _spawn_background_task ساخته شود
+            # (نه asyncio.create_task خام)؛ وگرنه چون هیچ‌جا رفرنسی از Task نگه
+            # داشته نمی‌شود، Garbage Collector پایتون ممکن است پیش از تمام‌شدنِ
+            # ۳ ثانیه، خودِ Task را جمع‌آوری/لغو کند و پیام هرگز پاک نشود - دقیقاً
+            # همان باگی که گزارش شده بود.
             async def _delete_after_delay():
                 try:
                     await asyncio.sleep(3)
                     await event.delete()
                 except Exception as e:
                     log_internal_error("panel_close_auto_delete", e)
-            asyncio.create_task(_delete_after_delay())
+            _spawn_background_task(_delete_after_delay())
             return
 
         user_id = owner_id
@@ -294,6 +394,7 @@ async def callback_handler(event):
         if all_joined:
             user = user_data.get(user_id) or make_default_user(step="menu")
             user_data[user_id] = user
+            await _try_credit_referral(user_id)
             await safe_edit(event, get_start_root_text(), buttons=get_start_root_keyboard(user))
         else:
             await event.answer("برای استفاده از ربات، ابتدا باید در کانال‌های مشخص‌شده عضو شوید.", alert=True)
@@ -337,6 +438,34 @@ async def callback_handler(event):
         # ====================================================================
         if data == b"admin_joingate":
             await safe_edit(event, get_joingate_admin_text(), buttons=get_joingate_admin_keyboard())
+            return
+
+        # ====================================================================
+        # ============================ مدیریت رفرال ============================
+        # ====================================================================
+        if data == b"admin_referral":
+            await safe_edit(event, get_admin_referral_text(), buttons=get_admin_referral_keyboard(is_referral_enabled_db()))
+            return
+
+        if data == b"admin_referral_toggle":
+            set_referral_enabled_db(not is_referral_enabled_db())
+            log_admin_action(user_id, 0, "referral_toggle", str(is_referral_enabled_db()))
+            await safe_edit(event, get_admin_referral_text(), buttons=get_admin_referral_keyboard(is_referral_enabled_db()))
+            return
+
+        if data == b"admin_referral_zero_reward":
+            set_referral_reward_db(0)
+            log_admin_action(user_id, 0, "referral_reward_zeroed", "0")
+            await safe_edit(event, get_admin_referral_text(), buttons=get_admin_referral_keyboard(is_referral_enabled_db()))
+            return
+
+        if data == b"admin_referral_set_reward":
+            admin_action_data[user_id] = {"type": "admin_referral_reward", "step": "get_amount"}
+            await safe_edit(event,
+                "✏️ **تغییر مقدار جایزه‌ی رفرال**\n\n"
+                "مقدار جدید جایزه (به الماس) را ارسال کنید:",
+                buttons=[[styled_button("➜ بازگشت", b"admin_referral", style=STYLE_OFF)]]
+            )
             return
 
         if data == b"admin_joingate_add":
@@ -1300,6 +1429,10 @@ async def callback_handler(event):
         await safe_edit(event, get_start_account_text(user_id, user), buttons=get_start_account_keyboard())
         return
 
+    if data == b"account_referral":
+        await safe_edit(event, get_referral_page_text(user_id, user), buttons=get_referral_page_keyboard())
+        return
+
     if data == b"start_about":
         await safe_edit(event, get_start_about_text(), buttons=get_start_about_keyboard())
         return
@@ -1496,8 +1629,7 @@ async def callback_handler(event):
         purchase_data[user_id] = {"buffer": ""}
         user["step"] = "buy_amount"
         await safe_edit(event,
-            "💎 **خرید الماس**\n\n"
-            "تعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+            get_buy_amount_text(""),
             buttons=get_buy_amount_keyboard("")
         )
         return
@@ -1530,14 +1662,14 @@ async def callback_handler(event):
             buffer_str += action
 
         pending["buffer"] = buffer_str
-        await safe_edit(event, "💎 **خرید الماس**\n\nتعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+        await safe_edit(event, get_buy_amount_text(buffer_str),
                          buttons=get_buy_amount_keyboard(buffer_str))
         return
 
     if data == b"buy_amount_back" and user.get("step") == "buy_confirm":
         pending = purchase_data.setdefault(user_id, {"buffer": ""})
         user["step"] = "buy_amount"
-        await safe_edit(event, "💎 **خرید الماس**\n\nتعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:",
+        await safe_edit(event, get_buy_amount_text(pending.get("buffer", "")),
                          buttons=get_buy_amount_keyboard(pending.get("buffer", "")))
         return
 
@@ -2237,14 +2369,30 @@ async def callback_handler(event):
         return
 
     if data == b"secretary_set_text":
+        try:
+            panel_msg = await event.get_message()
+            user["secretary_panel_msg_id"] = panel_msg.id if panel_msg else None
+        except Exception as e:
+            log_internal_error("secretary_panel_ref", e)
+            user["secretary_panel_msg_id"] = None
+        user["secretary_panel_chat_id"] = event.chat_id
         user["step"] = "secretary_get_text"
         await safe_edit(event,
-            "📝 متن موردنظر خود را ارسال کنید.\n\n"
-            "این متن جایگزین پیام پیش‌فرض منشی می‌شود."
+            "📝 هر نوع محتوایی که می‌خواهید منشی به‌جای شما بفرستد را ارسال کنید:\n\n"
+            "متن ساده، متنِ استایل‌دار (Bold/Italic/Underline/Strike/Spoiler/Quote/لینک)، "
+            "عکس (+توضیح)، ویدیو (+توضیح)، GIF، استیکر، فایل، ویس، Video Note، موزیک، "
+            "یا حتی یک پیامِ Forward‌شده - همان محتوا عیناً به‌عنوان پاسخ منشی ذخیره می‌شود."
         )
         return
 
     if data == b"secretary_set_time":
+        try:
+            panel_msg = await event.get_message()
+            user["secretary_panel_msg_id"] = panel_msg.id if panel_msg else None
+        except Exception as e:
+            log_internal_error("secretary_panel_ref", e)
+            user["secretary_panel_msg_id"] = None
+        user["secretary_panel_chat_id"] = event.chat_id
         user["step"] = "secretary_get_time"
         await safe_edit(event,
             "⏱️ لطفاً زمان تأخیر پاسخ منشی را بر حسب **ثانیه** ارسال کنید.\n\n"
@@ -2359,6 +2507,8 @@ async def message_handler(event):
         backup_upload_pending.pop(user_id, None)
         if user_id in user_data:
             user_data[user_id]["step"] = "managed"
+            user_data[user_id].pop("secretary_panel_chat_id", None)
+            user_data[user_id].pop("secretary_panel_msg_id", None)
         # buttons=Button.clear() هم چون ممکن است هنگام لغو، دکمه‌ی «ارسال شماره
         # تلفن» (کیبورد پایین صفحه) هنوز باز باشد.
         await event.respond("❌ عملیات لغو شد.", buttons=Button.clear())
@@ -2708,6 +2858,26 @@ async def message_handler(event):
                 buttons=get_giftcodes_admin_keyboard()
             )
             return
+
+    # ====== تغییر مقدار جایزه‌ی رفرال توسط ادمین ======
+    if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") == "admin_referral_reward":
+        cancel_kb = [[styled_button("➜ بازگشت", b"admin_referral", style=STYLE_OFF)]]
+        try:
+            new_reward = float(text)
+            if new_reward < 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            await event.respond("❌ لطفاً یک عدد معتبر و غیرمنفی ارسال کنید.", buttons=cancel_kb)
+            return
+
+        set_referral_reward_db(new_reward)
+        del admin_action_data[user_id]
+        log_admin_action(user_id, 0, "referral_reward_changed", f"new_reward={new_reward}")
+        await event.respond(
+            get_admin_referral_text(),
+            buttons=get_admin_referral_keyboard(is_referral_enabled_db())
+        )
+        return
 
     # ====== ویرایش مقدار الماس / انقضای یک کد هدیه‌ی موجود ======
     if user_id in admin_action_data and is_admin(user_id) and admin_action_data[user_id].get("type") in (
@@ -3061,15 +3231,68 @@ async def message_handler(event):
             return
 
     # ====== دریافت سشن آماده ======
-    # ====== تنظیم متن منشی ======
+    # ====== تنظیم متن/محتوای منشی (پشتیبانی کامل از هر نوع پیام تلگرام) ======
     if user_id in user_data and user_data[user_id].get("step") == "secretary_get_text":
-        new_text = text if text else "مشغولم، بعداً پاسخ می‌دهم ✅"
-        user_data[user_id]["secretary_text"] = new_text
+        panel_chat_id = user_data[user_id].get("secretary_panel_chat_id")
+        panel_msg_id = user_data[user_id].get("secretary_panel_msg_id")
+
+        async def _update_secretary_panel(panel_text, buttons=None):
+            """
+            طبق «تغییر مکانیزم تنظیمات منشی»: به‌جای ارسال پیامِ تازه، همان پیامِ
+            پنلی که قبلاً باز شده بود Edit می‌شود. اگر آن پیام به هر دلیلی در
+            دسترس نبود (مثلاً پاک شده)، به‌عنوان تنها راهِ باقی‌مانده یک پیامِ
+            تازه فرستاده می‌شود (Fallback امن، نه رفتار پیش‌فرض).
+            """
+            if panel_chat_id and panel_msg_id:
+                try:
+                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons)
+                    return
+                except MessageNotModifiedError:
+                    return
+                except Exception as e:
+                    log_internal_error("secretary_panel_edit", e)
+            await event.respond(panel_text, buttons=buttons)
+
+        msg = event.message
+        media_kind = _media_kind_key(msg)
+        media_bytes = None
+        media_filename = None
+        media_mime = None
+
+        if media_kind:
+            size = getattr(event.file, "size", None) if event.file else None
+            if size and size > MAX_AUTOREPLY_MEDIA_BYTES:
+                await _update_secretary_panel(
+                    f"❌ حجم این فایل بیش از حد مجاز است (حداکثر {MAX_AUTOREPLY_MEDIA_MB} مگابایت).\n\n"
+                    "فایل کوچک‌تری بفرست یا پیام دیگری ارسال کن."
+                )
+                return
+            try:
+                media_bytes = await event.download_media(file=bytes)
+            except Exception as e:
+                log_internal_error("secretary_download_media", e)
+                await _update_secretary_panel("❌ خطا در دریافت فایل. دوباره تلاش کنید.")
+                return
+            media_filename = getattr(event.file, "name", None) if event.file else None
+            media_mime = getattr(event.file, "mime_type", None) if event.file else None
+
+        new_text = text if text else None
+        if not new_text and not media_bytes:
+            await _update_secretary_panel("❌ پیام خالی قابل ذخیره نیست. یک متن یا رسانه ارسال کن.")
+            return
+
+        user_data[user_id]["secretary_text"] = new_text or "مشغولم، بعداً پاسخ می‌دهم ✅"
+        user_data[user_id]["secretary_entities"] = msg.entities
+        user_data[user_id]["secretary_media_kind"] = media_kind
+        user_data[user_id]["secretary_media_bytes"] = media_bytes
+        user_data[user_id]["secretary_media_filename"] = media_filename
+        user_data[user_id]["secretary_media_mime"] = media_mime
         user_data[user_id]["step"] = "managed"
+        user_data[user_id].pop("secretary_panel_chat_id", None)
+        user_data[user_id].pop("secretary_panel_msg_id", None)
         save_user(user_id, user_data[user_id])
 
-        await event.respond("✅ متن منشی با موفقیت ذخیره شد.")
-        await event.respond(
+        await _update_secretary_panel(
             get_secretary_menu_text(user_data[user_id]),
             buttons=get_secretary_menu_keyboard(user_data[user_id])
         )
@@ -3077,20 +3300,35 @@ async def message_handler(event):
 
     # ====== تنظیم تایم منشی ======
     if user_id in user_data and user_data[user_id].get("step") == "secretary_get_time":
+        panel_chat_id = user_data[user_id].get("secretary_panel_chat_id")
+        panel_msg_id = user_data[user_id].get("secretary_panel_msg_id")
+
+        async def _update_secretary_panel_time(panel_text, buttons=None):
+            if panel_chat_id and panel_msg_id:
+                try:
+                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons)
+                    return
+                except MessageNotModifiedError:
+                    return
+                except Exception as e:
+                    log_internal_error("secretary_panel_edit", e)
+            await event.respond(panel_text, buttons=buttons)
+
         try:
             seconds = int(text)
             if seconds < 1 or seconds > 86400:
                 raise ValueError
         except (ValueError, TypeError):
-            await event.respond("❌ لطفاً یک عدد معتبر (بین 1 تا 86400) بر حسب ثانیه ارسال کنید.")
+            await _update_secretary_panel_time("❌ لطفاً یک عدد معتبر (بین 1 تا 86400) بر حسب ثانیه ارسال کنید.")
             return
 
         user_data[user_id]["secretary_delay"] = seconds
         user_data[user_id]["step"] = "managed"
+        user_data[user_id].pop("secretary_panel_chat_id", None)
+        user_data[user_id].pop("secretary_panel_msg_id", None)
         save_user(user_id, user_data[user_id])
 
-        await event.respond(f"✅ زمان تأخیر منشی روی {seconds} ثانیه تنظیم شد.")
-        await event.respond(
+        await _update_secretary_panel_time(
             get_secretary_menu_text(user_data[user_id]),
             buttons=get_secretary_menu_keyboard(user_data[user_id])
         )
@@ -3123,16 +3361,32 @@ async def message_handler(event):
             except ValueError:
                 target_id = None
         else:
-            # جستجو بر اساس یوزرنیم (با یا بدون @، غیرحساس به بزرگی/کوچکیِ حروف) -
-            # دقیقاً همان شرط آیدی عددی: فقط اگر کاربر واقعاً در ربات ثبت‌نام
-            # کرده باشد (یوزرنیمش در user_data ذخیره شده) پیدا می‌شود.
-            uname = raw_target.lstrip("@").lower()
+            # نکته‌ی مهم (علتِ اصلیِ باگِ گزارش‌شده): جستجوی فقط در کشِ محلیِ
+            # user_data کافی نیست، چون آن فیلد فقط یک‌بار (موقع اولین /start)
+            # پر می‌شود و اگر کاربر بعداً یوزرنیمش را عوض کند یا موقع اولین
+            # /start اصلاً یوزرنیم نداشته، برای همیشه خالی/قدیمی می‌ماند. برای
+            # همین اول زنده از خودِ تلگرام Resolve می‌کنیم و فقط اگر آن هم جواب
+            # نداد (مثلاً به‌خاطر تنظیمات حریم خصوصی)، به کشِ محلی برمی‌گردیم.
+            uname = raw_target.lstrip("@").strip()
             if uname:
-                for uid, udata in user_data.items():
-                    stored_uname = (udata.get("username") or "").lower()
-                    if stored_uname and stored_uname == uname:
-                        target_id = uid
-                        break
+                try:
+                    entity = await bot.get_entity(uname)
+                    resolved_id = getattr(entity, "id", None)
+                    if resolved_id and resolved_id in user_data:
+                        target_id = resolved_id
+                        live_username = getattr(entity, "username", None)
+                        if live_username:
+                            user_data[resolved_id]["username"] = live_username
+                except Exception as e:
+                    log_internal_error("transfer_username_resolve", f"uname={uname} err={e}")
+
+                if target_id is None:
+                    uname_lower = uname.lower()
+                    for uid, udata in user_data.items():
+                        stored_uname = (udata.get("username") or "").lower()
+                        if stored_uname and stored_uname == uname_lower:
+                            target_id = uid
+                            break
 
         if target_id is None:
             await event.respond(

@@ -22,6 +22,7 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
+import nova_state
 from nova_utils import (
     styled_button, toggle_button, toggle_label, status_icon,
     STYLE_ON, STYLE_OFF, STYLE_INFO, wrap_panel_buttons,
@@ -40,6 +41,7 @@ from nova_state import (
 from nova_db import (
     get_db_connection, list_backups_db, list_broadcasts_db,
     list_gift_codes_db, list_join_channels_db, get_user_stats,
+    get_referral_reward_db, is_referral_enabled_db, get_referral_stats_db,
 )
 
 FEATURE_LOCK_DEFS = [
@@ -891,8 +893,30 @@ def get_start_account_keyboard():
             styled_button("💎 خرید الماس", b"account_buy_diamond", style=STYLE_ON),
             styled_button("💸 انتقال الماس", b"account_transfer_start", style=STYLE_ON),
         ],
+        [styled_button("👥 الماس رایگان", b"account_referral", style=STYLE_INFO)],
         [styled_button("➜ بازگشت", b"start_root", style=STYLE_OFF)]
     ]
+
+# ======================== صفحه‌ی الماس رایگان (Referral) ========================
+def get_referral_page_text(user_id, user):
+    if not is_referral_enabled_db():
+        return (
+            "💎 **الماس رایگان**\n\n"
+            "❌ قابلیتِ رفرال در حال حاضر توسط مدیریت غیرفعال است."
+        )
+
+    bot_username = nova_state.BOT_USERNAME
+    link = f"https://t.me/{bot_username}?start={user_id}" if bot_username else "(در حال آماده‌سازی...)"
+    reward = get_referral_reward_db()
+    return (
+        "💎 **الماس رایگان**\n\n"
+        f"🔗 لینک دعوت شما:\n`{link}`\n\n"
+        f"🎁 جایزه هر رفرال:\n{format_diamonds(reward)} الماس\n\n"
+        f"👥 تعداد رفرال شما:\n{user.get('referral_count', 0)}"
+    )
+
+def get_referral_page_keyboard():
+    return [[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]]
 
 def get_account_delete_warning_keyboard():
     return [
@@ -983,20 +1007,62 @@ def get_code_keyboard(current_code=""):
 # ======================== خرید الماس (کیبورد عددی + State Machine) ========================
 MAX_BUY_DIAMONDS_DIGITS = 7  # جلوگیری از وارد کردن اعداد نجومی/بی‌معنی
 
-def get_buy_amount_keyboard(buffer_str):
-    display = buffer_str if buffer_str else "0"
+def _calc_buy_days(amount):
+    """
+    تعداد روزی که مقدار الماسِ واردشده برای «روشن ماندنِ» سلف کافی است - واقعی و
+    بر اساس همان نرخِ مصرفِ ساعتیِ پروژه (DIAMOND_RATE_PER_HOUR) محاسبه می‌شود،
+    نه یک عدد ثابت/Hard-code.
+    """
     try:
-        preview_toman = f"{int(buffer_str) * DIAMOND_PRICE_TOMAN:,}" if buffer_str else "0"
+        amount = float(amount or 0)
+    except (TypeError, ValueError):
+        return 0
+    if amount <= 0 or not DIAMOND_RATE_PER_HOUR:
+        return 0
+    total_hours = amount / DIAMOND_RATE_PER_HOUR
+    return int(total_hours // 24)
+
+def get_buy_amount_text(buffer_str):
+    """
+    طبق درخواست: نمایش مقدار الماس/تومان/روز از روی دکمه‌ی شیشه‌ای به متنِ خودِ
+    پیام منتقل شده است.
+    """
+    try:
+        amount = int(buffer_str) if buffer_str else 0
     except ValueError:
-        preview_toman = "0"
+        amount = 0
+    toman = amount * DIAMOND_PRICE_TOMAN
+    days = _calc_buy_days(amount)
+    return (
+        "💎 **خرید الماس**\n\n"
+        "تعداد الماسی که می‌خواهید خریداری کنید را با کیبورد زیر وارد کنید:\n\n"
+        f"💎 • الماس: {format_diamonds(amount)}\n"
+        f"💰 • تومان: {toman:,.0f} تومان\n"
+        f"📆 • روز: {days} روز"
+    )
+
+def get_buy_amount_keyboard(buffer_str):
+    # طبق درخواست صریح: ردیفِ پیش‌نمایش (دکمه‌ی بی‌رنگِ «تعداد/تومان») حذف شده
+    # (این اطلاعات الان در متنِ پیام است)، و تمام دکمه‌های عددی آبی شدند.
     return [
-        [Button.inline(f"💎 تعداد: {display}  |  💰 {preview_toman} تومان", b"void")],
-        [Button.inline("1", b"buy_k_1"), Button.inline("2", b"buy_k_2"), Button.inline("3", b"buy_k_3")],
-        [Button.inline("4", b"buy_k_4"), Button.inline("5", b"buy_k_5"), Button.inline("6", b"buy_k_6")],
-        [Button.inline("7", b"buy_k_7"), Button.inline("8", b"buy_k_8"), Button.inline("9", b"buy_k_9")],
+        [
+            styled_button("1", b"buy_k_1", style=STYLE_INFO),
+            styled_button("2", b"buy_k_2", style=STYLE_INFO),
+            styled_button("3", b"buy_k_3", style=STYLE_INFO),
+        ],
+        [
+            styled_button("4", b"buy_k_4", style=STYLE_INFO),
+            styled_button("5", b"buy_k_5", style=STYLE_INFO),
+            styled_button("6", b"buy_k_6", style=STYLE_INFO),
+        ],
+        [
+            styled_button("7", b"buy_k_7", style=STYLE_INFO),
+            styled_button("8", b"buy_k_8", style=STYLE_INFO),
+            styled_button("9", b"buy_k_9", style=STYLE_INFO),
+        ],
         [
             styled_button("⌫", b"buy_k_back", style=STYLE_OFF),
-            Button.inline("0", b"buy_k_0"),
+            styled_button("0", b"buy_k_0", style=STYLE_INFO),
             styled_button("✅ تأیید", b"buy_k_submit", style=STYLE_ON),
         ],
         [styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]
@@ -1084,9 +1150,30 @@ def get_admin_main_menu():
         [styled_button("🎁 مدیریت کدهای هدیه", b"admin_giftcodes", style=STYLE_INFO)],
         [styled_button("🧾 پیام‌های ارسالی", b"admin_messages_list", style=STYLE_INFO)],
         [styled_button("🔔 جوین اجباری", b"admin_joingate", style=STYLE_INFO)],
+        [styled_button("👥 مدیریت رفرال", b"admin_referral", style=STYLE_INFO)],
         [styled_button("💾 سیستم بکاپ", b"admin_backup", style=STYLE_INFO)],
         [styled_button("📜 لاگ‌های مدیریتی اخیر", b"admin_logs", style=STYLE_INFO)],
         [styled_button("🔄 بروزرسانی همه کاربران", b"admin_refresh_all", style=STYLE_INFO)]
+    ]
+
+def get_admin_referral_text():
+    stats = get_referral_stats_db()
+    reward = get_referral_reward_db()
+    enabled = is_referral_enabled_db()
+    return (
+        "👥 **مدیریت رفرال**\n\n"
+        f"🎁 مقدار جایزه‌ی فعلی: {format_diamonds(reward)} الماس\n"
+        f"⚙️ وضعیت سراسری: {status_icon(enabled)}\n\n"
+        f"📊 تعداد کل رفرال‌های ثبت‌شده: {stats['total']}\n"
+        f"✅ تعداد رفرال‌هایی که جایزه گرفته‌اند: {stats['credited']}"
+    )
+
+def get_admin_referral_keyboard(enabled):
+    return [
+        [toggle_button("رفرال سراسری", enabled, b"admin_referral_toggle")],
+        [styled_button("✏️ تغییر مقدار جایزه", b"admin_referral_set_reward", style=STYLE_INFO)],
+        [styled_button("0️⃣ صفر کردن جایزه", b"admin_referral_zero_reward", style=STYLE_OFF)],
+        [styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
     ]
 
 def get_giftcodes_admin_text():
@@ -1413,8 +1500,8 @@ async def build_panel_card_image(owner_id, user):
             draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
 
         # ---- آواتار سمت چپ ----
-        avatar_size = 340
-        avatar_x = 80
+        avatar_size = 300
+        avatar_x = 70
         avatar_y = (H - avatar_size) // 2
 
         avatar_img = None
@@ -1455,54 +1542,60 @@ async def build_panel_card_image(owner_id, user):
         img.paste(avatar_img, (avatar_x, avatar_y), mask)
 
         # ---- بلوکِ متنیِ سمت راست ----
-        right_x = avatar_x + avatar_size + 60
-        right_margin = 30
+        right_x = avatar_x + avatar_size + 50
+        right_margin = 26
         max_text_width = W - right_x - right_margin
 
-        title_font = _load_card_font(74, bold=True)
-        sub_font_small = _load_card_font(28, bold=False)
+        # طبق گزارش «متن‌ها هنوز کوچیکن»، این نسخه فونت‌ها را به‌طور محسوس بزرگ‌تر
+        # کرده (نه فقط چند پیکسل) - چون تلگرام تصویرِ اینلاین را در حبابِ چت با
+        # عرضِ فیزیکیِ محدود نمایش می‌دهد، اندازه‌ی مؤثرِ فونت روی صفحه از نسبتِ
+        # «اندازه‌ی فونت به عرضِ کل تصویر» می‌آید، نه از رزولوشنِ خام؛ پس برای
+        # واقعاً بزرگ‌تر دیده‌شدن، این نسبت باید افزایش پیدا کند.
+        title_font = _load_card_font(104, bold=True)
+        sub_font_small = _load_card_font(30, bold=False)
         title_text = "NOVA SELF"
-        title_y = 95
+        title_y = 60
 
         # اگر به هر دلیلی (مثلاً فونتِ Fallback) عنوان از عرضِ باقیمانده رد بشود،
         # فونتش را تا حدی کوچک می‌کنیم که کامل جا شود (به‌جای بریده‌شدن).
         tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
-        while tw_title > max_text_width and title_font.size > 40:
+        while tw_title > max_text_width and title_font.size > 50:
             title_font = _load_card_font(title_font.size - 2, bold=True)
             tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
 
         glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         glow_draw = ImageDraw.Draw(glow_layer)
         glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
-        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(14))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(16))
         img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
         draw = ImageDraw.Draw(img)
         draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
 
         sub_text = "SELF MANAGEMENT PANEL"
-        draw.text((right_x + 4, title_y + 118), sub_text, font=sub_font_small, fill=(120, 170, 220))
-        draw.line([(right_x, title_y + 172), (right_x + 380, title_y + 172)], fill=(0, 150, 190), width=3)
+        draw.text((right_x + 4, title_y + 130), sub_text, font=sub_font_small, fill=(120, 170, 220))
+        draw.line([(right_x, title_y + 185), (right_x + 380, title_y + 185)], fill=(0, 150, 190), width=3)
 
-        info_font = _load_card_font(56, bold=True)
-        sub_font = _load_card_font(38, bold=False)
+        info_font = _load_card_font(70, bold=True)
+        sub_font = _load_card_font(48, bold=False)
         # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
         # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
         username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
         id_text = f"ID: {owner_id}"
 
-        # اگر یوزرنیم طولانی بود، فونت را تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود
+        # اگر یوزرنیم طولانی بود (تلگرام حداکثر ۳۲ کاراکتر مجاز می‌داند)، فونت را
+        # تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود.
         uw = _card_text_width(draw, username_text, info_font)
-        while uw > max_text_width and info_font.size > 28:
+        while uw > max_text_width and info_font.size > 24:
             info_font = _load_card_font(info_font.size - 2, bold=True)
             uw = _card_text_width(draw, username_text, info_font)
 
-        draw.text((right_x, title_y + 215), username_text, font=info_font, fill=(255, 255, 255))
-        draw.text((right_x, title_y + 285), id_text, font=sub_font, fill=(150, 205, 255))
+        draw.text((right_x, title_y + 228), username_text, font=info_font, fill=(255, 255, 255))
+        draw.text((right_x, title_y + 312), id_text, font=sub_font, fill=(150, 205, 255))
 
-        tag_font = _load_card_font(20, bold=False)
+        tag_font = _load_card_font(22, bold=False)
         tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
         tgw = _card_text_width(draw, tag_text, tag_font)
-        draw.text(((W - tgw) / 2, H - 46), tag_text, font=tag_font, fill=(85, 115, 155))
+        draw.text(((W - tgw) / 2, H - 44), tag_text, font=tag_font, fill=(85, 115, 155))
 
         out = io.BytesIO()
         out.name = "novaself_panel.png"
@@ -1512,3 +1605,4 @@ async def build_panel_card_image(owner_id, user):
     except Exception as e:
         log_internal_error("panel_card_image", e)
         return None
+

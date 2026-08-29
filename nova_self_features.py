@@ -151,13 +151,39 @@ async def _send_mentions(event, users_list, user_id):
 
         await asyncio.sleep(1.5)
 
+# ======================== سیستم یکپارچه‌ی مدیریت خطا ========================
+async def _edit_with_error(event, error_text):
+    """
+    طبق «سیستم یکپارچه مدیریت خطا»: به‌جای ارسال یک پیامِ خطای جداگانه، خودِ
+    پیامِ دستورِ کاربر Edit می‌شود و خطا به‌صورت نقل‌قول (Blockquote، دقیقاً مثل
+    مکانیزمِ «> متن خطا») داخل همان پیام نمایش داده می‌شود - نه یک پیامِ اضافه.
+    اگر Editکردن هم ممکن نبود (مثلاً چون پیام قبلاً پاک شده)، بی‌صدا نادیده
+    گرفته می‌شود؛ هرگز باعث Crash یا ارسال پیامِ اضافه نمی‌شود.
+    """
+    try:
+        surrogated = helpers.add_surrogate(error_text)
+        entities = [make_blockquote_entity(0, len(surrogated))]
+        await safe_call(event.client.edit_message, event.chat_id, event.id, error_text, formatting_entities=entities)
+    except MessageNotModifiedError:
+        pass
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("edit_with_error", e)
+
 async def handle_tag_admins(event, user_id):
     try:
         admins = await _gather_chat_admins(event)
         if not admins:
-            await event.reply("❌ ادمینی برای منشن پیدا نشد یا دسترسی کافی برای دریافت لیست ادمین‌ها وجود ندارد.")
+            await _edit_with_error(event, "❌ ادمینی برای منشن پیدا نشد یا دسترسی کافی برای دریافت لیست ادمین‌ها وجود ندارد.")
             return
         await _send_mentions(event, admins, user_id)
+        # طبق رفتار یکپارچه‌ی جدید: بعد از ارسال موفقِ منشن‌ها، خودِ پیامِ دستور
+        # (`.تگ ادمین`) پاک می‌شود تا اضافه در چت باقی نماند.
+        try:
+            await event.delete()
+        except Exception as e:
+            log_internal_error("tag_admins_cleanup_command_msg", e)
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -173,14 +199,18 @@ async def handle_tag_members(event, user_id):
                     members.append(u)
         except (RPCError, Exception) as e:
             logging.error(f"⚠️ خطا در دریافت اعضای گروه: {e}")
-            await event.reply("❌ دریافت لیست اعضا با خطا مواجه شد (ممکن است دسترسی کافی نباشد یا گروه محدودیت داشته باشد).")
+            await _edit_with_error(event, "❌ دریافت لیست اعضا با خطا مواجه شد (ممکن است دسترسی کافی نباشد یا گروه محدودیت داشته باشد).")
             return
 
         if not members:
-            await event.reply("❌ عضوی برای منشن پیدا نشد.")
+            await _edit_with_error(event, "❌ عضوی برای منشن پیدا نشد.")
             return
 
         await _send_mentions(event, members, user_id)
+        try:
+            await event.delete()
+        except Exception as e:
+            log_internal_error("tag_members_cleanup_command_msg", e)
     except Exception as e:
         logging.error(f"⚠️ خطا در تگ اعضا (کاربر {user_id}): {e}")
 
@@ -263,12 +293,12 @@ async def handle_whois_command(event, user_id):
     """فقط زمانی کار می‌کند که دستور روی پیام یک کاربر Reply شده باشد."""
     try:
         if not event.is_reply:
-            await event.reply("❌ برای استفاده از `.آیدی` باید روی پیام یک کاربر Reply کنید.")
+            await _edit_with_error(event, "❌ برای استفاده از `.آیدی` باید روی پیام یک کاربر Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not reply.sender_id:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         client = event.client
@@ -279,7 +309,7 @@ async def handle_whois_command(event, user_id):
             target = None
 
         if not target:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         bio = ""
@@ -323,12 +353,19 @@ async def handle_whois_command(event, user_id):
         else:
             # طبق نکته‌ی «اگر کاربر عکس پروفایل نداشت، بدون خطا کار کند»
             await safe_call(client.send_message, event.chat_id, caption, reply_to=reply.id)
+
+        # طبق رفتار یکپارچه‌ی جدید (مثل `.بلاک`/`.حذف`): چون نتیجه یک پیامِ
+        # جداگانه است، خودِ پیامِ دستور بعد از موفقیت پاک می‌شود.
+        try:
+            await event.delete()
+        except Exception as e:
+            log_internal_error("whois_cleanup_command_msg", e)
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
         log_internal_error("whois_command", e)
         try:
-            await event.reply("❌ خطا در دریافت اطلاعات کاربر.")
+            await _edit_with_error(event, "❌ خطا در دریافت اطلاعات کاربر.")
         except Exception:
             pass
 
@@ -338,17 +375,17 @@ async def handle_set_reaction_command(event, user_id):
     try:
         parts = event.raw_text.strip().split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
-            await event.reply("❌ فرمت صحیح: `.ریکت 🤣` (با Reply روی پیام کاربر موردنظر)")
+            await _edit_with_error(event, "❌ فرمت صحیح: `.ریکت 🤣` (با Reply روی پیام کاربر موردنظر)")
             return
         emoji = parts[1].strip()
 
         if not event.is_reply:
-            await event.reply("❌ برای تنظیم ریکت باید روی پیام همان کاربر Reply کنید.")
+            await _edit_with_error(event, "❌ برای تنظیم ریکت باید روی پیام همان کاربر Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not reply.sender_id:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         target_id = reply.sender_id
@@ -360,7 +397,7 @@ async def handle_set_reaction_command(event, user_id):
             pass
 
         if not set_user_reaction_db(user_id, target_id, username, emoji):
-            await event.reply("❌ خطا در ذخیره‌سازی. دوباره تلاش کنید.")
+            await _edit_with_error(event, "❌ خطا در ذخیره‌سازی. دوباره تلاش کنید.")
             return
 
         reaction_targets.setdefault(user_id, {})[target_id] = {"emoji": emoji, "username": username}
@@ -395,12 +432,12 @@ async def handle_set_reaction_command(event, user_id):
 async def handle_remove_reaction_command(event, user_id):
     try:
         if not event.is_reply:
-            await event.reply("❌ برای حذف ریکت باید روی پیام همان کاربر Reply کنید.")
+            await _edit_with_error(event, "❌ برای حذف ریکت باید روی پیام همان کاربر Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not reply.sender_id:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         target_id = reply.sender_id
@@ -418,7 +455,7 @@ async def handle_remove_reaction_command(event, user_id):
             client = event.client
             await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
         else:
-            await event.reply("❌ این کاربر در لیست ریکت شما نبود.")
+            await _edit_with_error(event, "❌ این کاربر در لیست ریکت شما نبود.")
     except MessageNotModifiedError:
         pass
     except FloodWaitError as e:
@@ -498,12 +535,12 @@ def _display_name_of(entity):
 async def handle_block_command(event, user_id):
     try:
         if not event.is_reply:
-            await event.reply("❌ برای بلاک کردن باید روی پیام همان کاربر Reply کنید.")
+            await _edit_with_error(event, "❌ برای بلاک کردن باید روی پیام همان کاربر Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not reply.sender_id:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         client = event.client
@@ -511,11 +548,11 @@ async def handle_block_command(event, user_id):
             target = await reply.get_sender()
         except Exception as e:
             log_internal_error("block_get_sender", e)
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         if not target:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         name = _display_name_of(target)
@@ -527,7 +564,7 @@ async def handle_block_command(event, user_id):
             return
         except Exception as e:
             log_internal_error("block_command", f"user={user_id} target={getattr(target,'id',None)} err={e}")
-            await event.reply(f"❌ بلاک کردن {name} با خطا مواجه شد.")
+            await _edit_with_error(event, f"❌ بلاک کردن {name} با خطا مواجه شد.")
             return
 
         await asyncio.sleep(0.2)
@@ -550,12 +587,12 @@ async def handle_block_command(event, user_id):
 async def handle_unblock_command(event, user_id):
     try:
         if not event.is_reply:
-            await event.reply("❌ برای آن‌بلاک کردن باید روی پیام همان کاربر Reply کنید.")
+            await _edit_with_error(event, "❌ برای آن‌بلاک کردن باید روی پیام همان کاربر Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not reply.sender_id:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         client = event.client
@@ -563,11 +600,11 @@ async def handle_unblock_command(event, user_id):
             target = await reply.get_sender()
         except Exception as e:
             log_internal_error("unblock_get_sender", e)
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         if not target:
-            await event.reply("❌ اطلاعات این کاربر در دسترس نیست.")
+            await _edit_with_error(event, "❌ اطلاعات این کاربر در دسترس نیست.")
             return
 
         name = _display_name_of(target)
@@ -579,7 +616,7 @@ async def handle_unblock_command(event, user_id):
             return
         except Exception as e:
             log_internal_error("unblock_command", f"user={user_id} target={getattr(target,'id',None)} err={e}")
-            await event.reply(f"❌ آن‌بلاک کردن {name} با خطا مواجه شد.")
+            await _edit_with_error(event, f"❌ آن‌بلاک کردن {name} با خطا مواجه شد.")
             return
 
         await asyncio.sleep(0.2)
@@ -653,21 +690,24 @@ async def handle_videomessage_command(event, user_id):
     (round_message + ابعاد مربعیِ صریح، طبق نیازِ مستندِ تلگرام برای این نوع
     پیام) در همان چت ارسال می‌شود. تمام خطاهای احتمالی (فرمت نامعتبر، حجم/طول
     زیاد، FloodWait) بدون کرش مدیریت می‌شوند و فایل‌های موقت همیشه پاک می‌شوند.
+
+    طبق سیستم یکپارچه‌ی خطا: به‌جای پیامِ جداگانه‌ی «⏳ در حال تبدیل...»، خودِ
+    پیامِ دستور ویرایش می‌شود؛ و بعد از موفقیت (چون نتیجه یک فایل است، نه متن)
+    خودِ پیامِ دستور حذف می‌شود - دقیقاً مثل رفتار `.بلاک`/`.حذف`.
     """
     tmp_dir = None
-    status_msg = None
     try:
         if not event.is_reply:
-            await event.reply("❌ برای این قابلیت باید روی یک ویدیو Reply کنید.")
+            await _edit_with_error(event, "❌ برای این قابلیت باید روی یک ویدیو Reply کنید.")
             return
 
         reply = await event.get_reply_message()
         if not reply or not getattr(reply, "video", None):
-            await event.reply("❌ باید روی یک پیامِ ویدیویی Reply کنید.")
+            await _edit_with_error(event, "❌ باید روی یک پیامِ ویدیویی Reply کنید.")
             return
 
         if not _FFMPEG_AVAILABLE:
-            await event.reply("❌ این قابلیت روی سرور فعال نیست (imageio-ffmpeg نصب نشده است).")
+            await _edit_with_error(event, "❌ این قابلیت روی سرور فعال نیست (imageio-ffmpeg نصب نشده است).")
             return
 
         client = event.client
@@ -676,9 +716,9 @@ async def handle_videomessage_command(event, user_id):
         output_path = os.path.join(tmp_dir, "output.mp4")
 
         try:
-            status_msg = await event.reply("⏳ در حال تبدیل به ویدیو مسیج...")
+            await safe_call(client.edit_message, event.chat_id, event.id, "⏳ در حال تبدیل به ویدیو مسیج...")
         except Exception:
-            status_msg = None
+            pass
 
         try:
             await safe_call(client.download_media, reply, input_path)
@@ -687,27 +727,13 @@ async def handle_videomessage_command(event, user_id):
             return
         except Exception as e:
             log_internal_error("videomessage_download", f"user={user_id} err={e}")
-            err_text = "❌ دانلود ویدیو ناموفق بود."
-            if status_msg:
-                try:
-                    await status_msg.edit(err_text)
-                except Exception:
-                    pass
-            else:
-                await event.reply(err_text)
+            await _edit_with_error(event, "❌ دانلود ویدیو ناموفق بود.")
             return
 
         success, duration, err = await _convert_to_video_note(input_path, output_path)
         if not success:
             log_internal_error("videomessage_convert", f"user={user_id} err={err}")
-            err_text = "❌ تبدیل ویدیو به ویدیو مسیج ناموفق بود؛ فرمت ویدیو پشتیبانی نمی‌شود."
-            if status_msg:
-                try:
-                    await status_msg.edit(err_text)
-                except Exception:
-                    pass
-            else:
-                await event.reply(err_text)
+            await _edit_with_error(event, "❌ تبدیل ویدیو به ویدیو مسیج ناموفق بود؛ فرمت ویدیو پشتیبانی نمی‌شود.")
             return
 
         attributes = [DocumentAttributeVideo(
@@ -724,21 +750,13 @@ async def handle_videomessage_command(event, user_id):
             return
         except Exception as e:
             log_internal_error("videomessage_send", f"user={user_id} err={e}")
-            err_text = "❌ ارسال ویدیو مسیج ناموفق بود."
-            if status_msg:
-                try:
-                    await status_msg.edit(err_text)
-                except Exception:
-                    pass
-            else:
-                await event.reply(err_text)
+            await _edit_with_error(event, "❌ ارسال ویدیو مسیج ناموفق بود.")
             return
 
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+        try:
+            await event.delete()
+        except Exception as e:
+            log_internal_error("videomessage_cleanup_command_msg", e)
     except FloodWaitError as e:
         await asyncio.sleep(e.seconds)
     except Exception as e:
@@ -901,7 +919,6 @@ def make_secretary_incoming_handler(user_id):
                 return
 
             delay = max(1, int(user.get("secretary_delay", 60)))
-            reply_text = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
 
             async def _delayed_reply():
                 try:
@@ -912,8 +929,36 @@ def make_secretary_incoming_handler(user_id):
                     client = active_clients.get(user_id)
                     if not client:
                         return
-                    sent = await client.send_message(peer_id, cur_user.get("secretary_text") or reply_text)
-                    _mark_auto_sent(user_id, sent.chat_id, sent.id)
+
+                    caption = cur_user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
+                    entities = cur_user.get("secretary_entities")
+                    media_bytes = cur_user.get("secretary_media_bytes")
+                    sent = None
+
+                    if media_bytes:
+                        file_obj = io.BytesIO(media_bytes)
+                        file_obj.name = cur_user.get("secretary_media_filename") or "file"
+                        send_kwargs = {
+                            "caption": caption,
+                            "formatting_entities": entities,
+                        }
+                        kind = cur_user.get("secretary_media_kind")
+                        if kind == "voice":
+                            send_kwargs["voice_note"] = True
+                        elif kind == "video_note":
+                            send_kwargs["video_note"] = True
+                        elif kind == "gif":
+                            send_kwargs["attributes"] = [DocumentAttributeAnimated()]
+                        # نکته: استیکر از بایت خام (بدون stickerset اصلی) به‌صورت عکس/فایل
+                        # معمولی دوباره ارسال می‌شود؛ حفظ کامل خاصیت «استیکر» ممکن نیست،
+                        # چون از یک حساب دیگر (پنل بات) دانلود و توسط اکانت Self دوباره
+                        # آپلود می‌شود - دقیقاً همان محدودیتِ سیستم پاسخ خودکار.
+                        sent = await safe_call(client.send_file, peer_id, file_obj, **send_kwargs)
+                    else:
+                        sent = await safe_call(client.send_message, peer_id, caption, formatting_entities=entities)
+
+                    if sent:
+                        _mark_auto_sent(user_id, sent.chat_id, sent.id)
                     if user_id in secretary_state and peer_id in secretary_state[user_id]:
                         secretary_state[user_id][peer_id]["replied"] = True
                 except asyncio.CancelledError:
@@ -2083,3 +2128,4 @@ async def autostart_saved_users():
             # کاربران باید مستقل از این، در همین چرخه‌ی استارتاپ راه‌اندازی شوند.
             logging.error(f"❌ خطا در autostart برای کاربر {user_id}: {e}")
             log_internal_error("autostart_saved_users", e)
+
