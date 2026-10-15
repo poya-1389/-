@@ -240,6 +240,7 @@ def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
 
     @web.middleware
     async def cors_middleware(request, handler):
+        # آپدیت ۲۰۲۶: فقط methodهای GET و POST و OPTIONS اجازه دارن.
         if request.method == "OPTIONS":
             resp = web.Response()
         else:
@@ -247,9 +248,20 @@ def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
                 resp = await handler(request)
             except web.HTTPException as exc:
                 resp = exc
-        resp.headers["Access-Control-Allow-Origin"] = allowed_origin
+        # آپدیت ۲۰۲۶: اگر allowed_origin برابر "*" نباشه (محیط production)،
+        # به‌جای wildcard از origin درخواست استفاده می‌کنیم تا CORS محدود بشه.
+        origin = request.headers.get("Origin", "")
+        if allowed_origin != "*" and origin and origin != allowed_origin:
+            # رد درخواست از origin غیرمجاز.
+            return web.json_response({"ok": False, "error": "origin-not-allowed"}, status=403)
+        resp.headers["Access-Control-Allow-Origin"] = allowed_origin if allowed_origin != "*" else origin or "*"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Init-Data"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+        # آپدیت ۲۰۲۶: headerهای امنیتی.
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "no-referrer"
         return resp
 
     app = web.Application(middlewares=[cors_middleware])

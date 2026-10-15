@@ -22,6 +22,7 @@ nova_utils.py
 
 import re
 import time
+import math
 import logging
 import asyncio
 from datetime import datetime
@@ -29,6 +30,60 @@ from decimal import Context, Decimal, DivisionByZero, InvalidOperation, Overflow
 
 from telethon.errors import FloodWaitError
 from telethon.tl.custom import Button
+
+# ==================== ۰. helperهای امنیتی و پارس امن callback ====================
+_MD_SPECIAL = re.compile(r"([_*~`|\[\](){}>#\\+\-=!])")
+
+
+def escape_md(text) -> str:
+    """
+    Escape کاراکترهای خاصِ MarkdownV2 تا رشته‌ی کنترل‌شده‌ی کاربر (مثل username،
+    عنوان گروه، متن منشی و...) باعث نشه parse_error یا قالب‌بندیِ ناخواسته در
+    تلگرام پیش بیاد. مقدار None/خالی به رشته‌ی خالی تبدیل می‌شه.
+    """
+    if text is None:
+        return ""
+    return _MD_SPECIAL.sub(r"\\\1", str(text))
+
+
+def safe_int_id(data: bytes, prefix, default=None):
+    """
+    پارس امنِ شناسه‌ی عددی از callback_data با حذفِ prefix. اگر داده‌ی ورودی
+    مخدوش باشه یا شکل مورد انتظار رو نداشته باشه، `default` برمی‌گرده بدون
+    پرتابِ Exception. این تابع جلوی کرشِ callback_handler به‌خاطر ValueError/
+    IndexError رو می‌گیره.
+    prefix می‌تونه bytes یا str باشه.
+    """
+    try:
+        if isinstance(prefix, bytes):
+            raw = data.split(prefix, 1)[1]
+        else:
+            raw = data.decode(errors="ignore").split(prefix, 1)[1]
+        return int(raw)
+    except (ValueError, IndexError, UnicodeDecodeError, AttributeError):
+        return default
+
+
+def safe_split_id(data: bytes, sep: str = "_", index: int = -1, default=None):
+    """
+    پارس امنِ شناسه با split بر اساس sep و گرفتن بخشِ index.
+    """
+    try:
+        parts = data.decode(errors="ignore").split(sep)
+        if -len(parts) <= index < len(parts):
+            return int(parts[index])
+    except (ValueError, IndexError, UnicodeDecodeError, AttributeError):
+        pass
+    return default
+
+
+def is_finite_number(value) -> bool:
+    """بررسی اینکه value یک عدد متناهی است (نه NaN/Inf)."""
+    try:
+        f = float(value)
+        return math.isfinite(f)
+    except (TypeError, ValueError):
+        return False
 
 # ==================== ۷. دکمه‌ی شیشه‌ای رنگی (با Fallback) ====================
 # تلگرام از Bot API 9.4 (۹ فوریه ۲۰۲۶) فیلد style را به دکمه‌ها اضافه کرد که
@@ -255,11 +310,13 @@ class ClickDebouncer:
 
 
 # ==================== ۵. اجرای امن عملیات تلگرام (مدیریت خودکار FloodWait) ====================
-async def safe_call(coro_func, *args, max_retries: int = 3, **kwargs):
+async def safe_call(coro_func, *args, max_retries: int = 3, base_backoff: float = 1.0, **kwargs):
     """
     coro_func (مثل client.send_message، client.edit_message و ...) رو با
     آرگومان‌های داده‌شده صدا می‌زنه؛ اگر FloodWaitError بگیره، خودش به‌اندازه‌ی
     لازم صبر می‌کنه و دوباره تلاش می‌کنه (بدون نیاز به تکرار این منطق در همه‌جا).
+    از backoff نمایی با jitter استفاده می‌کنه تا در صورتِ ترافیک بالا، فشار
+    اضافی روی سرور تلگرام وارد نشه.
     """
     last_error = None
     for attempt in range(max_retries):
@@ -268,10 +325,28 @@ async def safe_call(coro_func, *args, max_retries: int = 3, **kwargs):
         except FloodWaitError as e:
             last_error = e
             wait_for = e.seconds + 1
-            logging.warning(f"⏳ FloodWait: {wait_for} ثانیه صبر (تلاش {attempt + 1}/{max_retries})")
+            logging.warning(f"⏳ FloodWait: {wait_for}s صبر (تلاش {attempt + 1}/{max_retries})")
             await asyncio.sleep(wait_for)
+        except Exception as e:
+            # خطاهای غیرِ FloodWait رو بلافاصله پاس می‌دیم به caller تا رفتار
+            # متناسب با نوع خطا (مثل MessageNotModifiedError) رو هندل کنه.
+            raise
     if last_error:
         raise last_error
+
+
+async def safe_call_bg(coro_func, *args, max_retries: int = 5, **kwargs):
+    """
+    نسخه‌ی پس‌زمینه‌ی safe_call برای عملیات‌های non-critical (مثل ارسال receipt).
+    تعداد retry بیشتر و در صورت شکست نهایی، فقط لاگ می‌کنه و exception رو
+    نمی‌ده بالا تا جریان اصلی کاربر قطع نشه.
+    """
+    try:
+        await safe_call(coro_func, *args, max_retries=max_retries, **kwargs)
+        return True
+    except Exception as e:
+        log_internal_error("safe_call_bg", e)
+        return False
 
 
 # ==================== ۶. لاگ داخلی عملیات مهم ====================

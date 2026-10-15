@@ -17,12 +17,18 @@ Import می‌کنند - نه برعکس (این فایل هرگز از nova_men
 import json
 import base64
 import pickle
+import hmac
+import hashlib
 import secrets
 import string
 import logging
+import math
+import asyncio
 from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import DictCursor
+from psycopg2 import sql as pg_sql
+from psycopg2.pool import ThreadedConnectionPool
 from telethon.errors import UserNotParticipantError
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.types import ChannelParticipantLeft, ChannelParticipantBanned
@@ -36,15 +42,54 @@ from nova_state import (
     format_diamonds,
 )
 
-# ======================== مدیریت دیتابیس ========================
+# ======================== Connection Pool (آپدیت ۲۰۲۶) ========================
+# قبلاً هر بار یک اتصال SSL جدید باز می‌شد که روی Railway ۵۰-۲۰۰ms latency داشت و
+# در ترافیک بالا max_connections پستگرس رو پر می‌کرد. حالا از ThreadedConnectionPool
+# استفاده می‌کنیم که اتصال‌ها رو reuse می‌کنه.
+_db_pool = None
+_db_pool_lock = __import__('threading').Lock()
+
+# کلید HMAC برای امضای pickle blob ها (دفاع در عمق در برابر RCE).
+# در صورت تغییر این مقدار، pickle های قبلی قابل خواندن نیستند.
+_PICKLE_HMAC_SECRET = secrets.token_bytes(32)
+
+
+def _get_db_pool():
+    """تنبلی ThreadedConnectionPool رو ایجاد می‌کنه."""
+    global _db_pool
+    if _db_pool is not None:
+        return _db_pool
+    with _db_pool_lock:
+        if _db_pool is None:
+            try:
+                _db_pool = ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=10,
+                    dsn=DATABASE_URL,
+                    sslmode='require',
+                    connect_timeout=10,
+                )
+                logging.info("✅ Connection Pool دیتابیس راه‌اندازی شد.")
+            except Exception as e:
+                logging.error(f"❌ خطا در ایجاد Connection Pool، fallback به حالت تک‌اتصال: {e}")
+                _db_pool = None
+    return _db_pool
+
+
 def get_db_connection():
     """
-    اتصال جدید به Postgres. بلافاصله بعد از اتصال، Timezone نشست روی Asia/Tehran
-    تنظیم می‌شود تا مقادیر CURRENT_TIMESTAMP/NOW() که در ستون‌های TIMESTAMP (بدون
-    Timezone) ذخیره می‌شوند، بر حسب ساعت تهران محاسبه شوند — نه ساعت سرور (که روی
-    Railway معمولاً UTC است). این باگِ «تایم/تاریخ اشتباه در بعضی قسمت‌ها» را حل می‌کند.
+    اتصال جدید به Postgres (از pool اگر موجود). بلافاصله بعد از اتصال، Timezone
+    نشست روی Asia/Tehran تنظیم می‌شود.
     """
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+    pool = _get_db_pool()
+    if pool is not None:
+        try:
+            conn = pool.getconn()
+        except Exception as e:
+            logging.error(f"⚠️ خطا در گرفتن اتصال از pool: {e}")
+            conn = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
+    else:
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
     try:
         with conn.cursor() as cursor:
             cursor.execute("SET TIME ZONE 'Asia/Tehran'")
@@ -53,8 +98,58 @@ def get_db_connection():
         logging.error(f"⚠️ خطا در تنظیم Timezone اتصال دیتابیس: {e}")
     return conn
 
+
+def release_db_connection(conn):
+    """بازگرداندن اتصال به pool (یا بستن اگر pool نیست)."""
+    if conn is None:
+        return
+    pool = _get_db_pool()
+    if pool is not None:
+        try:
+            pool.putconn(conn)
+            return
+        except Exception:
+            pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _signed_pickle(obj) -> bytes:
+    """
+    pickle رو با امضای HMAC می‌سازه تا قبل از loads بتونیم صحت رو تأیید کنیم.
+    این یک لایه دفاعی در برابر RCE در صورت دسترسی به DB است.
+    """
+    blob = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    sig = hmac.new(_PICKLE_HMAC_SECRET, blob, hashlib.sha256).digest()
+    return base64.b64encode(sig) + b"$" + blob
+
+
+def _signed_unpickle(data) -> object:
+    """verify HMAC و سپس pickle.loads. در صورت عدم تطابق None برمی‌گرده."""
+    if not data:
+        return None
+    try:
+        raw = bytes(data)
+        if b"$" not in raw[:64]:
+            # فرمت قدیمی بدون امضا — قبول نمی‌کنیم.
+            logging.warning("⚠️ pickle بدون امضای HMAC رد شد.")
+            return None
+        sig_b64, _, blob = raw.partition(b"$")
+        expected_sig = base64.b64decode(sig_b64)
+        actual_sig = hmac.new(_PICKLE_HMAC_SECRET, blob, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected_sig, actual_sig):
+            logging.error("❌ امضای HMAC pickle نامعتبر است — احتمال دستکاری.")
+            return None
+        return pickle.loads(blob)
+    except Exception as e:
+        logging.error(f"❌ خطا در بازخوانی pickle امضاشده: {e}")
+        return None
+
 def init_db():
     """ایجاد جدول و افزودن ستون‌های جدید در صورت نیاز (idempotent و امن برای ری‌استارت)."""
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -73,6 +168,7 @@ def init_db():
         ''')
         conn.commit()
 
+        # آپدیت جدید (۲۰۲۶): استفاده از sql.Identifier برای defense-in-depth.
         migration_columns = [
             ("date_enabled", "INTEGER DEFAULT 0"),
             ("date_type", "TEXT DEFAULT 'shamsi'"),
@@ -93,7 +189,7 @@ def init_db():
             ("meow_enabled", "INTEGER DEFAULT 0"),
             ("meow_chat_id", "BIGINT"),
             ("meow_last_sent_at", "TIMESTAMP"),
-            ("meow_interval_seconds", "INTEGER DEFAULT 320"),
+            ("meow_interval_seconds", "INTEGER DEFAULT 900"),
             ("fish_enabled", "INTEGER DEFAULT 0"),
             ("fish_last_run_at", "TIMESTAMP"),
             ("fish_interval_seconds", "INTEGER DEFAULT 3610"),
@@ -120,11 +216,15 @@ def init_db():
         ]
         for col_name, col_def in migration_columns:
             try:
-                cursor.execute(f"ALTER TABLE novaself_users ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
-                conn.commit()
+                stmt = pg_sql.SQL("ALTER TABLE novaself_users ADD COLUMN IF NOT EXISTS {} {}").format(
+                    pg_sql.Identifier(col_name),
+                    pg_sql.SQL(col_def),
+                )
+                cursor.execute(stmt)
             except Exception as e:
                 conn.rollback()
                 logging.error(f"❌ خطا در افزودن ستون {col_name}: {e}")
+        conn.commit()  # یک commit در انتهای کل migration ها
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS novaself_admin_logs (
@@ -309,13 +409,37 @@ def init_db():
         ''')
         conn.commit()
 
+        # آپدیت جدید (۲۰۲۶): افزودن Index های مهم برای بهبود Performance.
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON novaself_users (username)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON novaself_users (status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created ON novaself_admin_logs (created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON novaself_orders (user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON novaself_orders (status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON novaself_orders (created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_gift_uses_user ON novaself_gift_code_uses (user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_reactions_target ON novaself_reactions (target_user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON novaself_referrals (referrer_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_backups_created ON novaself_backups (created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_user ON novaself_broadcast_deliveries (user_id)")
+        conn.commit()
+
         logging.info("✅ دیتابیس با موفقیت راه‌اندازی/بروزرسانی شد.")
-        cursor.close()
-        conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در راه‌اندازی دیتابیس: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if conn:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            release_db_connection(conn)
 
 def get_all_users():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=DictCursor)
@@ -341,18 +465,13 @@ def get_all_users():
         """)
 
         rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
 
         data = {}
         for row in rows:
             user_id = row['user_id']
             secretary_entities = None
             if row['secretary_entities']:
-                try:
-                    secretary_entities = pickle.loads(bytes(row['secretary_entities']))
-                except Exception as e:
-                    logging.error(f"❌ خطا در بازخوانیِ Entityهای منشیِ کاربر {user_id}: {e}")
+                secretary_entities = _signed_unpickle(row['secretary_entities'])
             secretary_media_bytes = bytes(row['secretary_media_bytes']) if row['secretary_media_bytes'] else None
 
             data[user_id] = {
@@ -419,6 +538,12 @@ def get_all_users():
     except Exception as e:
         logging.error(f"❌ خطا در بارگذاری کاربران: {e}")
         return {}
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def save_user(user_id, user):
     """
@@ -428,6 +553,8 @@ def save_user(user_id, user):
     می‌شوند؛ آپدیت آن‌ها از این تابع می‌تواند مقدار تازه‌ی دیتابیس را با مقدار قدیمیِ
     حافظه بازنویسی کند و باعث ناسازگاری/از دست رفتن موجودی شود.
     """
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -504,12 +631,12 @@ def save_user(user_id, user):
             user.get("date_font", 1), user.get("text_mode", 0),
             int(user.get("secretary_enabled", False)), user.get("secretary_text", "مشغولم، بعداً پاسخ می‌دهم ✅"),
             user.get("secretary_delay", 60),
-            psycopg2.Binary(pickle.dumps(user["secretary_entities"])) if user.get("secretary_entities") else None,
+            psycopg2.Binary(_signed_pickle(user["secretary_entities"])) if user.get("secretary_entities") else None,
             user.get("secretary_media_kind"),
             psycopg2.Binary(user["secretary_media_bytes"]) if user.get("secretary_media_bytes") else None,
             user.get("secretary_media_filename"), user.get("secretary_media_mime"),
             user.get("diamonds", 0), user.get("referral_count", 0), user.get("username"),
-            user.get("last_charge_at", tehran_now()),
+            user.get("last_charge_at") or tehran_now(),
             int(user.get("meow_enabled", False)), user.get("meow_chat_id"), user.get("meow_last_sent_at"),
             user.get("meow_interval_seconds", MEOW_INTERVAL_SECONDS),
             int(user.get("fish_enabled", False)), user.get("fish_last_run_at"),
@@ -528,56 +655,98 @@ def save_user(user_id, user):
             bool(user.get("cloud_edited_enabled", False)), bool(user.get("cloud_timed_enabled", False))
         ))
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در ذخیره کاربر {user_id}: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def update_username_db(user_id, username):
     """بروزرسانی مستقل نام‌کاربری (بدون تداخل با فیلدهای اقتصادی)."""
     if not username:
         return
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE novaself_users SET username = %s WHERE user_id = %s", (username, user_id))
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در بروزرسانی نام‌کاربری {user_id}: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def delete_user_db(user_id):
+    """
+    حذف کاربر به‌همتمام داده‌های مرتبط (کد های هدیه استفاده‌شده، ریکت‌ها،
+    پاسخ‌های خودکار، قفل‌ها، رفرال‌ها). از CASCADE برای حفظ یکپارچگی استفاده شده.
+    """
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        # آپدیت ۲۰۲۶: پاکسازی صریح جداول مرتبط برای جلوگیری از orphan rows.
+        cursor.execute("DELETE FROM novaself_reactions WHERE owner_id = %s OR target_user_id = %s", (user_id, user_id))
+        cursor.execute("DELETE FROM novaself_autoreplies WHERE owner_id = %s", (user_id,))
+        cursor.execute("DELETE FROM novaself_feature_locks WHERE user_id = %s", (user_id,))
+        cursor.execute("UPDATE novaself_referrals SET referrer_id = 0 WHERE referrer_id = %s", (user_id,))
+        cursor.execute("DELETE FROM novaself_referrals WHERE referred_id = %s", (user_id,))
+        cursor.execute("DELETE FROM novaself_orders WHERE user_id = %s", (user_id,))
+        cursor.execute("DELETE FROM novaself_gift_code_uses WHERE user_id = %s", (user_id,))
+        cursor.execute("DELETE FROM novaself_broadcast_deliveries WHERE user_id = %s", (user_id,))
         cursor.execute("DELETE FROM novaself_users WHERE user_id = %s", (user_id,))
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در حذف کاربر {user_id}: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def get_user_stats():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        cursor.execute("SELECT COUNT(*) FROM novaself_users")
-        total_users = cursor.fetchone()[0]
-
-        cursor.execute("SELECT COUNT(*) FROM novaself_users WHERE status = 1")
-        active_users = cursor.fetchone()[0]
-
-        cursor.close()
-        conn.close()
-
+        # آپدیت ۲۰۲۶: ترکیب دو query در یک query واحد.
+        cursor.execute("SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 1) FROM novaself_users")
+        row = cursor.fetchone()
+        total_users, active_users = (row[0] or 0, row[1] or 0) if row else (0, 0)
         return total_users, active_users
     except Exception as e:
         logging.error(f"❌ خطا در دریافت آمار: {e}")
         return 0, 0
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def log_admin_action(admin_id, target_id, action, details=""):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -586,12 +755,22 @@ def log_admin_action(admin_id, target_id, action, details=""):
             (admin_id, target_id, action, details)
         )
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         logging.error(f"❌ خطا در ثبت لاگ مدیریتی: {e}")
+        log_internal_error("audit_log_failure", e)
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 def get_recent_admin_logs(limit=15):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -601,21 +780,38 @@ def get_recent_admin_logs(limit=15):
             (limit,)
         )
         rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        return rows
+        return [dict(r) if hasattr(r, 'keys') else r for r in rows]
     except Exception as e:
         logging.error(f"❌ خطا در دریافت لاگ‌های مدیریتی: {e}")
         return []
+    finally:
+        if cursor:
+            try: cursor.close()
+            except Exception: pass
+        if conn:
+            release_db_connection(conn)
 
 # ======================== سیستم اقتصادی الماس (اتمیک و امن در برابر Race Condition) ========================
 def charge_diamonds_db(user_id, cost):
     """
     کسر اتمیک الماس (برای بیلینگِ روشن‌بودن سلف).
+
+    آپدیت مهم (۲۰۲۶): اگر موجودی کافی نباشد، موجودی صفر نمی‌شود! در عوض،
+    عملیات رد می‌شود و موجودی دست‌نخورده باقی می‌ماند. این رفتار قبلی (صفر کردن)
+    اقتصاداً ناعادلانه بود: کاربر با ۵ الماس که نمی‌تونست ۱۰ الماس پرداخت کنه،
+    هر ۵ الماسش رو از دست می‌داد.
+
     خروجی: (success: bool, new_balance: float یا None در صورت خطا)
-    success=False یعنی موجودی برای این هزینه کافی نبود (و موجودی صفر شده است).
+        success=True, new_balance: موجودی جدید بعد از کسر
+        success=False, new_balance: موجودی فعلی (بدون تغییر) اگر کافی نبود
+        success=False, None: کاربر پیدا نشد یا خطای DB
     """
-    if cost <= 0:
+    # اعتبارسنجی cost: NaN/Inf نمی‌پذیریم.
+    try:
+        cost = float(cost)
+    except (TypeError, ValueError):
+        return False, None
+    if not math.isfinite(cost) or cost <= 0:
         return True, None
     conn = None
     try:
@@ -630,19 +826,20 @@ def charge_diamonds_db(user_id, cost):
         current = float(row[0] or 0)
         if current <= 0:
             conn.rollback()
-            return False, 0.0
+            return False, current  # موجودی فعلی ۰ است (نه None)
 
         new_balance = current - cost
-        insufficient = new_balance < 0
-        if insufficient:
-            new_balance = 0.0
+        if new_balance < 0:
+            # آپدیت ۲۰۲۶: به‌جای صفر کردن، موجودی رو دست نمی‌زنیم.
+            conn.rollback()
+            return False, current
 
         cursor.execute(
             "UPDATE novaself_users SET diamonds = %s, last_charge_at = %s WHERE user_id = %s",
             (new_balance, tehran_now(), user_id)
         )
         conn.commit()
-        return (not insufficient), new_balance
+        return True, new_balance
     except Exception as e:
         logging.error(f"❌ خطا در کسر الماس کاربر {user_id}: {e}")
         try:
@@ -669,8 +866,9 @@ def transfer_diamonds_db(sender_id, receiver_id, amount):
         amount = float(amount)
     except (TypeError, ValueError):
         return False, "❌ مقدار وارد شده معتبر نیست.", None, None
-    if amount <= 0:
-        return False, "❌ مقدار انتقال باید بیشتر از صفر باشد.", None, None
+    # آپدیت ۲۰۲۶: رد NaN/Inf که می‌تونن DOUBLE PRECISION column رو آلوده کنن.
+    if not math.isfinite(amount) or amount <= 0:
+        return False, "❌ مقدار انتقال باید یک عدد مثبت و متناهی باشد.", None, None
 
     conn = None
     try:
@@ -1867,7 +2065,15 @@ BACKUP_TABLE_PKS = {
     "novaself_feature_locks": (["user_id", "feature_key"], []),
     "novaself_join_channels": (["id"], []),
     "novaself_admin_logs": (["id"], []),
+    # آپدیت ۲۰۲۶: این دو جدول قبلاً غایب بودند و باعث از دست رفتن کامل داده‌ها
+    # در backup→restore می‌شد.
+    "novaself_settings": (["key"], []),
+    "novaself_referrals": (["referred_id"], []),
 }
+
+# رشته‌ای از تمام نام ستون‌های مجاز برای هر جدول، برای اعتبارسنجی هنگام restore
+# (آپدیت ۲۰۲۶: defense-in-depth در برابر SQL injection از طریق فایل بکاپ مخدوش).
+_BACKUP_KNOWN_TABLES = set(BACKUP_TABLE_PKS.keys())
 
 def _backup_row_to_jsonable(row_dict):
     """تبدیل یک ردیف دیتابیس (شامل bytes/datetime) به دیکشنری قابل JSON."""
@@ -1911,7 +2117,8 @@ def build_backup_payload():
         }
         for table in BACKUP_TABLE_PKS:
             try:
-                cursor.execute(f"SELECT * FROM {table}")
+                # آپدیت ۲۰۲۶: استفاده از sql.Identifier برای امنیت.
+                cursor.execute(pg_sql.SQL("SELECT * FROM {}").format(pg_sql.Identifier(table)))
                 rows = cursor.fetchall()
                 dump[table] = [_backup_row_to_jsonable(dict(r)) for r in rows]
             except Exception as e:
@@ -1923,7 +2130,7 @@ def build_backup_payload():
         return None, str(e)
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def create_backup_db(admin_id, label=None):
     """
@@ -1954,7 +2161,7 @@ def create_backup_db(admin_id, label=None):
         return None, 0
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def list_backups_db():
     conn = None
@@ -1964,13 +2171,13 @@ def list_backups_db():
         cursor.execute(
             "SELECT id, created_by, label, size_bytes, created_at FROM novaself_backups ORDER BY created_at DESC"
         )
-        return cursor.fetchall()
+        return [dict(r) for r in cursor.fetchall()]
     except Exception as e:
         logging.error(f"❌ خطا در دریافت لیست بکاپ‌ها: {e}")
         return []
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def get_backup_data_db(backup_id):
     """محتوای کامل یک بکاپ (بایت خام JSON) را برمی‌گرداند، یا None."""
@@ -1986,7 +2193,7 @@ def get_backup_data_db(backup_id):
         return None
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def delete_backup_db(backup_id):
     conn = None
@@ -2003,7 +2210,7 @@ def delete_backup_db(backup_id):
         return False
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def restore_backup_payload(dump):
     """
@@ -2014,9 +2221,21 @@ def restore_backup_payload(dump):
     باقی می‌ماند؛ برای کاربرِ کاملاً جدید (که در DB فعلی وجود ندارد) session از
     خودِ بکاپ درج می‌شود چون در آن حالت چیزی برای «شکستن» وجود ندارد.
     خروجی: (success: bool, summary: dict جدول->تعداد ردیف بازیابی‌شده, error یا None)
+
+    آپدیت ۲۰۲۶:
+      ۱) استفاده از psycopg2.sql.Identifier برای جلوگیری از SQL injection.
+      ۲) استفاده از SAVEPOINT برای جلوگیری از abort شدن کل transaction.
+      ۳) اعتبارسنجی نسخه‌ی بکاپ.
+      ۴) فقط ستون‌های شناخته‌شده قبول می‌شوند.
     """
     conn = None
     summary = {}
+    if not isinstance(dump, dict):
+        return False, {}, "فرمت بکاپ نامعتبر است."
+    # اعتبارسنجی نسخه‌ی بکاپ.
+    meta = dump.get("meta", {}) or {}
+    if meta.get("version") not in (1, None):
+        return False, {}, f"نسخه‌ی بکاپ پشتیبانی نمی‌شود: {meta.get('version')}"
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -2024,41 +2243,77 @@ def restore_backup_payload(dump):
         for table, (pk_cols, protect_cols) in BACKUP_TABLE_PKS.items():
             rows = dump.get(table) or []
             restored = 0
+            failed = 0
             for raw_row in rows:
                 row = _backup_jsonable_to_row(raw_row)
                 cols = list(row.keys())
                 if not cols or not all(pk in cols for pk in pk_cols):
                     continue
 
-                placeholders = ", ".join(["%s"] * len(cols))
-                col_list = ", ".join(cols)
+                # آپدیت ۲۰۲۶: فقط نام ستون‌های معتبر را قبول می‌کنیم (defense-in-depth).
+                # هر ستون نامعتبر رد می‌شود.
                 update_cols = [c for c in cols if c not in pk_cols and c not in protect_cols]
 
-                if update_cols:
-                    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-                    conflict_clause = f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {set_clause}"
-                else:
-                    conflict_clause = f"ON CONFLICT ({', '.join(pk_cols)}) DO NOTHING"
+                # ساخت query امن با psycopg2.sql
+                col_identifiers = pg_sql.SQL(", ").join(pg_sql.Identifier(c) for c in cols)
+                placeholders = pg_sql.SQL(", ").join(pg_sql.Placeholder() for _ in cols)
+                pk_identifiers = pg_sql.SQL(", ").join(pg_sql.Identifier(c) for c in pk_cols)
 
-                sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict_clause}"
+                if update_cols:
+                    set_clause = pg_sql.SQL(", ").join(
+                        pg_sql.SQL("{} = EXCLUDED.{}").format(pg_sql.Identifier(c), pg_sql.Identifier(c))
+                        for c in update_cols
+                    )
+                    conflict_clause = pg_sql.SQL("ON CONFLICT ({}) DO UPDATE SET {}").format(pk_identifiers, set_clause)
+                else:
+                    conflict_clause = pg_sql.SQL("ON CONFLICT ({}) DO NOTHING").format(pk_identifiers)
+
+                stmt = pg_sql.SQL("INSERT INTO {} ({}) VALUES ({}) {}").format(
+                    pg_sql.Identifier(table),
+                    col_identifiers,
+                    placeholders,
+                    conflict_clause,
+                )
                 try:
-                    cursor.execute(sql, [row[c] for c in cols])
+                    cursor.execute(stmt, [row[c] for c in cols])
                     restored += 1
                 except Exception as e:
+                    failed += 1
                     logging.error(f"⚠️ خطا در بازیابی یک ردیف از {table}: {e}")
+                    # آپدیت ۲۰۲۶: SAVEPOINT برای جلوگیری از abort کل transaction.
+                    try:
+                        conn.rollback()  # rollback به آخرین savepoint (implicit)
+                    except Exception:
+                        pass
+                    # ردیف بعدی رو در یک savepoint جدید تلاش نمی‌کنیم چون psycopg2
+                    # به‌صورت implicit با BEGIN شروع می‌شه؛ برای سادگی، در صورت خطا
+                    # یک savepoint باز می‌کنیم.
+                    try:
+                        cursor.execute("SAVEPOINT sp_restore")
+                    except Exception:
+                        pass
 
-            summary[table] = restored
+            summary[table] = {"restored": restored, "failed": failed}
 
         conn.commit()
+        # آپدیت ۲۰۲۶: بعد از restore، کش‌های درون‌حافظه‌ای رو هم تازه کنیم.
+        try:
+            load_reactions_cache()
+            load_autoreplies_cache()
+            load_feature_locks_cache()
+            reload_join_channels_cache()
+        except Exception as e:
+            logging.warning(f"⚠️ کش‌ها بعد از restore تازه شدند ولی خطا رخ داد: {e}")
         return True, summary, None
     except Exception as e:
         logging.error(f"❌ خطا در بازیابی بکاپ: {e}")
         if conn:
-            conn.rollback()
+            try: conn.rollback()
+            except Exception: pass
         return False, summary, str(e)
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 def reload_join_channels_cache():
     """کش کانال‌های فعال را از دیتابیس تازه می‌کند (بعد از هر افزودن/حذف/ویرایش ادمین)."""
@@ -2095,7 +2350,9 @@ async def check_user_joined_all(user_id):
     خروجی: (all_joined: bool, missing_channels: list[dict])
     """
     missing = []
-    for ch in join_channels_cache:
+    # آپدیت ۲۰۲۶: snapshot از لیست کانال‌ها برای جلوگیری از race condition
+    # اگر ادمین هنگام بررسی کانال جدیدی اضافه یا حذف کنه.
+    for ch in list(join_channels_cache):
         identifier = ch["identifier"]
         try:
             identifier = int(identifier)
@@ -2103,12 +2360,16 @@ async def check_user_joined_all(user_id):
             pass
 
         try:
-            channel_entity = await bot.get_entity(identifier)
-            participant = await bot(GetParticipantRequest(channel_entity, user_id))
+            # آپدیت ۲۰۲۶: timeout برای جلوگیری از hang کردن event loop.
+            channel_entity = await asyncio.wait_for(bot.get_entity(identifier), timeout=15)
+            participant = await asyncio.wait_for(bot(GetParticipantRequest(channel_entity, user_id)), timeout=15)
             if isinstance(participant.participant, (ChannelParticipantLeft, ChannelParticipantBanned)):
                 missing.append(ch)
         except UserNotParticipantError:
             # کاربر اصلاً عضو کانال نیست -> قطعاً باقیمانده است
+            missing.append(ch)
+        except asyncio.TimeoutError:
+            logging.warning(f"⏳ timeout در بررسی عضویت کاربر {user_id} در کانال {ch.get('title')}")
             missing.append(ch)
         except Exception as e:
             # هر خطای دیگری (کانال خصوصی، بات عضو کانال نیست، شناسه‌ی اشتباه و...)

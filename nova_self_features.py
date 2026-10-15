@@ -1559,20 +1559,48 @@ async def _teardown_existing_client(user_id):
     با همان Session ساخته و متصل شود درحالی‌که کلاینت قبلی هنوز زنده است، تلگرام
     هر دو اتصال را به‌عنوان استفاده‌ی هم‌زمان از یک Session از دو IP تشخیص می‌دهد
     و کل نشست را باطل می‌کند (دقیقاً همان چیزی که باعث Logout ناخواسته می‌شود).
+
+    آپدیت مهم (۲۰۲۶): تسک‌های کنسل‌شده حالا await می‌شوند تا مطمئن بشیم که واقعاً
+    تموم شدن و هیچ تسک زامبی روی کلاینتِ قبلی نمونده. همچنین handler های تلگرام
+    از کلاینت قدیمی پاک می‌شن تا در صورت reuse کلاینت، handler دوبار ثبت نشه.
     """
     old_client = active_clients.pop(user_id, None)
     cloud_cache.pop(user_id, None)
     user = user_data.get(user_id)
     current = asyncio.current_task()
 
+    tasks_to_await = []
     if user:
         for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task", "fridge_task"):
             t = user.get(key)
             if t and t is not current and not t.done():
                 t.cancel()
+                tasks_to_await.append(t)
             user[key] = None
 
+    # آپدیت ۲۰۲۶: صبر برای اتمام کامل تسک‌های لغوشده (با timeout).
+    if tasks_to_await:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks_to_await, return_exceptions=True),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(f"⚠️ بعضی تسک‌های سلف کاربر {user_id} بعد از ۵ ثانیه هنوز تموم نشدن.")
+        except Exception:
+            pass
+
     if old_client:
+        # آپدیت ۲۰۲۶: پاکسازی handler های ثبت‌شده روی کلاینت قدیمی.
+        try:
+            handlers = old_client.list_event_handlers()
+            for callback, event in handlers:
+                try:
+                    old_client.remove_event_handler(callback, event)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if old_client.is_connected():
                 await old_client.disconnect()
@@ -1592,23 +1620,29 @@ def register_active_client(user_id, client):
     client.add_event_handler(make_cloud_deleted_handler(user_id), events.MessageDeleted())
     client.add_event_handler(make_cloud_edited_handler(user_id), events.MessageEdited(incoming=True))
 
-    loop = asyncio.get_event_loop()
-    if user_id in user_data:
-        user_data[user_id]["task"] = loop.create_task(self_bot_worker(user_id, client))
-        user_data[user_id]["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
-        user_data[user_id]["billing_task"] = loop.create_task(diamond_billing_worker(user_id, client))
-        # میو: فقط اگر قبلاً فعال بوده (مثلاً بعد از Restart) خودکار دوباره استارت می‌شود
-        if user_data[user_id].get("meow_enabled") and user_data[user_id].get("meow_chat_id"):
-            user_data[user_id]["meow_task"] = loop.create_task(meow_worker(user_id, client))
-        # ماهی: همانند میو، فقط اگر قبلاً فعال بوده و گروه هنوز ست است
-        if user_data[user_id].get("fish_enabled") and user_data[user_id].get("meow_chat_id"):
-            user_data[user_id]["fish_task"] = loop.create_task(fish_worker(user_id, client))
-        # میو پوینت: همانند میو/ماهی
-        if user_data[user_id].get("meowpoint_enabled") and user_data[user_id].get("meow_chat_id"):
-            user_data[user_id]["meowpoint_task"] = loop.create_task(meowpoint_worker(user_id, client))
-        # یخچال میویی: همانند میو/ماهی/میو‌پوینت
-        if user_data[user_id].get("fridge_enabled") and user_data[user_id].get("meow_chat_id"):
-            user_data[user_id]["fridge_task"] = loop.create_task(fridge_worker(user_id, client))
+    # آپدیت ۲۰۲۶: snapshot از user برای جلوگیری از race condition.
+    user = user_data.get(user_id)
+    if user is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    user["task"] = loop.create_task(self_bot_worker(user_id, client))
+    user["action_task"] = loop.create_task(self_bot_action_worker(user_id, client))
+    user["billing_task"] = loop.create_task(diamond_billing_worker(user_id, client))
+    # میو: فقط اگر قبلاً فعال بوده (مثلاً بعد از Restart) خودکار دوباره استارت می‌شود
+    if user.get("meow_enabled") and user.get("meow_chat_id"):
+        user["meow_task"] = loop.create_task(meow_worker(user_id, client))
+    # ماهی: همانند میو، فقط اگر قبلاً فعال بوده و گروه هنوز ست است
+    if user.get("fish_enabled") and user.get("meow_chat_id"):
+        user["fish_task"] = loop.create_task(fish_worker(user_id, client))
+    # میو پوینت: همانند میو/ماهی
+    if user.get("meowpoint_enabled") and user.get("meow_chat_id"):
+        user["meowpoint_task"] = loop.create_task(meowpoint_worker(user_id, client))
+    # یخچال میویی: همانند میو/ماهی/میو‌پوینت
+    if user.get("fridge_enabled") and user.get("meow_chat_id"):
+        user["fridge_task"] = loop.create_task(fridge_worker(user_id, client))
 
 async def start_self_client(user_id, session_string):
     """ساخت یک کلاینت جدید از روی سشن ذخیره‌شده، اتصال و ثبت آن (بعد از جمع‌کردن ایمن کلاینت قبلی در صورت وجود)."""
@@ -1636,22 +1670,53 @@ async def stop_self_client(user_id):
     این تابع ممکن است از داخل خودِ یکی از تسک‌ها (مثلاً diamond_billing_worker هنگام اتمام
     موجودی) صدا زده شود؛ برای جلوگیری از خودکنسل‌کردنِ تسکِ در حال اجرا، تسک جاری را
     از لیست کنسل‌شدنی مستثنی می‌کنیم.
+
+    آپدیت ۲۰۲۶: تسک‌های لغوشده await می‌شوند تا اتمام کاملشون مطمئن بشیم.
     """
     user = user_data.get(user_id)
     current = asyncio.current_task()
 
+    tasks_to_await = []
     if user:
         for key in ("task", "action_task", "billing_task", "meow_task", "fish_task", "meowpoint_task", "fridge_task"):
             t = user.get(key)
             if t and t is not current:
                 t.cancel()
+                tasks_to_await.append(t)
             user[key] = None
+
+    if tasks_to_await:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks_to_await, return_exceptions=True),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(f"⚠️ بعضی تسک‌های سلف کاربر {user_id} بعد از ۵ ثانیه هنوز تموم نشدن.")
+        except Exception:
+            pass
 
     _cleanup_secretary_state(user_id)
     cloud_cache.pop(user_id, None)
+    # آپدیت ۲۰۲۶: پاکسازی panel_registry از ورودی‌های این کاربر.
+    try:
+        for key in [k for k in nova_state.panel_registry if k[0] == user_id]:
+            nova_state.panel_registry.pop(key, None)
+    except Exception:
+        pass
 
     client = active_clients.pop(user_id, None)
     if client:
+        # آپدیت ۲۰۲۶: پاکسازی handler های ثبت‌شده روی کلاینت.
+        try:
+            handlers = client.list_event_handlers()
+            for callback, event in handlers:
+                try:
+                    client.remove_event_handler(callback, event)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if client.is_connected():
                 await client.disconnect()
@@ -1660,6 +1725,14 @@ async def stop_self_client(user_id):
 
 # ======================== توابع اصلی سلف ========================
 async def self_bot_worker(user_id, client):
+    """
+    آپدیت ۲۰۲۶:
+      - sleep از ۵ ثانیه به ۳۰ ثانیه (تا FloodWait کمتر پیش بیاد).
+      - در صورت FloodWait، last_signature به‌روزرسانی می‌شه تا retry فوری نباشه.
+      - بعد از FloodWait بزرگ، از UpdateProfileRequest صرف‌نظر می‌کنه.
+      - استفاده از TEHRAN_TZ از nova_state به‌جای ساختن pytz.timezone هر بار.
+    """
+    from nova_state import TEHRAN_TZ
     try:
         me = await client.get_me()
         first_name = me.first_name or "کاربر"
@@ -1670,48 +1743,51 @@ async def self_bot_worker(user_id, client):
             update_username_db(user_id, me.username)
 
         while True:
-            if user_id not in user_data or not user_data[user_id]["status"]:
+            if user_id not in user_data or not user_data[user_id].get("status"):
                 break
 
             user = user_data[user_id]
-            tehran_tz = pytz.timezone('Asia/Tehran')
-            now = datetime.now(tehran_tz)
+            now = datetime.now(TEHRAN_TZ).replace(tzinfo=None)
             current_time = now.strftime("%H:%M")
             current_date_raw = format_date(now, user.get("date_type", "shamsi"))
 
             signature = (
                 current_time, current_date_raw,
-                user["name_time"], user["bio_time"], user["font_id"],
+                user.get("name_time", True), user.get("bio_time", False), user.get("font_id", 1),
                 user.get("date_enabled", False), user.get("date_type", "shamsi"),
                 user.get("date_font", 1)
             )
 
             if signature != last_signature:
-                formatted_time = apply_font(current_time, user["font_id"])
+                formatted_time = apply_font(current_time, user.get("font_id", 1))
                 formatted_date = apply_font(current_date_raw, user.get("date_font", 1))
 
                 try:
-                    if user["name_time"]:
+                    if user.get("name_time", True):
                         await client(UpdateProfileRequest(first_name=first_name, last_name=formatted_time))
                     else:
                         await client(UpdateProfileRequest(first_name=first_name, last_name=""))
 
                     bio_parts = []
-                    if user["bio_time"]:
+                    if user.get("bio_time", False):
                         bio_parts.append(formatted_time)
-                    if user.get("date_enabled"):
+                    if user.get("date_enabled", False):
                         bio_parts.append(formatted_date)
 
                     if bio_parts:
                         await client(UpdateProfileRequest(about=" | ".join(bio_parts)))
 
+                    # آپدیت ۲۰۲۶: به‌روزرسانی last_signature حتی بعد از FloodWait موفق.
                     last_signature = signature
                 except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
+                    # آپدیت ۲۰۲۶: last_signature به‌روزرسانی می‌شه تا retry فوری نباشه.
+                    last_signature = signature
+                    await asyncio.sleep(e.seconds + 1)
                 except Exception as e:
                     logging.error(f"⚠️ خطا در بروزرسانی پروفایل کاربر {user_id}: {e}")
 
-            await asyncio.sleep(5)
+            # آپدیت ۲۰۲۶: ۳۰ ثانیه به‌جای ۵ ثانیه (نمایش ساعت فقط در مرز دقیقه مهمه).
+            await asyncio.sleep(30)
 
     except asyncio.CancelledError:
         pass
@@ -1727,46 +1803,70 @@ async def self_bot_worker(user_id, client):
             pass
 
 async def self_bot_action_worker(user_id, client):
+    """
+    آپدیت مهم (۲۰۲۶): فاصله‌های زمانی بازنویسی شدن تا با anti-spam تلگرام سازگار باشن.
+    - UpdateStatusRequest (همیشه آنلاین): از ۴ ثانیه به ۹۰ ثانیه (تلگرام آنلاین رو
+      تا ۵ دقیقه نگه می‌داره).
+    - SetTypingRequest: از ۴ ثانیه به ۳۰ ثانیه و فقط برای آخرین دیالوگ (نه ۱۰ دیالوگ).
+    - کشِ iter_dialogs به ۶۰ ثانیه.
+    این تغییرات ریسک soft-ban رو به‌شدت کاهش می‌دن.
+    """
+    import time as _time
+    _dialogs_cache = None
+    _dialogs_cache_ts = 0
     try:
         while True:
             if user_id not in user_data or not user_data[user_id]["status"]:
                 break
 
             user = user_data[user_id]
-            action_key = user["active_action"]
+            action_key = user.get("active_action", "none")
 
-            # «همیشه آنلاین» حالا دقیقاً مثل بقیه‌ی اکشن‌ها، فقط یکی از آن‌ها به‌طور
-            # هم‌زمان قابل انتخاب است (از طریق همون active_action)؛ فقط مکانیزم اجرایش
-            # با بقیه فرق دارد: به‌جای SetTypingRequest، هر ۴ ثانیه UpdateStatusRequest
-            # می‌فرستد تا تلگرام کاربر را واقعاً آنلاین نشان دهد.
             if action_key == "online":
+                # آپدیت ۲۰۲۶: ۹۰ ثانیه به‌جای ۴ ثانیه (تلگرام آنلاین رو ۵ دقیقه نگه می‌داره).
                 try:
                     await client(UpdateStatusRequest(offline=False))
                 except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
+                    await asyncio.sleep(e.seconds + 1)
                 except Exception as e:
                     log_internal_error("always_online", f"user={user_id} err={e}")
-                await asyncio.sleep(4)
+                await asyncio.sleep(90)
                 continue
 
             if action_key == 'none' or action_key not in ACTIONS:
-                await asyncio.sleep(4)
+                await asyncio.sleep(30)
                 continue
 
-            try:
-                async for dialog in client.iter_dialogs(limit=10):
-                    if dialog.is_user or dialog.is_group:
-                        try:
-                            await client(SetTypingRequest(
-                                peer=dialog.input_entity,
-                                action=ACTIONS[action_key][1]
-                            ))
-                        except Exception:
-                            pass
-            except Exception as e:
-                logging.error(f"⚠️ خطا در نمایش اکشن کاربر {user_id}: {e}")
+            # آپدیت ۲۰۲۶: کش dialogs به‌جای fetch هر بار.
+            now_ts = _time.monotonic()
+            if _dialogs_cache is None or (now_ts - _dialogs_cache_ts) > 60:
+                try:
+                    _dialogs_cache = []
+                    async for dialog in client.iter_dialogs(limit=3):
+                        if dialog.is_user or dialog.is_group:
+                            _dialogs_cache.append(dialog)
+                    _dialogs_cache_ts = now_ts
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                    _dialogs_cache = []
+                except Exception as e:
+                    logging.error(f"⚠️ خطا در iter_dialogs کاربر {user_id}: {e}")
+                    _dialogs_cache = []
 
-            await asyncio.sleep(4)
+            # فقط آخرین (جدیدترین) دیالوگ — کاهش شدید FloodWait.
+            if _dialogs_cache:
+                dialog = _dialogs_cache[0]
+                try:
+                    await client(SetTypingRequest(
+                        peer=dialog.input_entity,
+                        action=ACTIONS[action_key][1]
+                    ))
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(30)
 
     except asyncio.CancelledError:
         pass
@@ -1783,6 +1883,9 @@ async def meow_worker(user_id, client):
     while True:
         if user_id not in user_data or not user_data[user_id].get("meow_enabled"):
             break
+        # آپدیت ۲۰۲۶: بررسی status کلاینت (نه فقط meow_enabled).
+        if not user_data[user_id].get("status"):
+            break
 
         chat_id = user_data[user_id].get("meow_chat_id")
         if not chat_id:
@@ -1791,7 +1894,8 @@ async def meow_worker(user_id, client):
         try:
             await safe_call(client.send_message, chat_id, "میو")
             user_data[user_id]["meow_last_sent_at"] = tehran_now()
-            save_user(user_id, user_data[user_id])
+            # آپدیت ۲۰۲۶: استفاده از asyncio.to_thread برای DB sync.
+            await asyncio.to_thread(save_user, user_id, user_data[user_id])
 
         except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError,
                 UserNotParticipantError, ChatAdminRequiredError) as e:
@@ -2336,20 +2440,25 @@ async def diamond_billing_worker(user_id, client):
     هر BILLING_INTERVAL_SECONDS ثانیه، به نسبت مدت‌زمان سپری‌شده الماس کسر می‌کند
     (نرخ: DIAMOND_RATE_PER_HOUR الماس به ازای هر ساعت روشن بودن سلف).
     اگر موجودی تمام شود، سلف به‌صورت خودکار خاموش و به کاربر اطلاع داده می‌شود.
+
+    آپدیت ۲۰۲۶: استفاده از asyncio.to_thread برای charge_diamonds_db (sync) و
+    save_user، و استفاده از tehran_now به‌جای datetime.now(pytz.UTC) برای سازگاری.
     """
+    from nova_state import TEHRAN_TZ
     try:
-        last_charge = datetime.now(pytz.UTC)
+        # آپدیت ۲۰۲۶: استفاده از TEHRAN_TZ به‌جای pytz.UTC برای سازگاری با بقیه پروژه.
+        last_charge = datetime.now(TEHRAN_TZ).replace(tzinfo=None)
 
         while True:
-            if user_id not in user_data or not user_data[user_id]["status"]:
+            if user_id not in user_data or not user_data[user_id].get("status"):
                 break
 
             await asyncio.sleep(BILLING_INTERVAL_SECONDS)
 
-            if user_id not in user_data or not user_data[user_id]["status"]:
+            if user_id not in user_data or not user_data[user_id].get("status"):
                 break
 
-            now = datetime.now(pytz.UTC)
+            now = datetime.now(TEHRAN_TZ).replace(tzinfo=None)
             elapsed_hours = (now - last_charge).total_seconds() / 3600
             last_charge = now
 
@@ -2357,7 +2466,8 @@ async def diamond_billing_worker(user_id, client):
             if cost <= 0:
                 continue
 
-            success, new_balance = charge_diamonds_db(user_id, cost)
+            # آپدیت ۲۰۲۶: استفاده از to_thread برای charge_diamonds_db.
+            success, new_balance = await asyncio.to_thread(charge_diamonds_db, user_id, cost)
 
             if user_id in user_data and new_balance is not None:
                 user_data[user_id]["diamonds"] = new_balance
@@ -2365,7 +2475,7 @@ async def diamond_billing_worker(user_id, client):
             if not success:
                 if user_id in user_data:
                     user_data[user_id]["status"] = False
-                    save_user(user_id, user_data[user_id])
+                    await asyncio.to_thread(save_user, user_id, user_data[user_id])
 
                 await stop_self_client(user_id)
 
@@ -2385,27 +2495,34 @@ async def diamond_billing_worker(user_id, client):
         logging.error(f"⚠️ خطای بیلینگ الماس کاربر {user_id}: {e}")
 
 async def autostart_saved_users():
+    """
+    آپدیت ۲۰۲۶: استارت موازی کلاینت‌ها (با semaphore برای محدود کردن concurrency)
+    به‌جای استارت سریال که با ۱۰۰ کاربر ۲۰۰ ثانیه طول می‌کشید.
+    """
     await asyncio.sleep(5)
 
+    # آپدیت ۲۰۲۶: فیلتر کاربرانی که واقعاً باید استارت بشن.
+    candidates = []
     for user_id, user in list(user_data.items()):
         try:
-            if user["status"] and user["session"]:
+            if user.get("status") and user.get("session"):
                 if float(user.get("diamonds", 0)) <= 0:
                     user["status"] = False
-                    save_user(user_id, user)
-                    logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل موجودی صفر الماس غیرفعال ماند.")
+                    await asyncio.to_thread(save_user, user_id, user)
                     continue
-
-                client = await start_self_client(user_id, user["session"])
-                if client:
-                    logging.info(f"✅ سلف کاربر {user_id} راه‌اندازی شد.")
-                else:
-                    user["status"] = False
-                    save_user(user_id, user)
-                    logging.warning(f"⚠️ سلف کاربر {user_id} به‌دلیل نشست نامعتبر غیرفعال شد.")
+                candidates.append((user_id, user.get("session")))
         except Exception as e:
-            # هر خطایی برای یک کاربر، فقط همان کاربر را تحت تأثیر قرار می‌دهد؛ بقیه‌ی
-            # کاربران باید مستقل از این، در همین چرخه‌ی استارتاپ راه‌اندازی شوند.
-            logging.error(f"❌ خطا در autostart برای کاربر {user_id}: {e}")
-            log_internal_error("autostart_saved_users", e)
+            logging.error(f"⚠️ خطا در بررسی کاربر {user_id} برای autostart: {e}")
+
+    # آپدیت ۲۰۲۶: استارت موازی با semaphore (حداکثر ۱۰ هم‌زمان).
+    semaphore = asyncio.Semaphore(10)
+
+    async def _start_one(uid, sess):
+        async with semaphore:
+            try:
+                await start_self_client(uid, sess)
+            except Exception as e:
+                logging.error(f"❌ autostart شکست خورد برای {uid}: {e}")
+
+    await asyncio.gather(*[_start_one(uid, sess) for uid, sess in candidates], return_exceptions=True)
 
