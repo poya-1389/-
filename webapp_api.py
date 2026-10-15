@@ -41,7 +41,7 @@ SIMPLE_FIELDS = {
 # محدوده‌ی مجاز برای فیلدهای عددی/متنی ساده (برای همسان‌ماندن با محدودیت‌های
 # همان فیلدها در منوهای خودِ ربات؛ قبلاً این محدودیت‌ها فقط سمت ربات چک می‌شد
 # و از طریق Mini App هر عددی قابل ارسال بود).
-FONT_ID_RANGE = range(0, 21)          # با تعداد فونت‌های واقعی FONTS در main.py هماهنگ کنید
+FONT_ID_RANGE = range(0, 14)          # پیش‌فرض (۱۴ فونت)؛ main.py مقدار واقعی را از FONT_NAMES می‌دهد
 TEXT_MODE_RANGE = range(0, 9)         # 0 (خاموش) تا 8 طبق build_format_entities
 DATE_FONT_ID_RANGE = FONT_ID_RANGE
 DATE_TYPE_VALUES = {"shamsi", "qamari", "gregorian"}
@@ -103,12 +103,20 @@ def _validate_init_data(init_data: str, bot_token: str, max_age_seconds: int = 8
 def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
                        stop_self_client, format_diamonds, diamond_rate_per_hour=5,
                        allowed_origin="*", is_feature_locked=None,
-                       is_feature_globally_locked=None):
+                       is_feature_globally_locked=None, font_ids=None,
+                       textmode_ids=None):
     """
     این تابع را از main.py صدا بزن و خروجی‌اش را با run_webapp_server اجرا کن.
     توجه: user_data باید همان دیکشنری سراسری main.py باشد (پاس دادن با رفرنس)
     تا تغییرات این ماژول همان لحظه در حافظه‌ی ربات هم دیده شود.
+
+    font_ids / textmode_ids (اختیاری): مجموعه‌ی شناسه‌های مجازِ فونت و حالت متن.
+    اگر از main.py (از روی FONT_NAMES / TEXTMODE_NAMES) داده شوند، محدوده‌ی مجاز
+    همیشه با ربات هم‌خوان می‌ماند؛ در غیر این صورت از مقادیر پیش‌فرضِ بالای فایل
+    استفاده می‌شود.
     """
+    allowed_font_ids = set(font_ids) if font_ids else set(FONT_ID_RANGE)
+    allowed_textmode_ids = set(textmode_ids) if textmode_ids else set(TEXT_MODE_RANGE)
 
     async def _authed_user(request):
         init_data = request.headers.get("X-Init-Data", "")
@@ -170,11 +178,11 @@ def create_webapp_app(*, bot_token, user_data, save_user, start_self_client,
             elif field in SIMPLE_FIELDS:
                 caster = SIMPLE_FIELDS[field]
                 value = caster(body.get("value"))
-                if field == "font_id" and value not in FONT_ID_RANGE:
+                if field == "font_id" and value not in allowed_font_ids:
                     return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
-                if field == "text_mode" and value not in TEXT_MODE_RANGE:
+                if field == "text_mode" and value not in allowed_textmode_ids:
                     return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
-                if field == "date_font" and value not in DATE_FONT_ID_RANGE:
+                if field == "date_font" and value not in allowed_font_ids:
                     return web.json_response({"ok": False, "error": "invalid-value"}, status=400)
                 if field == "date_type" and value not in DATE_TYPE_VALUES:
                     return web.json_response({"ok": False, "error": "invalid-value"}, status=400)

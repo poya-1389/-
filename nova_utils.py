@@ -20,10 +20,12 @@ nova_utils.py
 ====================================================================
 """
 
+import re
 import time
 import logging
 import asyncio
 from datetime import datetime
+from decimal import Context, Decimal, DivisionByZero, InvalidOperation, Overflow
 
 from telethon.errors import FloodWaitError
 from telethon.tl.custom import Button
@@ -84,21 +86,28 @@ def _style_obj_to_str(style_obj):
     return None
 
 
-def wrap_panel_buttons(rows, owner_id, add_close=True):
+def wrap_panel_buttons(rows, owner_id, add_close=True, token=None):
     """
     یک صفحه‌کلید معمولیِ پنل خصوصی را برای استفاده در «پنل درون‌چتی» (که از طریق
     Inline Mode ساخته می‌شود) آماده می‌کند: شناسه‌ی صاحبِ Self را جلوی callback_data
     هر دکمه اضافه می‌کند تا در callback_handler بشود فهمید این کلیک برای چه کسی
     مجاز است (بند ۱۰ - Permission)، و طبق درخواست یک دکمه‌ی «✕ بستن پنل» به انتهای
     صفحه اضافه می‌کند (بند ۱۱).
+
+    پارامتر token (اختیاری): شناسه‌ی کوتاهِ همین پنل است. اگر داده شود، به پیشوند
+    اضافه می‌شود (ip_<owner>.<token>_) تا هنگام «بستن پنل» بشود دقیقاً همان پیامِ
+    پنل را از چت پاک کرد (در Inline Mode، بات هیچ‌راهی برای حذف پیام ندارد و فقط
+    خودِ اکانت Self می‌تواند آن را پاک کند).
     """
+    rows = rows or []
+    panel_prefix = f"ip_{owner_id}.{token}_" if token else f"ip_{owner_id}_"
     wrapped = []
     for row in rows:
         new_row = []
         for btn in row:
             data = getattr(btn, "data", None)
             if data:
-                prefix = f"ip_{owner_id}_".encode()
+                prefix = panel_prefix.encode()
                 new_data = prefix + data
                 style = _style_obj_to_str(getattr(btn, "style", None))
                 # callback_data تلگرام حداکثر ۶۴ بایت مجاز است (Button.inline خودش
@@ -127,9 +136,38 @@ def wrap_panel_buttons(rows, owner_id, add_close=True):
             wrapped.append(new_row)
 
     if add_close:
-        wrapped.append([styled_button("✕ بستن پنل", f"ip_{owner_id}_panel_close".encode(), style=STYLE_OFF)])
+        wrapped.append([styled_button("✕ بستن پنل", f"{panel_prefix}panel_close".encode(), style=STYLE_OFF)])
 
     return wrapped
+
+
+_PANEL_TOKEN_RE = re.compile(r"^[0-9a-f]{4}$")
+
+
+def new_panel_token_ok(token) -> bool:
+    """آیا token یک شناسه‌ی معتبرِ پنل (۴ کاراکتر hex) است؟"""
+    return bool(token) and bool(_PANEL_TOKEN_RE.match(token))
+
+
+def parse_panel_callback(data: bytes):
+    """
+    داده‌ی کلیکِ پنل درون‌چتی را به (owner_id, token, action) تبدیل می‌کند.
+    هر دو قالب پشتیبانی می‌شود:
+      ip_<owner>.<token>_<action>   (جدید)
+      ip_<owner>_<action>           (قدیمی؛ پنل‌های بازِ قبل از آپدیت)
+    در صورت نامعتبر بودن None برمی‌گرداند.
+    """
+    try:
+        _, owner_part, action = data.decode().split("_", 2)
+        if "." in owner_part:
+            owner_str, token = owner_part.split(".", 1)
+            if not new_panel_token_ok(token):
+                return None
+        else:
+            owner_str, token = owner_part, None
+        return int(owner_str), token, action
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 ICON_ON = "✓"
@@ -260,3 +298,61 @@ def log_settings_change(user_id, field, value):
 
 def log_internal_error(context, error):
     internal_logger.info(f"ERROR | context={context} error={error}")
+
+
+# ==================== ۹. ماشین حساب (.c) ====================
+_DIGIT_TABLE = {ord(c): str(i) for i, c in enumerate("۰۱۲۳۴۵۶۷۸۹")}
+_DIGIT_TABLE.update({ord(c): str(i) for i, c in enumerate("٠١٢٣٤٥٦٧٨٩")})
+_DIGIT_TABLE[ord("٫")] = "."
+
+_NUM = r"-?[0-9۰-۹٠-٩]+(?:[.٫][0-9۰-۹٠-٩]+)?"
+# فرمت: .c عدد۱ عملگر عدد۲  (فاصله‌ها اختیاری؛ ارقام فارسی/عربی هم پذیرفته می‌شود)
+CALC_COMMAND_RE = re.compile(rf"^\.c\s*({_NUM})\s*([+\-×÷*/xX])\s*({_NUM})$", re.IGNORECASE)
+
+_CALC_MAX_DIGITS = 15
+_CALC_CTX = Context(prec=60, traps=[InvalidOperation, DivisionByZero, Overflow])
+
+
+class CalcError(Exception):
+    """خطای قابل‌نمایش به کاربر (پیام فارسی داخل خود Exception است)."""
+
+
+def _calc_num(raw: str) -> Decimal:
+    norm = raw.translate(_DIGIT_TABLE)
+    if len(norm.replace("-", "").replace(".", "")) > _CALC_MAX_DIGITS:
+        raise CalcError("❌ عدد واردشده بیش از حد بزرگ است (حداکثر ۱۵ رقم).")
+    return Decimal(norm)
+
+
+def _calc_fmt(value: Decimal) -> str:
+    if value == value.to_integral_value():
+        return str(int(value))
+    text = format(value.quantize(Decimal("1e-10"), context=_CALC_CTX), "f")
+    text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def evaluate_calc(a_raw: str, op: str, b_raw: str):
+    """
+    دو عدد و یک عملگر را محاسبه می‌کند و (عبارت نمایشی، نتیجه) برمی‌گرداند.
+    عملگرها: + - × ÷ (به‌علاوه‌ی * ، / و x). محاسبه با Decimal انجام می‌شود تا
+    خطای اعشاری (مثل 0.1+0.2) پیش نیاید.
+    """
+    a = _calc_num(a_raw)
+    b = _calc_num(b_raw)
+    try:
+        if op == "+":
+            result, shown = _CALC_CTX.add(a, b), "+"
+        elif op == "-":
+            result, shown = _CALC_CTX.subtract(a, b), "-"
+        elif op in ("×", "*", "x", "X"):
+            result, shown = _CALC_CTX.multiply(a, b), "×"
+        else:
+            result, shown = _CALC_CTX.divide(a, b), "÷"
+    except (DivisionByZero, InvalidOperation):
+        if op in ("÷", "/") and b == 0:
+            raise CalcError("❌ تقسیم بر صفر امکان‌پذیر نیست.")
+        raise CalcError("❌ محاسبه ممکن نیست.")
+    except Overflow:
+        raise CalcError("❌ نتیجه بیش از حد بزرگ است.")
+    return f"{_calc_fmt(a)} {shown} {_calc_fmt(b)}", _calc_fmt(result)

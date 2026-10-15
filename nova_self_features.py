@@ -22,6 +22,8 @@ import time
 import logging
 import tempfile
 import shutil
+import secrets
+from collections import OrderedDict
 from datetime import datetime
 import pytz
 from telethon import TelegramClient, events, helpers
@@ -46,7 +48,10 @@ except ImportError:
     _FFMPEG_AVAILABLE = False
 
 import nova_state
-from nova_utils import safe_call, log_internal_error, log_settings_change
+from nova_utils import (
+    safe_call, log_internal_error, log_settings_change,
+    CALC_COMMAND_RE, CalcError, evaluate_calc,
+)
 from nova_state import (
     bot, API_ID, API_HASH, ACTIONS,
     user_data, active_clients, generator_data, secretary_state,
@@ -65,7 +70,7 @@ from nova_state import (
     GAME_CLICK_MAX_ATTEMPTS, GAME_CLICK_RETRY_DELAY,
     tehran_now, apply_font, format_date, build_format_entities,
     make_blockquote_entity, is_admin, _spawn_background_task, _normalize_block_cmd,
-    format_diamonds,
+    format_diamonds, cloud_cache, register_panel_message,
 )
 from nova_db import (
     save_user, update_username_db, charge_diamonds_db,
@@ -221,6 +226,11 @@ async def handle_panel_command(event, user_id):
     اجازه‌ی ضمیمه‌کردن دکمه به پیام‌های خودش را ندارد (محدودیت خودِ تلگرام)، به‌جایش
     از طریق Inline Mode به بات NovaSelf کوئری می‌زنیم و نتیجه‌ی برگشتی (که واقعاً
     از طرف بات و همراه با دکمه است) را در همین چت درج می‌کنیم.
+
+    یک شناسه‌ی کوتاه (token) به‌عنوان متنِ Inline Query فرستاده می‌شود و محل پیامِ
+    ساخته‌شده (chat_id + msg_id) با همان token ثبت می‌شود؛ بات در Inline Mode
+    نمی‌تواند پیام خودش را پاک کند، پس «✕ بستن پنل» با همین رجیستری آن را از طریق
+    خودِ اکانت Self حذف می‌کند.
     """
     try:
         await event.delete()
@@ -235,13 +245,38 @@ async def handle_panel_command(event, user_id):
         return
 
     try:
-        results = await event.client.inline_query(nova_state.BOT_USERNAME, "")
+        token = secrets.token_hex(2)  # ۴ کاراکتر hex
+        results = await event.client.inline_query(nova_state.BOT_USERNAME, token)
         if not results:
             return
         reply_to = event.reply_to_msg_id if event.is_reply else None
-        await results[0].click(event.chat_id, reply_to=reply_to)
+        sent = await results[0].click(event.chat_id, reply_to=reply_to)
+        sent_msg = sent[0] if isinstance(sent, (list, tuple)) and sent else sent
+        sent_id = getattr(sent_msg, "id", None)
+        if sent_id:
+            register_panel_message(user_id, token, event.chat_id, sent_id)
     except Exception as e:
         logging.error(f"⚠️ خطا در ساخت پنل درون‌چتی برای کاربر {user_id}: {e}")
+
+# ======================== دستور .c (ماشین حساب) ========================
+async def handle_calc_command(event, user_id, match):
+    """پیامِ دستور به نتیجه (به‌صورت نقل‌قول) ویرایش می‌شود؛ مثل .موجودی."""
+    try:
+        client = event.client
+        try:
+            expression, result = evaluate_calc(match.group(1), match.group(2), match.group(3))
+            result_text = f"⌨ ماشین حساب\n\n{expression} = {result}"
+        except CalcError as e:
+            result_text = f"⌨ ماشین حساب\n\n{e}"
+        surrogated = helpers.add_surrogate(result_text)
+        entities = [make_blockquote_entity(0, len(surrogated))]
+        await safe_call(client.edit_message, event.chat_id, event.id, result_text, formatting_entities=entities)
+    except MessageNotModifiedError:
+        pass
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        log_internal_error("calc_command", e)
 
 # ======================== دستور .پینگ ========================
 async def handle_ping_command(event, user_id):
@@ -802,6 +837,15 @@ def make_outgoing_handler(user_id):
                 await handle_balance_command(event, user_id)
                 return
 
+            # --- ماشین حساب: .c 2+2 (در هر نوع چتی) ---
+            calc_match = CALC_COMMAND_RE.match(text_stripped) if text_stripped else None
+            if calc_match:
+                if is_feature_locked(user_id, "calc"):
+                    await event.reply("این قابلیت برای شما قفل شده است.")
+                    return
+                await handle_calc_command(event, user_id, calc_match)
+                return
+
             # --- اطلاعات/آیدی (در هر نوع چتی، فقط با Reply) ---
             if text_stripped and text_stripped.lower() in WHOIS_TRIGGERS:
                 if is_feature_locked(user_id, "whois"):
@@ -1191,6 +1235,237 @@ def make_autoseen_handler(user_id):
 
     return handler
 
+# ======================== قابلیت اَبر چت ========================
+# پیام‌های دریافتیِ پیوی (فقط در حافظه و با سقف مشخص) نگه‌داری می‌شوند تا اگر
+# مخاطب آن‌ها را پاک/ویرایش کرد، نسخه‌ی اصلی در Saved Messages صاحب سلف ذخیره شود.
+CLOUD_MAX_MESSAGES = 400                 # حداکثر پیام نگه‌داری‌شده برای هر کاربر
+CLOUD_MAX_TOTAL_BYTES = 64 * 1024 * 1024  # سقف مجموع رسانه‌ی نگه‌داری‌شده برای هر کاربر
+CLOUD_MAX_MEDIA_BYTES = 15 * 1024 * 1024  # سقف حجم هر رسانه
+CLOUD_MAX_TEXT = 3500
+
+
+def _cloud_media_kind(msg):
+    """نوع رسانه‌ی قابل ذخیره: photo / video / video_note / voice (یا None)."""
+    try:
+        if msg.photo:
+            return "photo"
+        if msg.voice:
+            return "voice"
+        if msg.video_note:
+            return "video_note"
+        if msg.video:
+            return "video"
+    except Exception:
+        pass
+    return None
+
+
+def _cloud_label(sender):
+    if not sender:
+        return "ناشناس"
+    name = " ".join(p for p in (getattr(sender, "first_name", None), getattr(sender, "last_name", None)) if p).strip()
+    username = getattr(sender, "username", None)
+    parts = [name or str(getattr(sender, "id", "؟"))]
+    if username:
+        parts.append(f"@{username}")
+    return " | ".join(parts)
+
+
+def _cloud_compose(header, body=None):
+    """متن + entity نقل‌قول برای بخش body."""
+    if not body:
+        return header, None
+    body = body[:CLOUD_MAX_TEXT]
+    text = f"{header}\n\n{body}"
+    offset = len(helpers.add_surrogate(f"{header}\n\n"))
+    length = len(helpers.add_surrogate(body))
+    return text, [make_blockquote_entity(offset, length)]
+
+
+def _cloud_store(user_id, msg_id, record):
+    cache = cloud_cache.setdefault(user_id, OrderedDict())
+    cache.pop(msg_id, None)
+    cache[msg_id] = record
+    total = sum(len(r.get("bytes") or b"") for r in cache.values())
+    while cache and (len(cache) > CLOUD_MAX_MESSAGES or total > CLOUD_MAX_TOTAL_BYTES):
+        _, old = cache.popitem(last=False)
+        total -= len(old.get("bytes") or b"")
+
+
+def _cloud_flags(user_id):
+    """(user, media, deleted, edited, timed) یا None اگر قابلیت باید نادیده گرفته شود."""
+    user = user_data.get(user_id)
+    if not user or not user.get("status") or is_feature_locked(user_id, "cloud"):
+        return None
+    return (
+        user,
+        bool(user.get("cloud_media_enabled")),
+        bool(user.get("cloud_deleted_enabled")),
+        bool(user.get("cloud_edited_enabled")),
+        bool(user.get("cloud_timed_enabled")),
+    )
+
+
+async def _cloud_download(msg):
+    """رسانه را در حافظه دانلود می‌کند؛ اگر بزرگ‌تر از سقف بود None."""
+    size = getattr(getattr(msg, "file", None), "size", None)
+    if size and size > CLOUD_MAX_MEDIA_BYTES:
+        return None
+    data = await msg.download_media(file=bytes)
+    if not data or len(data) > CLOUD_MAX_MEDIA_BYTES:
+        return None
+    return data
+
+
+def _cloud_file(data, kind, ext):
+    bio = io.BytesIO(data)
+    bio.name = f"{kind}{ext or ''}"
+    return bio
+
+
+async def _cloud_send(user_id, send_func, *args, **kwargs):
+    """ارسال به Saved Messages + علامت‌گذاری «خودکار» تا حالت متن روی آن اعمال نشود."""
+    sent = await safe_call(send_func, *args, **kwargs)
+    if sent:
+        _mark_auto_sent(user_id, sent.chat_id, sent.id)
+    return sent
+
+
+async def _cloud_send_media(user_id, client, data, kind, ext, header, body):
+    """رسانه را به Saved Messages می‌فرستد (ویس/ویدیومسیج بدون کپشن؛ توضیح در پیامِ جدا)."""
+    file_obj = _cloud_file(data, kind, ext)
+    text, entities = _cloud_compose(header, body)
+    if kind in ("photo", "video"):
+        await _cloud_send(user_id, client.send_file, "me", file_obj, caption=text, formatting_entities=entities)
+        return
+    await _cloud_send(user_id, client.send_message, "me", text, formatting_entities=entities)
+    await _cloud_send(
+        user_id, client.send_file, "me", file_obj,
+        voice_note=(kind == "voice"), video_note=(kind == "video_note"),
+    )
+
+
+def make_cloud_incoming_handler(user_id):
+    """پیام‌های دریافتیِ پیوی را برای ابر چت بررسی/کش می‌کند و عکس‌های تایم‌دار را فوراً ذخیره می‌کند."""
+    async def handler(event):
+        try:
+            if event.out or not event.is_private:
+                return
+            flags = _cloud_flags(user_id)
+            if not flags:
+                return
+            _, want_media, want_deleted, want_edited, want_timed = flags
+            if not (want_media or want_deleted or want_edited or want_timed):
+                return
+
+            msg = event.message
+            if getattr(msg, "action", None):
+                return
+
+            sender = await event.get_sender()
+            if not sender or getattr(sender, "bot", False):
+                return
+            label = _cloud_label(sender)
+
+            # --- عکس تایم‌دار: همین لحظه (پیش از باز/منقضی‌شدن) دانلود و ذخیره می‌شود ---
+            ttl = getattr(getattr(msg, "media", None), "ttl_seconds", None)
+            if ttl:
+                if want_timed and msg.photo:
+                    data = await _cloud_download(msg)
+                    if data:
+                        header = f"⏱ عکس تایم‌دار از {label}"
+                        await _cloud_send_media(user_id, event.client, data, "photo", ".jpg", header, msg.raw_text or None)
+                return
+
+            text = msg.raw_text or ""
+            kind = _cloud_media_kind(msg) if want_media else None
+            data, ext = None, None
+            if kind:
+                data = await _cloud_download(msg)
+                ext = getattr(getattr(msg, "file", None), "ext", None)
+            if not (text or data or want_edited):
+                return
+            _cloud_store(user_id, msg.id, {
+                "chat_id": event.chat_id, "sender_label": label, "text": text,
+                "kind": kind if data else None, "bytes": data, "ext": ext,
+            })
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log_internal_error("cloud_incoming_handler", f"user={user_id} err={e}")
+
+    return handler
+
+
+def make_cloud_deleted_handler(user_id):
+    """وقتی مخاطب پیامی را در پیوی پاک کند، نسخه‌ی کش‌شده‌ی آن (رسانه/متن) به Saved Messages می‌رود."""
+    async def handler(event):
+        try:
+            if getattr(event, "chat_id", None):
+                return  # حذف در گروه/کانال؛ ابر چت فقط برای پیوی است
+            cache = cloud_cache.get(user_id)
+            if not cache:
+                return
+            flags = _cloud_flags(user_id)
+            if not flags:
+                return
+            _, want_media, want_deleted, _, _ = flags
+            client = event.client
+
+            for msg_id in event.deleted_ids:
+                rec = cache.pop(msg_id, None)
+                if not rec:
+                    continue
+                label = rec["sender_label"]
+                text = rec.get("text") or ""
+                if want_media and rec.get("bytes") and rec.get("kind"):
+                    header = f"🗑 رسانه‌ی حذف‌شده از {label}"
+                    await _cloud_send_media(user_id, client, rec["bytes"], rec["kind"], rec.get("ext"), header, text or None)
+                elif want_deleted and text:
+                    msg_text, entities = _cloud_compose(f"🗑 پیام حذف‌شده از {label}", text)
+                    await _cloud_send(user_id, client.send_message, "me", msg_text, formatting_entities=entities)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log_internal_error("cloud_deleted_handler", f"user={user_id} err={e}")
+
+    return handler
+
+
+def make_cloud_edited_handler(user_id):
+    """وقتی مخاطب پیامی را ویرایش کند، متن قبل و بعد در Saved Messages ذخیره می‌شود."""
+    async def handler(event):
+        try:
+            if event.out or not event.is_private:
+                return
+            cache = cloud_cache.get(user_id)
+            if not cache:
+                return
+            rec = cache.get(event.message.id)
+            if not rec:
+                return
+            flags = _cloud_flags(user_id)
+            if not flags:
+                return
+            _, _, _, want_edited, _ = flags
+
+            new_text = event.message.raw_text or ""
+            old_text = rec.get("text") or ""
+            if new_text == old_text:
+                return  # مثلاً فقط ریکشن عوض شده است
+            rec["text"] = new_text
+            if not want_edited:
+                return
+            body = f"قبل:\n{old_text or '—'}\n\nبعد:\n{new_text or '—'}"
+            msg_text, entities = _cloud_compose(f"✏️ پیام ویرایش‌شده از {rec['sender_label']}", body)
+            await _cloud_send(user_id, event.client.send_message, "me", msg_text, formatting_entities=entities)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            log_internal_error("cloud_edited_handler", f"user={user_id} err={e}")
+
+    return handler
+
 # ======================== قابلیت پاسخ خودکار (اجرای خودکار) ========================
 def make_autoreply_handler(user_id):
     """پیام‌های متنیِ دریافتی در هر چتی بررسی و در صورت تطبیق Trigger، پاسخ ارسال می‌شود."""
@@ -1286,6 +1561,7 @@ async def _teardown_existing_client(user_id):
     و کل نشست را باطل می‌کند (دقیقاً همان چیزی که باعث Logout ناخواسته می‌شود).
     """
     old_client = active_clients.pop(user_id, None)
+    cloud_cache.pop(user_id, None)
     user = user_data.get(user_id)
     current = asyncio.current_task()
 
@@ -1312,6 +1588,9 @@ def register_active_client(user_id, client):
     client.add_event_handler(make_reaction_handler(user_id), events.NewMessage(incoming=True))
     client.add_event_handler(make_autoreply_handler(user_id), events.NewMessage(incoming=True))
     client.add_event_handler(make_autoseen_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_cloud_incoming_handler(user_id), events.NewMessage(incoming=True))
+    client.add_event_handler(make_cloud_deleted_handler(user_id), events.MessageDeleted())
+    client.add_event_handler(make_cloud_edited_handler(user_id), events.MessageEdited(incoming=True))
 
     loop = asyncio.get_event_loop()
     if user_id in user_data:
@@ -1369,6 +1648,7 @@ async def stop_self_client(user_id):
             user[key] = None
 
     _cleanup_secretary_state(user_id)
+    cloud_cache.pop(user_id, None)
 
     client = active_clients.pop(user_id, None)
     if client:

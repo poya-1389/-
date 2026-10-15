@@ -113,6 +113,10 @@ def init_db():
             ("autoreply_enabled", "BOOLEAN DEFAULT FALSE"),
             ("autoreply_match_type", "TEXT DEFAULT 'exact'"),
             ("autoseen_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("cloud_media_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("cloud_deleted_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("cloud_edited_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("cloud_timed_enabled", "BOOLEAN DEFAULT FALSE"),
         ]
         for col_name, col_def in migration_columns:
             try:
@@ -330,7 +334,8 @@ def get_all_users():
                    fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                    fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                    meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                   autoseen_enabled
+                   autoseen_enabled,
+                   cloud_media_enabled, cloud_deleted_enabled, cloud_edited_enabled, cloud_timed_enabled
             FROM novaself_users
             ORDER BY joined_at DESC
         """)
@@ -397,6 +402,10 @@ def get_all_users():
                 "autoreply_enabled": bool(row['autoreply_enabled']),
                 "autoreply_match_type": row['autoreply_match_type'] or "exact",
                 "autoseen_enabled": bool(row['autoseen_enabled']) if row['autoseen_enabled'] is not None else False,
+                "cloud_media_enabled": bool(row['cloud_media_enabled']),
+                "cloud_deleted_enabled": bool(row['cloud_deleted_enabled']),
+                "cloud_edited_enabled": bool(row['cloud_edited_enabled']),
+                "cloud_timed_enabled": bool(row['cloud_timed_enabled']),
                 "step": "managed",
                 "task": None,
                 "action_task": None,
@@ -437,8 +446,9 @@ def save_user(user_id, user):
                  fridge_enabled, fridge_interval_seconds, fridge_last_run_at,
                  fish_operation_common, fish_operation_rare, fish_operation_epic, fish_operation_legendary,
                  meow_chat_title, reaction_enabled, autoreply_enabled, autoreply_match_type,
-                 autoseen_enabled)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 autoseen_enabled,
+                 cloud_media_enabled, cloud_deleted_enabled, cloud_edited_enabled, cloud_timed_enabled)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id)
             DO UPDATE SET
                 session = EXCLUDED.session,
@@ -481,7 +491,11 @@ def save_user(user_id, user):
                 reaction_enabled = EXCLUDED.reaction_enabled,
                 autoreply_enabled = EXCLUDED.autoreply_enabled,
                 autoreply_match_type = EXCLUDED.autoreply_match_type,
-                autoseen_enabled = EXCLUDED.autoseen_enabled
+                autoseen_enabled = EXCLUDED.autoseen_enabled,
+                cloud_media_enabled = EXCLUDED.cloud_media_enabled,
+                cloud_deleted_enabled = EXCLUDED.cloud_deleted_enabled,
+                cloud_edited_enabled = EXCLUDED.cloud_edited_enabled,
+                cloud_timed_enabled = EXCLUDED.cloud_timed_enabled
         ''', (
             user_id, user.get("session"), user.get("font_id", 1), int(user.get("status", False)),
             int(user.get("name_time", True)), int(user.get("bio_time", False)),
@@ -509,7 +523,9 @@ def save_user(user_id, user):
             user.get("fish_operation_epic", "feed"), user.get("fish_operation_legendary", "fridge"),
             user.get("meow_chat_title"),
             user.get("reaction_enabled", False), user.get("autoreply_enabled", False),
-            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False)
+            user.get("autoreply_match_type", "exact"), user.get("autoseen_enabled", False),
+            bool(user.get("cloud_media_enabled", False)), bool(user.get("cloud_deleted_enabled", False)),
+            bool(user.get("cloud_edited_enabled", False)), bool(user.get("cloud_timed_enabled", False))
         ))
         conn.commit()
         cursor.close()

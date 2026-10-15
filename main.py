@@ -31,6 +31,7 @@ from nova_utils import (
     STYLE_OFF, STYLE_ON, build_receiver_receipt, build_sender_receipt,
     log_diamond_transfer, log_internal_error, log_self_toggle, log_settings_change,
     safe_call, status_icon, styled_button, wrap_panel_buttons,
+    new_panel_token_ok, parse_panel_callback,
 )
 from nova_state import (
     ACTIONS, ADMIN_IDS, API_HASH, API_ID, AUTOREPLY_MATCH_TYPES,
@@ -43,7 +44,7 @@ from nova_state import (
     autoreply_draft, backup_upload_pending, bot, broadcast_data, click_debouncer,
     feature_locks, format_diamonds, format_expiry, format_toman, generator_data,
     is_admin, make_default_user, meow_group_cache, normalize_phone_number,
-    _spawn_background_task,
+    _spawn_background_task, pop_panel_message,
     purchase_data, safe_edit, tehran_now, transfer_data, user_data,
 )
 from nova_db import (
@@ -82,6 +83,8 @@ from nova_menus import (
     get_autoseen_menu_keyboard, get_autoseen_menu_text,
     get_backup_delete_confirm_keyboard, get_backup_list_keyboard,
     get_balance_menu_keyboard, get_balance_menu_text,
+    CLOUD_TOGGLE_FIELDS, get_actions_menu_text, get_calc_menu_keyboard, get_calc_menu_text,
+    get_cloud_menu_keyboard, get_cloud_menu_text, get_textmode_menu_text,
     get_backup_list_text, get_backup_manage_keyboard, get_backup_manage_text,
     get_backup_menu_keyboard, get_backup_menu_text,
     get_backup_restore_confirm_keyboard, get_backup_restore_confirm_text,
@@ -163,7 +166,10 @@ async def inline_panel_handler(event):
         return
 
     builder = event.builder
-    keyboard = wrap_panel_buttons(get_panel_root_keyboard(user), owner_id)
+    # متنِ کوئری = شناسه‌ی کوتاهِ همین پنل (از handle_panel_command)؛ برای بستنِ دقیق پنل.
+    panel_token = (event.text or "").strip().lower()
+    panel_token = panel_token if new_panel_token_ok(panel_token) else None
+    keyboard = wrap_panel_buttons(get_panel_root_keyboard(user), owner_id, token=panel_token)
 
     card_image = await build_panel_card_image(owner_id, user)
     if card_image is not None:
@@ -329,6 +335,7 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
     panel_owner_id = None  # فقط وقتی پر می‌شود که این کلیک از یک پنل درون‌چتی آمده باشد
+    panel_token = None     # شناسه‌ی کوتاه همان پنل (برای حذف دقیق پیام هنگام بستن)
 
     if data == b"void":
         await event.answer()
@@ -344,18 +351,20 @@ async def callback_handler(event):
     _module_safe_edit = globals()['safe_edit']
 
     async def safe_edit(ev, text, buttons=None):
-        if panel_owner_id is not None and buttons:
-            buttons = wrap_panel_buttons(buttons, panel_owner_id, add_close=True)
+        # داخل «پنل درون‌چتی» همیشه دکمه‌ی «✕ بستن پنل» باید بماند: قبلاً بعضی صفحه‌ها
+        # (مثل پیام‌های راهنمای منشی/پاسخ خودکار) بدون هیچ دکمه‌ای ویرایش می‌شدند و
+        # با ارسال reply_markup خالی، کل کیبورد (از جمله دکمه‌ی بستن) از پیام پاک می‌شد.
+        if panel_owner_id is not None:
+            buttons = wrap_panel_buttons(buttons or [], panel_owner_id, add_close=True, token=panel_token)
         return await _module_safe_edit(ev, text, buttons=buttons)
 
     # ====== پنل درون‌چتی (بندهای ۸-۱۲): بازکردن پیشوند مالکیت + کنترل دسترسی ======
     if data.startswith(b"ip_"):
-        try:
-            _, owner_id_str, real_action = data.decode().split("_", 2)
-            owner_id = int(owner_id_str)
-        except (ValueError, IndexError):
+        parsed_panel = parse_panel_callback(data)
+        if parsed_panel is None:
             await event.answer("❌ داده نامعتبر است.", alert=True)
             return
+        owner_id, panel_token, real_action = parsed_panel
 
         if event.sender_id != owner_id:
             await event.answer("⛔ فقط صاحب این Self می‌تواند از این پنل استفاده کند.", alert=True)
@@ -363,27 +372,41 @@ async def callback_handler(event):
 
         if real_action == "panel_close":
             if not click_debouncer.should_process(event.sender_id, data):
-                await event.answer()  # کلیک تکراری/سریع روی «بستن پنل»؛ تسکِ دوم ساخته نمی‌شود
+                await event.answer()  # کلیک تکراری/سریع روی «بستن پنل»
                 return
-            await _module_safe_edit(event, "✕ پنل بسته شد.", buttons=None)
-            # طبق درخواست: بعد از ۳ ثانیه خودِ پیامِ «پنل بسته شد» هم پاک شود.
-            # نکته‌ی حیاتی: Task باید حتماً با _spawn_background_task ساخته شود
-            # (نه asyncio.create_task خام)؛ وگرنه چون هیچ‌جا رفرنسی از Task نگه
-            # داشته نمی‌شود، Garbage Collector پایتون ممکن است پیش از تمام‌شدنِ
-            # ۳ ثانیه، خودِ Task را جمع‌آوری/لغو کند و پیام هرگز پاک نشود - دقیقاً
-            # همان باگی که گزارش شده بود.
-            async def _delete_after_delay():
+            await event.answer()
+            # پیامِ پنل با Inline Mode ساخته شده؛ بات هیچ راهی برای حذف پیامِ inline ندارد
+            # (event.delete() روی آن اثری ندارد)، پس همان پیام را خودِ اکانت Self - که
+            # آن را در چت فرستاده - فوراً پاک می‌کند.
+            deleted = False
+            location = pop_panel_message(owner_id, panel_token) if panel_token else None
+            owner_client = active_clients.get(owner_id)
+            if location and owner_client:
                 try:
-                    await asyncio.sleep(3)
-                    await event.delete()
+                    await owner_client.delete_messages(location[0], [location[1]])
+                    deleted = True
                 except Exception as e:
-                    log_internal_error("panel_close_auto_delete", e)
-            _spawn_background_task(_delete_after_delay())
+                    log_internal_error("panel_close_delete", e)
+            if not deleted:
+                # پنلِ باز از قبل از آپدیت/ری‌استارت (محل پیام ثبت نشده): آخرین راهِ ممکن
+                try:
+                    await event.delete()
+                    deleted = True
+                except Exception:
+                    pass
+            if not deleted:
+                await _module_safe_edit(event, "✕", buttons=None)
             return
 
         user_id = owner_id
         data = real_action.encode()
         panel_owner_id = owner_id
+
+        # دکمه‌های نمایشیِ «void» (مثل صفحه‌ی حساب کاربری) فقط بعد از بازکردنِ پیشوند
+        # قابل تشخیص‌اند؛ قبلاً داخل پنل بی‌پاسخ می‌ماندند و دکمه مدتی در حالت loading می‌ماند.
+        if data == b"void":
+            await event.answer()
+            return
 
     if not click_debouncer.should_process(user_id, data):
         await event.answer()  # کلیک تکراری/سریع؛ بی‌صدا نادیده گرفته می‌شود
@@ -1459,8 +1482,7 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event,
-            "🎭 **مدیریت اکشن‌های فیک**\n\n"
-            "با انتخاب هر گزینه، وضعیت شما به‌صورت مداوم برای دیگران نمایش داده می‌شود:",
+            get_actions_menu_text(),
             buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
@@ -1520,9 +1542,7 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event,
-            "🖊️ **حالت متن**\n\n"
-            "با انتخاب یکی از حالت‌های زیر، تمام پیام‌های متنی شما بلافاصله پس از ارسال "
-            "با همان قالب ویرایش می‌شوند. برای غیرفعال کردن، دوباره روی گزینه فعال بزنید.",
+            get_textmode_menu_text(),
             buttons=get_textmode_menu_keyboard(user.get("text_mode", 0))
         )
         return
@@ -1535,8 +1555,7 @@ async def callback_handler(event):
             user["text_mode"] = mode_id
         save_user(user_id, user)
         await safe_edit(event,
-            "🖊️ **حالت متن**\n\n"
-            "✅ حالت متن با موفقیت بروزرسانی شد.",
+            get_textmode_menu_text(updated=True),
             buttons=get_textmode_menu_keyboard(user.get("text_mode", 0))
         )
         return
@@ -1564,8 +1583,7 @@ async def callback_handler(event):
         save_user(user_id, user)
 
         await safe_edit(event,
-            "🎭 **مدیریت اکشن‌های فیک**\n\n"
-            f"✅ وضعیت اکشن با موفقیت تغییر یافت.",
+            get_actions_menu_text(updated=True),
             buttons=get_actions_menu_keyboard(user["active_action"])
         )
         return
@@ -1903,6 +1921,31 @@ async def callback_handler(event):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
         await safe_edit(event, get_balance_menu_text(), buttons=get_balance_menu_keyboard())
+        return
+
+    if data == b"menu_calc":
+        if is_feature_locked(user_id, "calc"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_calc_menu_text(), buttons=get_calc_menu_keyboard())
+        return
+
+    if data == b"menu_cloud":
+        if is_feature_locked(user_id, "cloud"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        await safe_edit(event, get_cloud_menu_text(user), buttons=get_cloud_menu_keyboard(user))
+        return
+
+    if data in CLOUD_TOGGLE_FIELDS:
+        if is_feature_locked(user_id, "cloud"):
+            await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
+            return
+        field = CLOUD_TOGGLE_FIELDS[data]
+        user[field] = not user.get(field, False)
+        save_user(user_id, user)
+        log_settings_change(user_id, field, user[field])
+        await safe_edit(event, get_cloud_menu_text(user), buttons=get_cloud_menu_keyboard(user))
         return
 
     if data == b"autoseen_toggle":
@@ -3245,7 +3288,8 @@ async def message_handler(event):
             """
             if panel_chat_id and panel_msg_id:
                 try:
-                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons)
+                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons,
+                                                    formatting_entities=getattr(panel_text, "entities", None))
                     return
                 except MessageNotModifiedError:
                     return
@@ -3306,7 +3350,8 @@ async def message_handler(event):
         async def _update_secretary_panel_time(panel_text, buttons=None):
             if panel_chat_id and panel_msg_id:
                 try:
-                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons)
+                    await event.client.edit_message(panel_chat_id, panel_msg_id, panel_text, buttons=buttons,
+                                                    formatting_entities=getattr(panel_text, "entities", None))
                     return
                 except MessageNotModifiedError:
                     return
@@ -3602,6 +3647,9 @@ if __name__ == "__main__":
         format_diamonds=format_diamonds,
         diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
         allowed_origin=MINIAPP_ORIGIN,
+        is_feature_locked=is_feature_locked,
+        font_ids=set(FONT_NAMES.keys()),
+        textmode_ids={0, *TEXTMODE_NAMES.keys()},
     )
     loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
 

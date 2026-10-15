@@ -36,7 +36,7 @@ from nova_state import (
     MEOWPOINT_INTERVAL_SECONDS, FRIDGE_INTERVAL_SECONDS,
     CLEANUP_MAX_COUNT, FISH_OPERATION_NAMES_FA,
     format_diamonds, format_toman, format_expiry,
-    format_interval, apply_font, format_date, tehran_now,
+    format_interval, apply_font, format_date, tehran_now, build_rich_text,
 )
 from nova_db import (
     get_db_connection, list_backups_db, list_broadcasts_db,
@@ -65,6 +65,8 @@ FEATURE_LOCK_DEFS = [
     ("autoseen", "👁️ سین خودکار"),
     ("videomessage", "🎥 ویدیو مسیج"),
     ("balance", "💎 موجودی"),
+    ("calc", "⌨ ماشین حساب"),
+    ("cloud", "☁️ ابر چت"),
 ]
 FEATURE_LOCK_LABELS = dict(FEATURE_LOCK_DEFS)
 
@@ -262,7 +264,11 @@ def get_settings_root_keyboard(user_id, page=1):
 
     if page == 2:
         return [
-            [btn("balance", "💎", "موجودی", b"menu_balance")],
+            [
+                btn("balance", "💎", "موجودی", b"menu_balance"),
+                btn("calc", "⌨", "ماشین حساب", b"menu_calc"),
+                btn("cloud", "☁️", "اَبر چت", b"menu_cloud"),
+            ],
             page_row,
             [styled_button("➜ بازگشت", b"panel_root", style=STYLE_OFF)]
         ]
@@ -359,14 +365,18 @@ def get_whois_menu_keyboard():
 # ======================== منوی ریکت ========================
 def get_reaction_menu_text(user_id, user):
     count = len(reaction_targets.get(user_id, {}))
-    return (
-        f"👍 **قابلیت ریکت** ({status_icon(user.get('reaction_enabled', False))})\n\n"
-        f"تعداد کاربران دارای ریکت: {count}\n\n"
-        "برای تنظیم ریکت روی یک کاربر، در هر چتی روی پیام او Reply کنید و بفرستید:\n"
-        "`.ریکت 🤣`\n\n"
-        "برای حذف ریکت آن کاربر، روی پیامش Reply کنید و بفرستید:\n"
-        "`.حذف ریکت`"
-    )
+    return build_rich_text([
+        (
+            f"👍 **قابلیت ریکت** ({status_icon(user.get('reaction_enabled', False))})\n\n"
+            f"تعداد کاربران دارای ریکت: {count}\n\n",
+            False,
+        ),
+        (
+            "برای تنظیم ریکت روی یک کاربر، روی پیام او ریپلای کرده و `.ریکت 🤣` را ارسال کنید.\n"
+            "برای حذف ریکت، روی پیام او ریپلای کرده و `.حذف ریکت` را ارسال کنید.",
+            True,
+        ),
+    ])
 
 def get_reaction_menu_keyboard(user):
     return [
@@ -577,6 +587,75 @@ def get_date_fonts_menu_text(user):
         f"{preview}"
     )
 
+def get_actions_menu_text(updated=False):
+    note = "✅ وضعیت اکشن با موفقیت تغییر یافت.\n\n" if updated else ""
+    return build_rich_text([
+        (f"🎭 **اکشن**\n\n{note}", False),
+        (
+            "با انتخاب هر گزینه، وضعیت انتخاب‌شده به‌صورت پیوسته برای مخاطبان شما نمایش داده می‌شود. "
+            "برای غیرفعال‌سازی، گزینه‌ی فعال را دوباره انتخاب کنید.",
+            True,
+        ),
+    ])
+
+def get_textmode_menu_text(updated=False):
+    note = "✅ حالت متن با موفقیت به‌روزرسانی شد.\n\n" if updated else ""
+    return build_rich_text([
+        (f"🖊️ **حالت متن**\n\n{note}", False),
+        (
+            "با انتخاب هر حالت، تمامی پیام‌های متنی شما پس از ارسال، به‌صورت خودکار با همان قالب ویرایش می‌شوند. "
+            "برای غیرفعال‌سازی، گزینه‌ی فعال را دوباره انتخاب کنید.",
+            True,
+        ),
+    ])
+
+def get_calc_menu_text():
+    return build_rich_text([
+        ("⌨ **قابلیت ماشین حساب**\n\n", False),
+        (
+            "برای استفاده از قابلیت ماشین‌حساب، در چت موردنظر خود از فرمت زیر استفاده کنید:\n\n"
+            "▫️ `.c [عدد] [- + × ÷] [عدد]`\n\n"
+            "مثال:\n"
+            "`.c 2+2`\n"
+            "`.c 5×5`",
+            True,
+        ),
+    ])
+
+def get_calc_menu_keyboard():
+    return [[styled_button("➜ بازگشت", b"settings_page2", style=STYLE_OFF)]]
+
+CLOUD_TOGGLE_FIELDS = {
+    b"cloud_toggle_media": "cloud_media_enabled",
+    b"cloud_toggle_deleted": "cloud_deleted_enabled",
+    b"cloud_toggle_edited": "cloud_edited_enabled",
+    b"cloud_toggle_timed": "cloud_timed_enabled",
+}
+
+def get_cloud_menu_text(user):
+    return build_rich_text([
+        ("☁️ **قابلیت اَبر چت**\n\n", False),
+        (
+            "با فعال بودن این قابلیت، تمامی رسانه‌های ارسال‌شده در پیوی شما پیش از حذف توسط مخاطب، "
+            "در سیومسیج شما ذخیره خواهد شد.\n\n"
+            f"⌯ ذخیره رسانه حذف‌شده: {status_icon(user.get('cloud_media_enabled', False))}\n"
+            "شامل: «عکس، فیلم، ویدیومسیج، ویس»\n\n"
+            f"⌯ ذخیره پیام حذف‌شده: {status_icon(user.get('cloud_deleted_enabled', False))}\n\n"
+            f"⌯ ذخیره پیام ویرایش‌شده: {status_icon(user.get('cloud_edited_enabled', False))}\n\n"
+            f"⌯ ذخیره عکس تایم‌دار: {status_icon(user.get('cloud_timed_enabled', False))}",
+            True,
+        ),
+    ])
+
+def get_cloud_menu_keyboard(user):
+    return [
+        [toggle_button("ذخیره رسانه حذف شده", user.get("cloud_media_enabled", False), b"cloud_toggle_media")],
+        [toggle_button("ذخیره پیام حذف شده", user.get("cloud_deleted_enabled", False), b"cloud_toggle_deleted")],
+        [toggle_button("ذخیره پیام ویرایش شده", user.get("cloud_edited_enabled", False), b"cloud_toggle_edited")],
+        [toggle_button("ذخیره عکس تایم‌دار", user.get("cloud_timed_enabled", False), b"cloud_toggle_timed")],
+        [styled_button("➜ بازگشت", b"settings_page2", style=STYLE_OFF)],
+    ]
+
 def get_textmode_menu_keyboard(current_mode):
     buttons = []
     row = []
@@ -597,16 +676,16 @@ def get_textmode_menu_keyboard(current_mode):
     return buttons
 
 def get_tag_menu_text():
-    return (
-        "🏷️ **قابلیت تگ**\n\n"
-        "این قابلیت با ارسال یکی از دستورات زیر (توسط خودتان) داخل هر گروه فعال می‌شود:\n\n"
-        "▫️ `.تگ ادمین` — منشن تمام ادمین‌های همان گروه.\n"
-        "▫️ `.تگ اعضا` — منشن تمام اعضای همان گروه.\n\n"
-        "نکات:\n"
-        "▫️ فقط داخل گروه/سوپرگروه کار می‌کند و در چت خصوصی غیرفعال است.\n"
-        "▫️ اگر دستور را روی پیامی ریپلای کنید، خروجی هم روی همان پیام ریپلای می‌شود.\n"
-        "▫️ در گروه‌های بزرگ، پیام‌ها به چند بخش تقسیم می‌شوند تا محدودیت تلگرام رعایت شود."
-    )
+    return build_rich_text([
+        ("🏷️ **قابلیت تگ**\n\n", False),
+        (
+            "با ارسال یکی از دستورات زیر در گروه، افراد موردنظر منشن می‌شوند:\n\n"
+            "▫️ `.تگ ادمین` — منشن مدیران گروه\n"
+            "▫️ `.تگ اعضا` — منشن اعضای گروه\n\n"
+            "این قابلیت فقط در گروه‌ها کار می‌کند و در صورت ریپلای، خروجی روی همان پیام ارسال می‌شود.",
+            True,
+        ),
+    ])
 
 def get_tag_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
@@ -623,30 +702,30 @@ def get_balance_menu_keyboard():
 
 # ======================== منوی حذف و پاکسازی ========================
 def get_cleanup_menu_text():
-    return (
-        "🧹 **حذف و پاکسازی**\n\n"
-        "این قابلیت با ارسال دستور زیر (توسط خودتان) در هر چتی فعال می‌شود:\n\n"
-        "▫️ `.حذف` + تعداد پیام\n"
-        "— حذف تعداد مشخصی از پیام‌های اخیر همان چت\n\n"
-        "مثال:\n"
-        "`.حذف 10`\n"
-        "یا:\n"
-        "`.حذف ۱۰`\n\n"
-        f"حداکثر {CLEANUP_MAX_COUNT} پیام در هر اجرا (برای جلوگیری از محدودیت تلگرام)."
-    )
+    return build_rich_text([
+        ("🧹 **حذف و پاکسازی**\n\n", False),
+        (
+            "با ارسال دستور زیر در هر چت، تعداد مشخصی از پیام‌های اخیر همان چت حذف می‌شود:\n\n"
+            "▫️ `.حذف 10`\n\n"
+            f"حداکثر {CLEANUP_MAX_COUNT} پیام در هر اجرا.",
+            True,
+        ),
+    ])
 
 def get_cleanup_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 # ======================== منوی بلاک و آن‌بلاک ========================
 def get_blockmgmt_menu_text():
-    return (
-        "🚫 **بلاک و آن‌بلاک**\n\n"
-        "این قابلیت با Reply روی پیام شخص موردنظر و ارسال یکی از دستورات زیر (توسط خودتان) کار می‌کند:\n\n"
-        "▫️ `.بلاک` — بلاک‌کردن همان کاربر\n"
-        "▫️ `.آن بلاک` — آن‌بلاک‌کردن همان کاربر\n\n"
-        "نکته: حتماً باید روی پیام همان شخص Reply کرده باشید."
-    )
+    return build_rich_text([
+        ("🚫 **بلاک و آن‌بلاک**\n\n", False),
+        (
+            "برای مسدودسازی یا رفع مسدودیت یک کاربر، روی پیام او ریپلای کرده و یکی از دستورات زیر را ارسال کنید:\n\n"
+            "▫️ `.بلاک` — مسدودسازی\n"
+            "▫️ `.آن بلاک` — رفع مسدودیت",
+            True,
+        ),
+    ])
 
 def get_blockmgmt_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
@@ -663,11 +742,13 @@ def get_autoseen_menu_keyboard(user):
 
 # ======================== منوی ویدیو مسیج ========================
 def get_videomessage_menu_text():
-    return (
-        "🎥 **قابلیت ویدیو مسیج**\n\n"
-        "▫️ `.ویدیو مسیج` + ریپلای\n\n"
-        "روی یک ویدیو ریپلای کنید و خروجی را به‌صورت ویدیو مسیج یا ویدیو گرد دریافت کنید"
-    )
+    return build_rich_text([
+        ("🎥 **قابلیت ویدیومسیج**\n\n", False),
+        (
+            "روی یک ویدیو ریپلای کرده و `.ویدیو مسیج` را ارسال کنید تا به‌صورت ویدیومسیج (ویدیوی گرد) تبدیل شود.",
+            True,
+        ),
+    ])
 
 def get_videomessage_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
@@ -676,14 +757,20 @@ def get_secretary_menu_text(user):
     status = status_icon(user.get("secretary_enabled"))
     delay = user.get("secretary_delay", 60)
     text_preview = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
-    return (
-        "🧑‍💼 **منشی پیوی**\n\n"
-        f"وضعیت: {status}\n"
-        f"⏱️ تأخیر پاسخ: {delay} ثانیه\n"
-        f"📝 متن فعلی:\n{text_preview}\n\n"
-        "وقتی روشن باشد، به اولین پیام خصوصی هر شخص (که هنوز پاسخ منشی نگرفته) "
-        "بعد از تأخیر تعیین‌شده، این متن ارسال می‌شود؛ تا وقتی طرف پیام تازه‌ای ندهد، دوباره ارسال نمی‌شود."
-    )
+    return build_rich_text([
+        (
+            "🧑‍💼 **منشی پیوی**\n\n"
+            f"وضعیت: {status}\n"
+            f"⏱️ تأخیر پاسخ: {delay} ثانیه\n"
+            f"📝 متن فعلی:\n{text_preview}\n\n",
+            False,
+        ),
+        (
+            "با فعال بودن این قابلیت، به نخستین پیام خصوصی هر مخاطب پس از تأخیر تعیین‌شده پاسخ خودکار ارسال می‌شود "
+            "و تا زمانی که مخاطب پیام تازه‌ای ارسال نکند، تکرار نخواهد شد.",
+            True,
+        ),
+    ])
 
 def get_meow_menu_text(user):
     return "🐱 **بخش میو**\n\nیکی از قابلیت‌های زیر را برای مدیریت انتخاب کنید:"
@@ -1358,6 +1445,10 @@ ADMIN_MANAGEABLE_FEATURES = [
     ("reaction_enabled", "ریکت"),
     ("autoreply_enabled", "پاسخ خودکار"),
     ("autoseen_enabled", "سین خودکار"),
+    ("cloud_media_enabled", "ابر چت: رسانه حذف‌شده"),
+    ("cloud_deleted_enabled", "ابر چت: پیام حذف‌شده"),
+    ("cloud_edited_enabled", "ابر چت: پیام ویرایش‌شده"),
+    ("cloud_timed_enabled", "ابر چت: عکس تایم‌دار"),
     ("meow_enabled", "میو"),
     ("fish_enabled", "ماهی"),
     ("meowpoint_enabled", "میو پوینت"),

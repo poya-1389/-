@@ -21,14 +21,17 @@ nova_state.py
 
 import os
 import re
+import time
 import asyncio
 import logging
+from collections import OrderedDict
 from datetime import datetime
 import pytz
 import jdatetime
 from hijridate import Gregorian
 from telethon import TelegramClient, events, helpers
 from telethon.errors import MessageNotModifiedError
+from telethon.extensions import markdown as _tl_markdown
 from telethon.tl.types import (
     SendMessageTypingAction, SendMessageRecordAudioAction, SendMessageUploadPhotoAction,
     SendMessageRecordRoundAction, SendMessageUploadDocumentAction, SendMessageUploadVideoAction,
@@ -172,6 +175,8 @@ def normalize_phone_number(raw):
 
 # ======================== دیکشنری‌های عمومی ========================
 active_clients = {}
+cloud_cache = {}  # {user_id: OrderedDict{msg_id: record}} کشِ موقتِ پیام‌های پیوی برای «ابر چت» (فقط در حافظه)
+panel_registry = {}  # {(owner_id, token): (chat_id, msg_id, ts)} محل پیامِ هر «پنل درون‌چتی» برای حذفِ فوری هنگام بستن
 BOT_USERNAME = None  # موقع اجرای برنامه از get_me() پر می‌شود (برای پنل درون‌چتی لازم است)
 generator_data = {}
 active_signins = {}
@@ -368,6 +373,10 @@ def make_default_user(session=None, status=False, step="menu"):
         "autoreply_enabled": False,
         "autoreply_match_type": "exact",
         "autoseen_enabled": False,
+        "cloud_media_enabled": False,
+        "cloud_deleted_enabled": False,
+        "cloud_edited_enabled": False,
+        "cloud_timed_enabled": False,
         "meow_interval_seconds": MEOW_INTERVAL_SECONDS,
         "fish_enabled": False,
         "fish_last_run_at": None,
@@ -506,6 +515,63 @@ async def _copy_message_to(client, target_id, src_msg):
         return result[0] if isinstance(result, list) else result
     return await client.send_message(target_id, src_msg)
 
+# ======================== رجیستری پنل‌های درون‌چتی ========================
+PANEL_REGISTRY_MAX = 500
+PANEL_REGISTRY_TTL = 24 * 3600
+
+
+def register_panel_message(owner_id, token, chat_id, msg_id):
+    """محل پیامِ یک پنل درون‌چتی را نگه می‌دارد تا «✕ بستن پنل» بتواند آن را پاک کند."""
+    now = time.time()
+    for key in [k for k, v in panel_registry.items() if now - v[2] > PANEL_REGISTRY_TTL]:
+        panel_registry.pop(key, None)
+    while len(panel_registry) >= PANEL_REGISTRY_MAX:
+        panel_registry.pop(next(iter(panel_registry)), None)
+    panel_registry[(owner_id, token)] = (chat_id, msg_id, now)
+
+
+def pop_panel_message(owner_id, token):
+    """(chat_id, msg_id) پنل را برمی‌گرداند و از رجیستری حذف می‌کند؛ در نبودِ آن None."""
+    item = panel_registry.pop((owner_id, token), None)
+    return (item[0], item[1]) if item else None
+
+
+# ======================== متن غنی (نقل‌قول + قالب‌بندی) برای منوهای ربات ========================
+class RichStr(str):
+    """
+    رشته‌ی ساده (بدون نشانه‌گذاری Markdown) به‌همراه entities آماده. چون زیرکلاسِ str
+    است، هر کدی که آن را مثل رشته‌ی عادی بخواند بدون مشکل کار می‌کند؛ safe_edit
+    ‌ها entities را هم‌زمان به تلگرام می‌فرستند (برای نمایش «نقل‌قول»).
+    """
+    entities = None
+
+
+def _utf16_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def build_rich_text(parts):
+    """
+    parts: لیستی از (متن_markdown, آیا_نقل‌قول_باشد). هر بخش جدا پارس می‌شود و
+    بخش‌های نقل‌قولی با یک MessageEntityBlockquote پوشش داده می‌شوند.
+    """
+    plain_chunks, entities, offset = [], [], 0
+    for md_text, quoted in parts:
+        plain, ents = _tl_markdown.parse(md_text)
+        for ent in ents:
+            ent.offset += offset
+            entities.append(ent)
+        if quoted:
+            body = plain.rstrip("\n")
+            if body:
+                entities.append(make_blockquote_entity(offset, _utf16_len(body)))
+        plain_chunks.append(plain)
+        offset += _utf16_len(plain)
+    result = RichStr("".join(plain_chunks))
+    result.entities = sorted(entities, key=lambda e: (e.offset, -e.length))
+    return result
+
+
 async def safe_edit(event, text, buttons=None):
     """
     ویرایش امن پیام + پاسخ فوری به Callback (برای جلوگیری از تأخیر/اسپینر روی دکمه‌ها).
@@ -521,7 +587,11 @@ async def safe_edit(event, text, buttons=None):
             buttons = wrap_panel_buttons(buttons, owner_id)
 
     try:
-        await event.edit(text, buttons=buttons)
+        rich_entities = getattr(text, "entities", None)
+        if rich_entities:
+            await event.edit(str(text), buttons=buttons, formatting_entities=rich_entities)
+        else:
+            await event.edit(text, buttons=buttons)
     except MessageNotModifiedError:
         pass
     except Exception as e:
