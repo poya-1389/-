@@ -3651,17 +3651,15 @@ if __name__ == "__main__":
     load_feature_locks_cache()
     load_join_gate_cache()
 
-    # آپدیت ۲۰۲۶: استفاده از new_event_loop به‌جای get_event_loop (deprecated).
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # آپدیت ۲۰۲۶: استفاده از bot.loop به‌جای ساخت event loop جدید.
+    # نکته‌ی بسیار مهم: Telethon در nova_state.py هنگام import شدن، با .start()
+    # یک event loop می‌سازه و به اون متصل می‌شه. اگر اینجا loop جدیدی بسازیم
+    # و set کنیم، Telethon خطای "The asyncio event loop must not change after
+    # connection" می‌ده. پس باید از همون loop ای استفاده کنیم که Telethon ساخته.
+    loop = bot.loop
 
     async def _load_bot_username():
         # آپدیت ۲۰۲۶: retry با backoff برای جلوگیری از crash loop هنگام cold start.
-        # نکته: BOT_USERNAME یک رشته‌ی معمولی است (نه دیکشنری/لیست)، پس نمی‌شود
-        # در جا Mutate‌اش کرد؛ باید حتماً روی خودِ ماژول nova_state نوشته شود
-        # (nova_state.BOT_USERNAME = ...)، نه با `global BOT_USERNAME` که فقط
-        # یک نامِ تازه و بی‌ربط در فضای نامِ خودِ main.py می‌ساخت و nova_self_features
-        # (که nova_state.BOT_USERNAME را می‌خواند) هیچ‌وقت مقدار واقعی را نمی‌دید.
         for attempt in range(5):
             try:
                 me = await bot.get_me()
@@ -3679,25 +3677,33 @@ if __name__ == "__main__":
         except Exception:
             logging.critical("❌ نمی‌توان BOT_USERNAME را تعیین کرد؛ بات ممکن است در پنل درون‌چتی مشکل داشته باشد.")
 
-    loop.run_until_complete(_load_bot_username())
+    async def _initialize_background_services():
+        """
+        آپدیت ۲۰۲۶: تمام initialization tasks (autostart و webapp) رو داخل
+        یه async function می‌بریم تا در context یه running loop اجرا بشن.
+        این کار از خطای get_event_loop در Python 3.13 جلوگیری می‌کنه.
+        """
+        await _load_bot_username()
 
-    # آپدیت ۲۰۲۶: استفاده از _spawn_background_task به‌جای create_task مستقیم.
-    _spawn_background_task(autostart_saved_users())
+        _spawn_background_task(autostart_saved_users())
 
-    webapp_app = create_webapp_app(
-        bot_token=BOT_TOKEN,
-        user_data=user_data,
-        save_user=save_user,
-        start_self_client=start_self_client,
-        stop_self_client=stop_self_client,
-        format_diamonds=format_diamonds,
-        diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
-        allowed_origin=MINIAPP_ORIGIN,
-        is_feature_locked=is_feature_locked,
-        font_ids=set(FONT_NAMES.keys()),
-        textmode_ids={0, *TEXTMODE_NAMES.keys()},
-    )
-    _spawn_background_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
+        webapp_app = create_webapp_app(
+            bot_token=BOT_TOKEN,
+            user_data=user_data,
+            save_user=save_user,
+            start_self_client=start_self_client,
+            stop_self_client=stop_self_client,
+            format_diamonds=format_diamonds,
+            diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
+            allowed_origin=MINIAPP_ORIGIN,
+            is_feature_locked=is_feature_locked,
+            font_ids=set(FONT_NAMES.keys()),
+            textmode_ids={0, *TEXTMODE_NAMES.keys()},
+        )
+        _spawn_background_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
+
+    # اجرای initialization در context یه running loop.
+    loop.run_until_complete(_initialize_background_services())
 
     # ======================== آپدیت ۲۰۲۶: graceful shutdown ========================
     # هندلر SIGTERM/SIGINT که قبل از خروج همه‌ی کلاینت‌ها و نشست‌ها رو تمیز می‌کنه.

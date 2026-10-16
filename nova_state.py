@@ -226,12 +226,22 @@ def _spawn_background_task(coro):
     رفرنس قوی به آن؛ بدون این کار، asyncio ممکن است در میانه‌ی اجرا Task را
     Garbage Collect و بی‌صدا لغو کند (یک نکته‌ی شناخته‌شده در مستندات asyncio).
     بعد از پایان Task، رفرنس خودش از مجموعه پاک می‌شود تا حافظه بی‌نهایت رشد نکند.
+
+    آپدیت ۲۰۲۶: استفاده از get_running_loop به‌جای get_event_loop (deprecated).
+    اگر در context یه running loop نباشه، fallback به bot.loop (که Telethon ساخته).
     """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # در context یه running loop نیستیم؛ از bot.loop استفاده می‌کنیم.
+        try:
+            loop = bot.loop
+        except Exception:
+            try:
+                loop = asyncio.get_event_loop()
+            except Exception:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
     task = loop.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
