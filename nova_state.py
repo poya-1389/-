@@ -627,11 +627,23 @@ async def safe_edit(event, text, buttons=None):
     اگر این کلیک از یک «پنل درون‌چتی» (ساخته‌شده با Inline Mode) آمده باشد،
     دکمه‌های صفحه‌ی بعدی را هم خودکار با پیشوند مالکیت بازپیچی می‌کنیم تا
     تمام مراحل ناوبری پنل، نه فقط صفحه‌ی اول، محدود به صاحب Self بماند (بند ۱۰).
+
+    آپدیت مهم (۲۰۲۶):
+      - اگر `buttons=None` باشه و در پنل درون‌چتی باشیم، یه کیبورد حداقل با
+        دکمه‌ی «✕ بستن پنل» می‌سازیم تا دکمه‌ی بستن هرگز حذف نشه.
+      - `_panel_token` رو هم از event می‌خونیم تا پیشوند درست ساخته بشه.
+      - اگه `event.edit` خطا بده (مثلاً به خاطر محدودیت inline messages)،
+        فقط لاگ می‌کنیم و `reply_markup` رو تغییر نمی‌دیم.
     """
-    if buttons and getattr(event, "_is_inline_panel", False):
-        owner_id = getattr(event, "_panel_owner_id", None)
-        if owner_id:
-            buttons = wrap_panel_buttons(buttons, owner_id)
+    # آپدیت ۲۰۲۶: چک کردن attribute‌های پنل درون‌چتی.
+    is_inline_panel = getattr(event, "_is_inline_panel", False)
+    panel_owner_id = getattr(event, "_panel_owner_id", None)
+    panel_token = getattr(event, "_panel_token", None)
+    if is_inline_panel and panel_owner_id:
+        # آپدیت ۲۰۲۶: اگه buttons None یا خالی باشه، حداقل دکمه‌ی بستن رو اضافه کن.
+        if not buttons:
+            buttons = []
+        buttons = wrap_panel_buttons(buttons, panel_owner_id, add_close=True, token=panel_token)
 
     try:
         rich_entities = getattr(text, "entities", None)
@@ -643,6 +655,8 @@ async def safe_edit(event, text, buttons=None):
         pass
     except Exception as e:
         logging.error(f"⚠️ خطا در ویرایش پیام: {e}")
+        # آپدیت ۲۰۲۶: اگه خطا به خاطر محدودیت inline messages باشه،
+        # حداقل متن رو با یک reply جدید بفرست (نه edit).
         try:
             await event.answer("❌ خطا در بروزرسانی پیام، دوباره تلاش کنید.", alert=True)
             return

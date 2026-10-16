@@ -351,11 +351,19 @@ async def callback_handler(event):
     _module_safe_edit = globals()['safe_edit']
 
     async def safe_edit(ev, text, buttons=None):
-        # داخل «پنل درون‌چتی» همیشه دکمه‌ی «✕ بستن پنل» باید بماند: قبلاً بعضی صفحه‌ها
-        # (مثل پیام‌های راهنمای منشی/پاسخ خودکار) بدون هیچ دکمه‌ای ویرایش می‌شدند و
-        # با ارسال reply_markup خالی، کل کیبورد (از جمله دکمه‌ی بستن) از پیام پاک می‌شد.
-        if panel_owner_id is not None:
-            buttons = wrap_panel_buttons(buttons or [], panel_owner_id, add_close=True, token=panel_token)
+        # آپدیت ۲۰۲۶: دکمه‌ها رو دیگه اینجا wrap نمی‌کنیم چون _module_safe_edit
+        # خودش از attribute‌های event (_is_inline_panel, _panel_owner_id, _panel_token)
+        # استفاده می‌کنه و دکمه‌ها رو wrap می‌کنه. این کار از دوبار wrap شدن
+        # (که باعث می‌شد callback_data به‌صورت ip_X_Y_ip_X_Y_action بشه) جلوگیری می‌کنه.
+        # فقط در مواردی که _is_inline_panel ست نشده (مثلاً پنل قدیمی)، از panel_owner_id
+        # محلی استفاده می‌کنیم.
+        if panel_owner_id is not None and not getattr(ev, "_is_inline_panel", False):
+            try:
+                ev._is_inline_panel = True
+                ev._panel_owner_id = panel_owner_id
+                ev._panel_token = panel_token
+            except Exception:
+                pass
         return await _module_safe_edit(ev, text, buttons=buttons)
 
     # ====== پنل درون‌چتی (بندهای ۸-۱۲): بازکردن پیشوند مالکیت + کنترل دسترسی ======
@@ -401,6 +409,15 @@ async def callback_handler(event):
         user_id = owner_id
         data = real_action.encode()
         panel_owner_id = owner_id
+        # آپدیت مهم (۲۰۲۶): ست کردن attribute‌های event تا safe_edit ماژول-سطح هم
+        # بتونه دکمه‌ها رو درست wrap کنه. قبلاً این attribute‌ها هیچ‌وقت ست نمی‌شدن
+        # و کد wrap در nova_state.py اجرا نمی‌شد.
+        try:
+            event._is_inline_panel = True
+            event._panel_owner_id = owner_id
+            event._panel_token = panel_token
+        except Exception:
+            pass
 
         # دکمه‌های نمایشیِ «void» (مثل صفحه‌ی حساب کاربری) فقط بعد از بازکردنِ پیشوند
         # قابل تشخیص‌اند؛ قبلاً داخل پنل بی‌پاسخ می‌ماندند و دکمه مدتی در حالت loading می‌ماند.
