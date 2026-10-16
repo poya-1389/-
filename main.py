@@ -351,19 +351,11 @@ async def callback_handler(event):
     _module_safe_edit = globals()['safe_edit']
 
     async def safe_edit(ev, text, buttons=None):
-        # آپدیت ۲۰۲۶: دکمه‌ها رو دیگه اینجا wrap نمی‌کنیم چون _module_safe_edit
-        # خودش از attribute‌های event (_is_inline_panel, _panel_owner_id, _panel_token)
-        # استفاده می‌کنه و دکمه‌ها رو wrap می‌کنه. این کار از دوبار wrap شدن
-        # (که باعث می‌شد callback_data به‌صورت ip_X_Y_ip_X_Y_action بشه) جلوگیری می‌کنه.
-        # فقط در مواردی که _is_inline_panel ست نشده (مثلاً پنل قدیمی)، از panel_owner_id
-        # محلی استفاده می‌کنیم.
-        if panel_owner_id is not None and not getattr(ev, "_is_inline_panel", False):
-            try:
-                ev._is_inline_panel = True
-                ev._panel_owner_id = panel_owner_id
-                ev._panel_token = panel_token
-            except Exception:
-                pass
+        # داخل «پنل درون‌چتی» همیشه دکمه‌ی «✕ بستن پنل» باید بماند: قبلاً بعضی صفحه‌ها
+        # (مثل پیام‌های راهنمای منشی/پاسخ خودکار) بدون هیچ دکمه‌ای ویرایش می‌شدند و
+        # با ارسال reply_markup خالی، کل کیبورد (از جمله دکمه‌ی بستن) از پیام پاک می‌شد.
+        if panel_owner_id is not None:
+            buttons = wrap_panel_buttons(buttons or [], panel_owner_id, add_close=True, token=panel_token)
         return await _module_safe_edit(ev, text, buttons=buttons)
 
     # ====== پنل درون‌چتی (بندهای ۸-۱۲): بازکردن پیشوند مالکیت + کنترل دسترسی ======
@@ -409,15 +401,6 @@ async def callback_handler(event):
         user_id = owner_id
         data = real_action.encode()
         panel_owner_id = owner_id
-        # آپدیت مهم (۲۰۲۶): ست کردن attribute‌های event تا safe_edit ماژول-سطح هم
-        # بتونه دکمه‌ها رو درست wrap کنه. قبلاً این attribute‌ها هیچ‌وقت ست نمی‌شدن
-        # و کد wrap در nova_state.py اجرا نمی‌شد.
-        try:
-            event._is_inline_panel = True
-            event._panel_owner_id = owner_id
-            event._panel_token = panel_token
-        except Exception:
-            pass
 
         # دکمه‌های نمایشیِ «void» (مثل صفحه‌ی حساب کاربری) فقط بعد از بازکردنِ پیشوند
         # قابل تشخیص‌اند؛ قبلاً داخل پنل بی‌پاسخ می‌ماندند و دکمه مدتی در حالت loading می‌ماند.
@@ -1264,37 +1247,28 @@ async def callback_handler(event):
 
             await safe_edit(event, "⏳ در حال حذف پیام از چت کاربران...")
 
-            # آپدیت ۲۰۲۶: اجرای حذف در پس‌زمینه با safe_call و rate-limit.
-            async def _run_delete_broadcast():
-                deleted_count = 0
-                failed_count = 0
-                for d in deliveries:
-                    # هر خطا فقط برای همان کاربر ثبت می‌شود و ادامه‌ی حذف بقیه
-                    # را متوقف نمی‌کند.
-                    try:
-                        await safe_call(bot.delete_messages, d["chat_id"], [d["message_id"]], max_retries=3)
-                        deleted_count += 1
-                    except Exception as e:
-                        failed_count += 1
-                        log_internal_error("delete_broadcast_message", f"broadcast={broadcast_id} chat={d['chat_id']} err={e}")
-                    await asyncio.sleep(0.05)  # آپدیت ۲۰۲۶: rate-limit بین deleteها.
-
-                delete_broadcast_record_db(broadcast_id)
-                log_admin_action(user_id, 0, "delete_broadcast", f"broadcast={broadcast_id} deleted={deleted_count} failed={failed_count}")
-
+            deleted_count = 0
+            failed_count = 0
+            for d in deliveries:
+                # هر خطا (کاربر پیام را قبلاً حذف کرده، بلاک کرده، ربات دسترسی حذف ندارد،
+                # پیام قدیمی است و ...) فقط برای همان کاربر ثبت می‌شود و ادامه‌ی حذف بقیه
+                # را متوقف نمی‌کند (بند ۲۷ آپدیت).
                 try:
-                    await bot.send_message(
-                        user_id,
-                        "🗑 **حذف پیام کامل شد.**\n\n"
-                        f"✅ حذف‌شده از چت کاربران: {deleted_count}\n"
-                        f"❌ ناموفق (قبلاً حذف‌شده/بلاک/دسترسی نبود): {failed_count}"
-                    )
-                except Exception:
-                    pass
+                    await bot.delete_messages(d["chat_id"], [d["message_id"]])
+                    deleted_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    log_internal_error("delete_broadcast_message", f"broadcast={broadcast_id} chat={d['chat_id']} err={e}")
 
-            _spawn_background_task(_run_delete_broadcast())
-            await event.answer("حذف در پس‌زمینه شروع شد. بعد از تکمیل نتیجه برای شما ارسال می‌شود.")
-            await safe_edit(event, get_broadcasts_admin_text(), buttons=get_broadcasts_admin_keyboard())
+            delete_broadcast_record_db(broadcast_id)
+            log_admin_action(user_id, 0, "delete_broadcast", f"broadcast={broadcast_id} deleted={deleted_count} failed={failed_count}")
+
+            await safe_edit(event,
+                "🗑 **حذف پیام کامل شد.**\n\n"
+                f"✅ حذف‌شده از چت کاربران: {deleted_count}\n"
+                f"❌ ناموفق (قبلاً حذف‌شده/بلاک/دسترسی نبود): {failed_count}",
+                buttons=[styled_button("➜ بازگشت", b"admin_messages_list", style=STYLE_OFF)]
+            )
             return
 
         # افزایش الماس
@@ -3598,44 +3572,26 @@ async def broadcast_callback_handler(event):
 
         else:
             total_users = len(user_data)
+            success_count = 0
+            fail_count = 0
             broadcast_id = create_broadcast_record_db(user_id, "broadcast", None, broadcast.get("summary", ""))
 
-            # آپدیت ۲۰۲۶: اجرای broadcast در پس‌زمینه تا callback فوراً برگردد.
-            async def _run_broadcast():
-                success_count = 0
-                fail_count = 0
-                for uid in list(user_data.keys()):
-                    try:
-                        sent = await safe_call(_copy_message_to, bot, uid, src_msg, max_retries=5)
-                        if sent:
-                            success_count += 1
-                            if broadcast_id:
-                                add_broadcast_delivery_db(broadcast_id, uid, uid, sent.id)
-                        else:
-                            fail_count += 1
-                        await asyncio.sleep(0.1)
-                    except Exception as e:
-                        fail_count += 1
-                        logging.error(f"❌ خطا در ارسال به {uid}: {e}")
-                        # آپدیت ۲۰۲۶: در صورت FloodWait طولانی، صبر کن.
-                        if isinstance(e, FloodWaitError):
-                            await asyncio.sleep(e.seconds + 1)
-
+            for uid in list(user_data.keys()):
                 try:
-                    await bot.send_message(
-                        user_id,
-                        f"✅ **ارسال پیام همگانی کامل شد!**\n\n"
-                        f"📨 تعداد کل: {total_users}\n"
-                        f"✅ موفق: {success_count}\n"
-                        f"❌ ناموفق: {fail_count}"
-                    )
-                except Exception:
-                    pass
+                    sent = await _copy_message_to(bot, uid, src_msg)
+                    success_count += 1
+                    if broadcast_id and sent:
+                        add_broadcast_delivery_db(broadcast_id, uid, uid, sent.id)
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    fail_count += 1
+                    logging.error(f"❌ خطا در ارسال به {uid}: {e}")
 
-            _spawn_background_task(_run_broadcast())
             await safe_edit(event,
-                "📤 **ارسال پیام همگانی شروع شد.**\n\n"
-                "پیام در پس‌زمینه به همه‌ی کاربران ارسال می‌شود و بعد از تکمیل، نتیجه برای شما ارسال خواهد شد.",
+                f"✅ **ارسال پیام همگانی کامل شد!**\n\n"
+                f"📨 تعداد کل: {total_users}\n"
+                f"✅ موفق: {success_count}\n"
+                f"❌ ناموفق: {fail_count}",
                 buttons=[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]
             )
 
@@ -3652,7 +3608,6 @@ async def broadcast_callback_handler(event):
 
 # ======================== اجرای اصلی ========================
 if __name__ == "__main__":
-    import signal
     logging.info("🚀 راه‌اندازی ربات NovaSelf...")
 
     init_db()
@@ -3668,117 +3623,37 @@ if __name__ == "__main__":
     load_feature_locks_cache()
     load_join_gate_cache()
 
-    # آپدیت ۲۰۲۶: استفاده از bot.loop به‌جای ساخت event loop جدید.
-    # نکته‌ی بسیار مهم: Telethon در nova_state.py هنگام import شدن، با .start()
-    # یک event loop می‌سازه و به اون متصل می‌شه. اگر اینجا loop جدیدی بسازیم
-    # و set کنیم، Telethon خطای "The asyncio event loop must not change after
-    # connection" می‌ده. پس باید از همون loop ای استفاده کنیم که Telethon ساخته.
-    loop = bot.loop
+    loop = asyncio.get_event_loop()
 
     async def _load_bot_username():
-        # آپدیت ۲۰۲۶: retry با backoff برای جلوگیری از crash loop هنگام cold start.
-        for attempt in range(5):
-            try:
-                me = await bot.get_me()
-                nova_state.BOT_USERNAME = me.username
-                logging.info(f"🤖 نام‌کاربری ربات برای پنل درون‌چتی ذخیره شد: @{nova_state.BOT_USERNAME}")
-                return
-            except Exception as e:
-                logging.error(f"⚠️ تلاش {attempt + 1}/5 برای get_me شکست خورد: {e}")
-                await asyncio.sleep(3)
-        # fallback: استخراج آیدی از BOT_TOKEN.
-        try:
-            bot_id = int(BOT_TOKEN.split(":")[0])
-            nova_state.BOT_USERNAME = str(bot_id)
-            logging.warning(f"⚠️ از fallback استفاده شد: BOT_USERNAME = {bot_id}")
-        except Exception:
-            logging.critical("❌ نمی‌توان BOT_USERNAME را تعیین کرد؛ بات ممکن است در پنل درون‌چتی مشکل داشته باشد.")
+        # نکته: BOT_USERNAME یک رشته‌ی معمولی است (نه دیکشنری/لیست)، پس نمی‌شود
+        # در جا Mutate‌اش کرد؛ باید حتماً روی خودِ ماژول nova_state نوشته شود
+        # (nova_state.BOT_USERNAME = ...)، نه با `global BOT_USERNAME` که فقط
+        # یک نامِ تازه و بی‌ربط در فضای نامِ خودِ main.py می‌ساخت و nova_self_features
+        # (که nova_state.BOT_USERNAME را می‌خواند) هیچ‌وقت مقدار واقعی را نمی‌دید.
+        me = await bot.get_me()
+        nova_state.BOT_USERNAME = me.username
+        logging.info(f"🤖 نام‌کاربری ربات برای پنل درون‌چتی ذخیره شد: @{nova_state.BOT_USERNAME}")
 
-    async def _initialize_background_services():
-        """
-        آپدیت ۲۰۲۶: تمام initialization tasks (autostart و webapp) رو داخل
-        یه async function می‌بریم تا در context یه running loop اجرا بشن.
-        این کار از خطای get_event_loop در Python 3.13 جلوگیری می‌کنه.
-        """
-        await _load_bot_username()
+    loop.run_until_complete(_load_bot_username())
+    loop.create_task(autostart_saved_users())
 
-        _spawn_background_task(autostart_saved_users())
-
-        webapp_app = create_webapp_app(
-            bot_token=BOT_TOKEN,
-            user_data=user_data,
-            save_user=save_user,
-            start_self_client=start_self_client,
-            stop_self_client=stop_self_client,
-            format_diamonds=format_diamonds,
-            diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
-            allowed_origin=MINIAPP_ORIGIN,
-            is_feature_locked=is_feature_locked,
-            font_ids=set(FONT_NAMES.keys()),
-            textmode_ids={0, *TEXTMODE_NAMES.keys()},
-        )
-        _spawn_background_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
-
-    # اجرای initialization در context یه running loop.
-    loop.run_until_complete(_initialize_background_services())
-
-    # ======================== آپدیت ۲۰۲۶: graceful shutdown ========================
-    # هندلر SIGTERM/SIGINT که قبل از خروج همه‌ی کلاینت‌ها و نشست‌ها رو تمیز می‌کنه.
-    # این کار جلوی invalid شدن session توسط تلگرام (به‌خاطر اتصال ناقص رهاشده)
-    # رو می‌گیره که در Railway redeploy خیلی مهمه.
-    async def _graceful_shutdown():
-        logging.info("🛑 در حال خاموش‌سازی گراس‌فول NovaSelf...")
-        try:
-            # قطع همه‌ی کلاینت‌های فعال یوزر.
-            for uid in list(active_clients.keys()):
-                try:
-                    await stop_self_client(uid)
-                except Exception as e:
-                    logging.error(f"⚠️ خطا در stop_self_client برای {uid}: {e}")
-            # قطع کلاینت‌های موقت signin.
-            for uid, client in list(active_signins.items()):
-                try:
-                    if client and client.is_connected():
-                        await client.disconnect()
-                except Exception:
-                    pass
-            active_signins.clear()
-            # قطع بات اصلی.
-            try:
-                await bot.disconnect()
-            except Exception:
-                pass
-            # بستن connection pool دیتابیس.
-            try:
-                import nova_db
-                if nova_db._db_pool is not None:
-                    nova_db._db_pool.closeall()
-                    nova_db._db_pool = None
-            except Exception:
-                pass
-            logging.info("✅ خاموش‌سازی کامل شد.")
-        except Exception as e:
-            logging.error(f"❌ خطا در graceful shutdown: {e}")
-
-    def _signal_handler(sig):
-        logging.info(f"📡 سیگنال دریافت شد: {sig}")
-        _spawn_background_task(_graceful_shutdown())
-
-    try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, _signal_handler, sig)
-            except (NotImplementedError, RuntimeError):
-                # در Windows یا محیط‌هایی که add_signal_handler پشتیبانی نمی‌شه.
-                pass
-    except Exception as e:
-        logging.warning(f"⚠️ نصب signal handler ناموفق بود: {e}")
+    webapp_app = create_webapp_app(
+        bot_token=BOT_TOKEN,
+        user_data=user_data,
+        save_user=save_user,
+        start_self_client=start_self_client,
+        stop_self_client=stop_self_client,
+        format_diamonds=format_diamonds,
+        diamond_rate_per_hour=DIAMOND_RATE_PER_HOUR,
+        allowed_origin=MINIAPP_ORIGIN,
+        is_feature_locked=is_feature_locked,
+        font_ids=set(FONT_NAMES.keys()),
+        textmode_ids={0, *TEXTMODE_NAMES.keys()},
+    )
+    loop.create_task(run_webapp_server(webapp_app, host="0.0.0.0", port=PORT))
 
     logging.info("✅ ربات با موفقیت راه‌اندازی شد!")
     logging.info(f"👑 تعداد ادمین‌ها: {len(ADMIN_IDS)}")
 
-    try:
-        bot.run_until_disconnected()
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("🛑 دریافت KeyboardInterrupt/SystemExit، در حال shutdown تمیز...")
-        loop.run_until_complete(_graceful_shutdown())
+    bot.run_until_disconnected()

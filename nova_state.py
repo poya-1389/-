@@ -43,22 +43,13 @@ from telethon.tl.types import (
 from nova_utils import ClickDebouncer, wrap_panel_buttons
 
 # ======================== تنظیمات اولیه ========================
-API_ID = int(os.environ.get("API_ID") or 0)
+API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_IDS", "").split(",") if id.strip()]
 MINIAPP_ORIGIN = os.environ.get("MINIAPP_ORIGIN", "*")  # آدرس گیت‌هاب‌پیجز، مثل: https://username.github.io
 PORT = int(os.environ.get("PORT", 8080))  # ریلوی این متغیر رو خودش ست می‌کنه
-# تنظیمات اتصال به تلگرام (برای پایداری بیشتر روی Railway)
-TELETHON_CONNECTION_RETRIES = int(os.environ.get("TELETHON_CONNECTION_RETRIES", 5))
-TELETHON_RETRY_DELAY = int(os.environ.get("TELETHON_RETRY_DELAY", 5))
-TELETHON_REQUEST_RETRIES = int(os.environ.get("TELETHON_REQUEST_RETRIES", 3))
-TELETHON_TIMEOUT = int(os.environ.get("TELETHON_TIMEOUT", 30))
-# آپدیت جدید: استفاده از session_name مشخص تا در volume persistent روی Railway
-# ذخیره بشه و در هر redeploy نیاز به re-auth نباشه (مهم برای جلوگیری از
-# "all sessions reset after authorization" که در ۲۰۲۵-۲۰۲۶ گزارش شده).
-TELETHON_SESSION_NAME = os.environ.get("TELETHON_SESSION_NAME", "helper_bot")
 
 if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
     raise ValueError("تمامی متغیرهای محیطی باید تنظیم شوند!")
@@ -66,26 +57,15 @@ if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
 if not ADMIN_IDS:
     logging.warning("⚠️ هشدار: هیچ ادمینی تنظیم نشده است!")
 
-# آپدیت مهم (۲۰۲۶): استفاده از connection_retries/retry_delay/request_retries برای
-# پایداری بیشتر روی Railway و جلوگیری از crash loop هنگام cold start.
-bot = TelegramClient(
-    TELETHON_SESSION_NAME, API_ID, API_HASH,
-    connection_retries=TELETHON_CONNECTION_RETRIES,
-    retry_delay=TELETHON_RETRY_DELAY,
-    request_retries=TELETHON_REQUEST_RETRIES,
-    timeout=TELETHON_TIMEOUT,
-).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('helper_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ======================== تنظیمات سیستم الماس ========================
 DIAMOND_RATE_PER_HOUR = 5       # مصرف الماس به ازای هر ساعت روشن بودن سلف
 DIAMOND_PRICE_TOMAN = 20        # قیمت هر الماس به تومان
 BILLING_INTERVAL_SECONDS = 60   # فاصله زمانی محاسبه و کسر الماس
-# آپدیت جدید: فاصله‌ی پیش‌فرض میو از ۵ دقیقه به ۱۵ دقیقه افزایش یافت تا با
-# سیاست‌های جدید anti-spam تلگرام (۲۰۲۵-۲۰۲۶) سازگار باشه. ارسال پیام
-# تکراری به گروه هر ۵ دقیقه می‌تونه باعث soft-ban بشه.
-MEOW_INTERVAL_SECONDS = 15 * 60         # ۱۵ دقیقه (قبلاً ۵ دقیقه و ۲۰ ثانیه بود)
-FISH_INTERVAL_SECONDS = 60 * 60 + 10     # ۱ ساعت و ۱۰ ثانیه (بدون تغییر)
+MEOW_INTERVAL_SECONDS = 5 * 60 + 20   # فاصله‌ی پیش‌فرض ارسال پیام «میو» (۵ دقیقه و ۲۰ ثانیه) — قابل تغییر توسط کاربر
+FISH_INTERVAL_SECONDS = 60 * 60 + 10  # فاصله‌ی ارسال پیام «ماهی» (۱ ساعت و ۱۰ ثانیه)
 MEOWIEQBOT_USERNAME = "MeowieQBot"
 FISH_RESPONSE_TIMEOUT = 15            # حداکثر انتظار برای اولین پاسخ ربات ماهی
 FISH_EDIT_WAIT_SECONDS = 12           # حداکثر انتظار برای ادیت‌شدنِ پیام اولیه (استیکر) به متن اطلاعات
@@ -226,38 +206,11 @@ def _spawn_background_task(coro):
     رفرنس قوی به آن؛ بدون این کار، asyncio ممکن است در میانه‌ی اجرا Task را
     Garbage Collect و بی‌صدا لغو کند (یک نکته‌ی شناخته‌شده در مستندات asyncio).
     بعد از پایان Task، رفرنس خودش از مجموعه پاک می‌شود تا حافظه بی‌نهایت رشد نکند.
-
-    آپدیت ۲۰۲۶: استفاده از get_running_loop به‌جای get_event_loop (deprecated).
-    اگر در context یه running loop نباشه، fallback به bot.loop (که Telethon ساخته).
     """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # در context یه running loop نیستیم؛ از bot.loop استفاده می‌کنیم.
-        try:
-            loop = bot.loop
-        except Exception:
-            try:
-                loop = asyncio.get_event_loop()
-            except Exception:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-    task = loop.create_task(coro)
+    task = asyncio.get_event_loop().create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
-
-# ---------- سیستم جدید (آپدیت ۲۰۲۶): Jitter تصادفی برای کاهش flood مشترک ----------
-import random as _random
-
-def jittered_sleep(base_seconds: float, jitter_ratio: float = 0.2) -> float:
-    """
-    اضافه‌کردن یک jitter تصادفی به sleep تا عملیات‌های زمان‌بندی‌شده‌ی همه‌ی
-    کاربران به‌صورت هم‌زمان اجرا نشن (که می‌تونه باعث FloodWait دسته‌جمعی بشه).
-    مقدار jitter بین ۰ و base*jitter_ratio است. خروجی: مدت زمان واقعی sleep.
-    """
-    actual = base_seconds + _random.uniform(0, base_seconds * jitter_ratio)
-    return actual
 
 TAG_ADMIN_TRIGGERS = {".تگ ادمین", ".تگادمین", ".tagadmins"}
 TAG_MEMBERS_TRIGGERS = {".تگ اعضا", ".تگاعضا", ".tagall"}
@@ -627,23 +580,11 @@ async def safe_edit(event, text, buttons=None):
     اگر این کلیک از یک «پنل درون‌چتی» (ساخته‌شده با Inline Mode) آمده باشد،
     دکمه‌های صفحه‌ی بعدی را هم خودکار با پیشوند مالکیت بازپیچی می‌کنیم تا
     تمام مراحل ناوبری پنل، نه فقط صفحه‌ی اول، محدود به صاحب Self بماند (بند ۱۰).
-
-    آپدیت مهم (۲۰۲۶):
-      - اگر `buttons=None` باشه و در پنل درون‌چتی باشیم، یه کیبورد حداقل با
-        دکمه‌ی «✕ بستن پنل» می‌سازیم تا دکمه‌ی بستن هرگز حذف نشه.
-      - `_panel_token` رو هم از event می‌خونیم تا پیشوند درست ساخته بشه.
-      - اگه `event.edit` خطا بده (مثلاً به خاطر محدودیت inline messages)،
-        فقط لاگ می‌کنیم و `reply_markup` رو تغییر نمی‌دیم.
     """
-    # آپدیت ۲۰۲۶: چک کردن attribute‌های پنل درون‌چتی.
-    is_inline_panel = getattr(event, "_is_inline_panel", False)
-    panel_owner_id = getattr(event, "_panel_owner_id", None)
-    panel_token = getattr(event, "_panel_token", None)
-    if is_inline_panel and panel_owner_id:
-        # آپدیت ۲۰۲۶: اگه buttons None یا خالی باشه، حداقل دکمه‌ی بستن رو اضافه کن.
-        if not buttons:
-            buttons = []
-        buttons = wrap_panel_buttons(buttons, panel_owner_id, add_close=True, token=panel_token)
+    if buttons and getattr(event, "_is_inline_panel", False):
+        owner_id = getattr(event, "_panel_owner_id", None)
+        if owner_id:
+            buttons = wrap_panel_buttons(buttons, owner_id)
 
     try:
         rich_entities = getattr(text, "entities", None)
@@ -655,8 +596,6 @@ async def safe_edit(event, text, buttons=None):
         pass
     except Exception as e:
         logging.error(f"⚠️ خطا در ویرایش پیام: {e}")
-        # آپدیت ۲۰۲۶: اگه خطا به خاطر محدودیت inline messages باشه،
-        # حداقل متن رو با یک reply جدید بفرست (نه edit).
         try:
             await event.answer("❌ خطا در بروزرسانی پیام، دوباره تلاش کنید.", alert=True)
             return

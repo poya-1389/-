@@ -14,7 +14,6 @@ User/آرگومان‌های ورودی و کش‌های خواندنیِ nova_s
 """
 
 import io
-import asyncio
 import logging
 from telethon import Button
 try:
@@ -28,7 +27,6 @@ from nova_utils import (
     styled_button, toggle_button, toggle_label, status_icon,
     STYLE_ON, STYLE_OFF, STYLE_INFO, wrap_panel_buttons,
     build_clock_preview, build_date_preview, log_internal_error,
-    escape_md,
 )
 from nova_state import (
     bot, feature_locks, reaction_targets, autoreply_cache,
@@ -756,7 +754,6 @@ def get_videomessage_menu_keyboard():
     return [[styled_button("➜ بازگشت", b"settings_root", style=STYLE_OFF)]]
 
 def get_secretary_menu_text(user):
-    # آپدیت ۲۰۲۶: escape_md برای جلوگیری از markdown injection توسط متن کاربر.
     status = status_icon(user.get("secretary_enabled"))
     delay = user.get("secretary_delay", 60)
     text_preview = user.get("secretary_text") or "مشغولم، بعداً پاسخ می‌دهم ✅"
@@ -765,7 +762,7 @@ def get_secretary_menu_text(user):
             "🧑‍💼 **منشی پیوی**\n\n"
             f"وضعیت: {status}\n"
             f"⏱️ تأخیر پاسخ: {delay} ثانیه\n"
-            f"📝 متن فعلی:\n{escape_md(text_preview)}\n\n",
+            f"📝 متن فعلی:\n{text_preview}\n\n",
             False,
         ),
         (
@@ -1009,12 +1006,9 @@ def get_referral_page_keyboard():
     return [[styled_button("➜ بازگشت", b"start_account", style=STYLE_OFF)]]
 
 def get_account_delete_warning_keyboard():
-    # آپدیت ۲۰۲۶: ترتیب دکمه‌ها با بقیه‌ی confirmation dialog ها یکسان شد
-    # (تایید اول، بازگشت دوم). قبلاً بازگشت اول بود که خطرناک بود چون کاربر
-    # با muscle memory می‌تونست اشتباهاً تایید رو بزنه.
     return [
-        [styled_button("✅ تایید و حذف حساب کاربری", b"account_delete_final", style=STYLE_OFF)],
-        [styled_button("➜ بازگشت", b"start_manage_self", style=STYLE_INFO)],
+        [styled_button("➜ بازگشت", b"start_manage_self", style=STYLE_OFF)],
+        [styled_button("✅ تایید و حذف حساب کاربری", b"account_delete_final", style=STYLE_OFF)]
     ]
 
 def get_start_root_text():
@@ -1367,14 +1361,6 @@ def get_broadcast_detail_keyboard(broadcast_id):
     ]
 
 def get_users_list_page(page=0, per_page=10):
-    """
-    آپدیت ۲۰۲۶:
-      - رفع connection leak با try/finally.
-      - مخفی کردن دکمه‌ی «بعدی» در صفحه‌ی آخر (اگه تعداد کاربران از per_page کمتر باشه).
-    """
-    from nova_db import release_db_connection
-    conn = None
-    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1388,6 +1374,8 @@ def get_users_list_page(page=0, per_page=10):
         """, (per_page, offset))
 
         users = cursor.fetchall()
+        cursor.close()
+        conn.close()
 
         buttons = []
         for user in users:
@@ -1402,9 +1390,7 @@ def get_users_list_page(page=0, per_page=10):
         if page > 0:
             nav_buttons.append(styled_button("⬅️ قبلی", f"admin_users_page_{page-1}".encode(), style=STYLE_INFO))
         nav_buttons.append(styled_button(f"📄 صفحه {page+1}", b"void", style=STYLE_INFO))
-        # آپدیت ۲۰۲۶: فقط اگر صفحه پر بود، دکمه‌ی بعدی رو نشون بده.
-        if len(users) >= per_page:
-            nav_buttons.append(styled_button("➡️ بعدی", f"admin_users_page_{page+1}".encode(), style=STYLE_INFO))
+        nav_buttons.append(styled_button("➡️ بعدی", f"admin_users_page_{page+1}".encode(), style=STYLE_INFO))
         buttons.append(nav_buttons)
 
         buttons.append([styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)])
@@ -1413,12 +1399,6 @@ def get_users_list_page(page=0, per_page=10):
     except Exception as e:
         logging.error(f"❌ خطا در دریافت لیست کاربران: {e}")
         return [[styled_button("➜ بازگشت", b"admin_panel", style=STYLE_OFF)]]
-    finally:
-        if cursor:
-            try: cursor.close()
-            except Exception: pass
-        if conn:
-            release_db_connection(conn)
 
 def get_user_detail_buttons(user_id):
     return [
@@ -1557,37 +1537,17 @@ def get_admin_actions_grid_keyboard(target_id, current_action):
 
 def _load_card_font(size, bold=True):
     """فونت لاتین برای کارت پنل؛ روی چند مسیر رایج امتحان می‌شود و در نبودشان
-    به فونت پیش‌فرض Pillow برمی‌گردد (بدون کرش).
-
-    آپدیت ۲۰۲۶:
-      - رفع باگ bold=False که به‌اشتباه از Bold استفاده می‌کرد.
-      - کش‌کردن فونت‌ها برای کاهش I/O.
-      - لاگ هشدار اگه فونت پیش‌فرض استفاده شد.
-    """
-    # آپدیت ۲۰۲۶: کش فونت‌ها.
-    cache_key = (size, bold)
-    cached = _FONT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    به فونت پیش‌فرض Pillow برمی‌گردد (بدون کرش)."""
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        # آپدیت ۲۰۲۶: انتخاب صحیح فونت بر اساس bold.
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]
     for path in candidates:
         try:
-            font = ImageFont.truetype(path, size)
-            _FONT_CACHE[cache_key] = font
-            return font
-        except (OSError, IOError):
+            return ImageFont.truetype(path, size)
+        except Exception:
             continue
-    logging.warning("⚠️ هیچ فونت TTF یافت نشد؛ از bitmap پیش‌فرض استفاده می‌شود (کیفیت پایین).")
-    default_font = ImageFont.load_default()
-    _FONT_CACHE[cache_key] = default_font
-    return default_font
-
-# آپدیت ۲۰۲۶: کش فونت‌های بارگذاری‌شده.
-_FONT_CACHE = {}
+    return ImageFont.load_default()
 
 def _card_text_width(draw, text, font):
     bbox = draw.textbbox((0, 0), text, font=font)
@@ -1602,140 +1562,138 @@ async def build_panel_card_image(owner_id, user):
     اگر Pillow نصب نباشد، یا دانلود عکس پروفایل/هر بخش دیگر با خطا مواجه شود،
     None برمی‌گرداند تا پنل بدون تصویر (دقیقاً مثل قبل، فقط متنی) کار کند و
     قابلیت اصلیِ باز شدنِ پنل هرگز به‌خاطر این افزوده به‌هم نریزد.
-
-    آپدیت ۲۰۲۶: کار PIL به یک thread منتقل شده تا event loop بلاک نشه.
     """
     if not _PIL_AVAILABLE:
         return None
     try:
-        # دانلود عکس پروفایل (async) رو همین‌جا انجام می‌دیم.
-        photo_bytes = None
+        W, H = 960, 560
+        bg_top, bg_bottom = (6, 8, 24), (24, 8, 48)
+        img = Image.new("RGB", (W, H), bg_top)
+        draw = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y / H
+            r = int(bg_top[0] + (bg_bottom[0] - bg_top[0]) * t)
+            g = int(bg_top[1] + (bg_bottom[1] - bg_top[1]) * t)
+            b = int(bg_top[2] + (bg_bottom[2] - bg_top[2]) * t)
+            draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+        grid_color = (34, 52, 82)
+        for x in range(0, W, 46):
+            draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
+        for y in range(0, H, 46):
+            draw.line([(0, y), (W, y)], fill=grid_color, width=1)
+
+        accent = (0, 220, 255)
+        bl, pad, lw = 50, 30, 5
+        for (cx, cy, dx, dy) in [(pad, pad, 1, 1), (W - pad, pad, -1, 1),
+                                  (pad, H - pad, 1, -1), (W - pad, H - pad, -1, -1)]:
+            draw.line([(cx, cy), (cx + dx * bl, cy)], fill=accent, width=lw)
+            draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
+
+        # ---- آواتار سمت چپ ----
+        avatar_size = 300
+        avatar_x = 70
+        avatar_y = (H - avatar_size) // 2
+
+        avatar_img = None
         try:
             photo_bytes = await bot.download_profile_photo(owner_id, file=bytes)
+            if photo_bytes:
+                avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
         except Exception as e:
             log_internal_error("panel_card_avatar_download", f"user={owner_id} err={e}")
-            photo_bytes = None
+            avatar_img = None
 
-        # آپدیت ۲۰۲۶: offload رندر PIL به thread.
-        return await asyncio.to_thread(_render_panel_card_sync, owner_id, user, photo_bytes)
+        if avatar_img is None:
+            avatar_img = Image.new("RGB", (avatar_size, avatar_size), (26, 30, 54))
+            ad = ImageDraw.Draw(avatar_img)
+            initial_source = user.get("username") or str(owner_id)
+            initial = initial_source[0].upper()
+            init_font = _load_card_font(140)
+            iw = _card_text_width(ad, initial, init_font)
+            ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 70), initial, font=init_font, fill=(0, 220, 255))
+        else:
+            # مربعی‌کردن (Crop از وسط) قبل از دایره‌ای‌کردن، تا عکس‌های غیرمربعی کش نیایند
+            w0, h0 = avatar_img.size
+            side = min(w0, h0)
+            left, top = (w0 - side) // 2, (h0 - side) // 2
+            avatar_img = avatar_img.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size))
+
+        mask = Image.new("L", (avatar_size, avatar_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
+
+        ring_pad = 16
+        ring_size = avatar_size + ring_pad * 2
+        ring_layer = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
+        ring_draw = ImageDraw.Draw(ring_layer)
+        ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=7)
+        ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(7))
+        img.paste(ring_blur, (avatar_x - ring_pad, avatar_y - ring_pad), ring_blur)
+        img.paste(ring_layer, (avatar_x - ring_pad, avatar_y - ring_pad), ring_layer)
+        img.paste(avatar_img, (avatar_x, avatar_y), mask)
+
+        # ---- بلوکِ متنیِ سمت راست ----
+        right_x = avatar_x + avatar_size + 50
+        right_margin = 26
+        max_text_width = W - right_x - right_margin
+
+        # طبق گزارش «متن‌ها هنوز کوچیکن»، این نسخه فونت‌ها را به‌طور محسوس بزرگ‌تر
+        # کرده (نه فقط چند پیکسل) - چون تلگرام تصویرِ اینلاین را در حبابِ چت با
+        # عرضِ فیزیکیِ محدود نمایش می‌دهد، اندازه‌ی مؤثرِ فونت روی صفحه از نسبتِ
+        # «اندازه‌ی فونت به عرضِ کل تصویر» می‌آید، نه از رزولوشنِ خام؛ پس برای
+        # واقعاً بزرگ‌تر دیده‌شدن، این نسبت باید افزایش پیدا کند.
+        title_font = _load_card_font(104, bold=True)
+        sub_font_small = _load_card_font(30, bold=False)
+        title_text = "NOVA SELF"
+        title_y = 60
+
+        # اگر به هر دلیلی (مثلاً فونتِ Fallback) عنوان از عرضِ باقیمانده رد بشود،
+        # فونتش را تا حدی کوچک می‌کنیم که کامل جا شود (به‌جای بریده‌شدن).
+        tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
+        while tw_title > max_text_width and title_font.size > 50:
+            title_font = _load_card_font(title_font.size - 2, bold=True)
+            tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
+
+        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_layer)
+        glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(16))
+        img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
+
+        sub_text = "SELF MANAGEMENT PANEL"
+        draw.text((right_x + 4, title_y + 130), sub_text, font=sub_font_small, fill=(120, 170, 220))
+        draw.line([(right_x, title_y + 185), (right_x + 380, title_y + 185)], fill=(0, 150, 190), width=3)
+
+        info_font = _load_card_font(70, bold=True)
+        sub_font = _load_card_font(48, bold=False)
+        # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
+        # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
+        username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
+        id_text = f"ID: {owner_id}"
+
+        # اگر یوزرنیم طولانی بود (تلگرام حداکثر ۳۲ کاراکتر مجاز می‌داند)، فونت را
+        # تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود.
+        uw = _card_text_width(draw, username_text, info_font)
+        while uw > max_text_width and info_font.size > 24:
+            info_font = _load_card_font(info_font.size - 2, bold=True)
+            uw = _card_text_width(draw, username_text, info_font)
+
+        draw.text((right_x, title_y + 228), username_text, font=info_font, fill=(255, 255, 255))
+        draw.text((right_x, title_y + 312), id_text, font=sub_font, fill=(150, 205, 255))
+
+        tag_font = _load_card_font(22, bold=False)
+        tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
+        tgw = _card_text_width(draw, tag_text, tag_font)
+        draw.text(((W - tgw) / 2, H - 44), tag_text, font=tag_font, fill=(85, 115, 155))
+
+        out = io.BytesIO()
+        out.name = "novaself_panel.png"
+        img.save(out, "PNG")
+        out.seek(0)
+        return out
     except Exception as e:
         log_internal_error("panel_card_image", e)
         return None
-
-
-def _render_panel_card_sync(owner_id, user, photo_bytes):
-    """نسخه‌ی همگامِ رندر کارت پنل — در thread اجرا می‌شه."""
-    W, H = 960, 560
-    bg_top, bg_bottom = (6, 8, 24), (24, 8, 48)
-    img = Image.new("RGB", (W, H), bg_top)
-    draw = ImageDraw.Draw(img)
-    for y in range(H):
-        t = y / H
-        r = int(bg_top[0] + (bg_bottom[0] - bg_top[0]) * t)
-        g = int(bg_top[1] + (bg_bottom[1] - bg_top[1]) * t)
-        b = int(bg_top[2] + (bg_bottom[2] - bg_top[2]) * t)
-        draw.line([(0, y), (W, y)], fill=(r, g, b))
-
-    grid_color = (34, 52, 82)
-    for x in range(0, W, 46):
-        draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
-    for y in range(0, H, 46):
-        draw.line([(0, y), (W, y)], fill=grid_color, width=1)
-
-    accent = (0, 220, 255)
-    bl, pad, lw = 50, 30, 5
-    for (cx, cy, dx, dy) in [(pad, pad, 1, 1), (W - pad, pad, -1, 1),
-                              (pad, H - pad, 1, -1), (W - pad, H - pad, -1, -1)]:
-        draw.line([(cx, cy), (cx + dx * bl, cy)], fill=accent, width=lw)
-        draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
-
-    # ---- آواتار سمت چپ ----
-    avatar_size = 300
-    avatar_x = 70
-    avatar_y = (H - avatar_size) // 2
-
-    avatar_img = None
-    if photo_bytes:
-        try:
-            avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-        except Exception:
-            avatar_img = None
-
-    if avatar_img is None:
-        avatar_img = Image.new("RGB", (avatar_size, avatar_size), (26, 30, 54))
-        ad = ImageDraw.Draw(avatar_img)
-        initial_source = user.get("username") or str(owner_id)
-        initial = initial_source[0].upper()
-        init_font = _load_card_font(140)
-        iw = _card_text_width(ad, initial, init_font)
-        ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 70), initial, font=init_font, fill=(0, 220, 255))
-    else:
-        w0, h0 = avatar_img.size
-        side = min(w0, h0)
-        left, top = (w0 - side) // 2, (h0 - side) // 2
-        avatar_img = avatar_img.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size))
-
-    mask = Image.new("L", (avatar_size, avatar_size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
-
-    ring_pad = 16
-    ring_size = avatar_size + ring_pad * 2
-    ring_layer = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
-    ring_draw = ImageDraw.Draw(ring_layer)
-    ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=7)
-    ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(7))
-    img.paste(ring_blur, (avatar_x - ring_pad, avatar_y - ring_pad), ring_blur)
-    img.paste(ring_layer, (avatar_x - ring_pad, avatar_y - ring_pad), ring_layer)
-    img.paste(avatar_img, (avatar_x, avatar_y), mask)
-
-    # ---- بلوکِ متنیِ سمت راست ----
-    right_x = avatar_x + avatar_size + 50
-    right_margin = 26
-    max_text_width = W - right_x - right_margin
-
-    title_font = _load_card_font(104, bold=True)
-    sub_font_small = _load_card_font(30, bold=False)
-    title_text = "NOVA SELF"
-    title_y = 60
-
-    tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
-    while tw_title > max_text_width and title_font.size > 50:
-        title_font = _load_card_font(title_font.size - 2, bold=True)
-        tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
-
-    glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_draw = ImageDraw.Draw(glow_layer)
-    glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
-    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(16))
-    img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
-
-    sub_text = "SELF MANAGEMENT PANEL"
-    draw.text((right_x + 4, title_y + 130), sub_text, font=sub_font_small, fill=(120, 170, 220))
-    draw.line([(right_x, title_y + 185), (right_x + 380, title_y + 185)], fill=(0, 150, 190), width=3)
-
-    info_font = _load_card_font(70, bold=True)
-    sub_font = _load_card_font(48, bold=False)
-    username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
-    id_text = f"ID: {owner_id}"
-
-    uw = _card_text_width(draw, username_text, info_font)
-    while uw > max_text_width and info_font.size > 24:
-        info_font = _load_card_font(info_font.size - 2, bold=True)
-        uw = _card_text_width(draw, username_text, info_font)
-
-    draw.text((right_x, title_y + 228), username_text, font=info_font, fill=(255, 255, 255))
-    draw.text((right_x, title_y + 312), id_text, font=sub_font, fill=(150, 205, 255))
-
-    tag_font = _load_card_font(22, bold=False)
-    tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
-    tgw = _card_text_width(draw, tag_text, tag_font)
-    draw.text(((W - tgw) / 2, H - 44), tag_text, font=tag_font, fill=(85, 115, 155))
-
-    out = io.BytesIO()
-    out.name = "novaself_panel.png"
-    img.save(out, "PNG")
-    out.seek(0)
-    return out
 
