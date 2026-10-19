@@ -14,6 +14,8 @@ User/آرگومان‌های ورودی و کش‌های خواندنیِ nova_s
 """
 
 import io
+import time
+import asyncio
 import logging
 from telethon import Button
 try:
@@ -1535,165 +1537,83 @@ def get_admin_actions_grid_keyboard(target_id, current_action):
     buttons.append([styled_button("➜ بازگشت", f"admin_features_{target_id}".encode(), style=STYLE_OFF)])
     return buttons
 
-def _load_card_font(size, bold=True):
-    """فونت لاتین برای کارت پنل؛ روی چند مسیر رایج امتحان می‌شود و در نبودشان
-    به فونت پیش‌فرض Pillow برمی‌گردد (بدون کرش)."""
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
-    for path in candidates:
-        try:
-            return ImageFont.truetype(path, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
+def count_active_features(user):
+    """تعداد قابلیت‌های روشنِ کاربر (برای کارت پنل). اگر سلف خاموش باشد، صفر."""
+    if not user.get("status"):
+        return 0
+    flags = (
+        "name_time", "bio_time", "date_enabled", "secretary_enabled", "reaction_enabled",
+        "autoreply_enabled", "autoseen_enabled", "meow_enabled", "fish_enabled",
+        "meowpoint_enabled", "streetcat_enabled", "fridge_enabled",
+    )
+    count = sum(1 for f in flags if user.get(f))
+    if user.get("text_mode"):
+        count += 1
+    if user.get("active_action") not in (None, "none"):
+        count += 1
+    if any(user.get(f) for f in ("cloud_media_enabled", "cloud_deleted_enabled",
+                                  "cloud_edited_enabled", "cloud_timed_enabled")):
+        count += 1
+    return count
 
-def _card_text_width(draw, text, font):
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return bbox[2] - bbox[0]
+def _expiry_en(diamonds):
+    diamonds = float(diamonds or 0)
+    if diamonds <= 0 or not DIAMOND_RATE_PER_HOUR:
+        return "Expired"
+    total_hours = diamonds / DIAMOND_RATE_PER_HOUR
+    days, hours = int(total_hours // 24), int(total_hours % 24)
+    return f"{days}d {hours}h" if days > 0 else f"{hours}h"
+
+async def _measure_ping_ms(owner_id):
+    """پینگ واقعی: زمانِ یک RPC (get_me) روی کلاینت خودِ سلف؛ اگر در دسترس نبود، روی بات."""
+    client = nova_state.active_clients.get(owner_id)
+    if client is None or not client.is_connected():
+        client = bot
+    try:
+        start = time.perf_counter()
+        await asyncio.wait_for(client.get_me(), timeout=4)
+        return f"{int((time.perf_counter() - start) * 1000)} ms"
+    except Exception as e:
+        log_internal_error("panel_card_ping", e)
+        return "—"
 
 async def build_panel_card_image(owner_id, user):
     """
-    ساخت تصویر «کارت پنل» با ظاهر دیجیتالی برای دستور `.پنل` (افقی، 960×560):
-    سمت چپ عکسِ پروفایلِ کاربر در دایره‌ای بزرگ با حلقه‌ی نئونی، سمت راست عنوان
-    NOVA SELF و زیرش یوزرنیم و آیدی عددی‌اش.
+    ساخت تصویر «کارت پنل» (بالای پیام `.پنل`) با داده‌های واقعیِ کاربر: وضعیت سلف،
+    پینگ، تعداد امکانات فعال، ساعت و تاریخ تهران، مدت فعالیت (از روی موجودی الماس)
+    و شناسه‌ی اکانت؛ عکس پروفایل کاربر داخل حلقه‌ی وسط قرار می‌گیرد. طراحی در nova_card.py.
 
-    اگر Pillow نصب نباشد، یا دانلود عکس پروفایل/هر بخش دیگر با خطا مواجه شود،
-    None برمی‌گرداند تا پنل بدون تصویر (دقیقاً مثل قبل، فقط متنی) کار کند و
-    قابلیت اصلیِ باز شدنِ پنل هرگز به‌خاطر این افزوده به‌هم نریزد.
+    اگر Pillow نصب نباشد یا هر بخشی خطا بدهد، None برمی‌گرداند تا پنل بدون تصویر
+    (متنی) باز شود و قابلیت اصلی هرگز به‌خاطر این افزوده به‌هم نریزد.
     """
     if not _PIL_AVAILABLE:
         return None
     try:
-        W, H = 960, 560
-        bg_top, bg_bottom = (6, 8, 24), (24, 8, 48)
-        img = Image.new("RGB", (W, H), bg_top)
-        draw = ImageDraw.Draw(img)
-        for y in range(H):
-            t = y / H
-            r = int(bg_top[0] + (bg_bottom[0] - bg_top[0]) * t)
-            g = int(bg_top[1] + (bg_bottom[1] - bg_top[1]) * t)
-            b = int(bg_top[2] + (bg_bottom[2] - bg_top[2]) * t)
-            draw.line([(0, y), (W, y)], fill=(r, g, b))
+        import nova_card
 
-        grid_color = (34, 52, 82)
-        for x in range(0, W, 46):
-            draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
-        for y in range(0, H, 46):
-            draw.line([(0, y), (W, y)], fill=grid_color, width=1)
-
-        accent = (0, 220, 255)
-        bl, pad, lw = 50, 30, 5
-        for (cx, cy, dx, dy) in [(pad, pad, 1, 1), (W - pad, pad, -1, 1),
-                                  (pad, H - pad, 1, -1), (W - pad, H - pad, -1, -1)]:
-            draw.line([(cx, cy), (cx + dx * bl, cy)], fill=accent, width=lw)
-            draw.line([(cx, cy), (cx, cy + dy * bl)], fill=accent, width=lw)
-
-        # ---- آواتار سمت چپ ----
-        avatar_size = 300
-        avatar_x = 70
-        avatar_y = (H - avatar_size) // 2
-
-        avatar_img = None
+        avatar_bytes = None
         try:
-            photo_bytes = await bot.download_profile_photo(owner_id, file=bytes)
-            if photo_bytes:
-                avatar_img = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+            avatar_bytes = await bot.download_profile_photo(owner_id, file=bytes)
         except Exception as e:
             log_internal_error("panel_card_avatar_download", f"user={owner_id} err={e}")
-            avatar_img = None
 
-        if avatar_img is None:
-            avatar_img = Image.new("RGB", (avatar_size, avatar_size), (26, 30, 54))
-            ad = ImageDraw.Draw(avatar_img)
-            initial_source = user.get("username") or str(owner_id)
-            initial = initial_source[0].upper()
-            init_font = _load_card_font(140)
-            iw = _card_text_width(ad, initial, init_font)
-            ad.text(((avatar_size - iw) / 2, avatar_size / 2 - 70), initial, font=init_font, fill=(0, 220, 255))
-        else:
-            # مربعی‌کردن (Crop از وسط) قبل از دایره‌ای‌کردن، تا عکس‌های غیرمربعی کش نیایند
-            w0, h0 = avatar_img.size
-            side = min(w0, h0)
-            left, top = (w0 - side) // 2, (h0 - side) // 2
-            avatar_img = avatar_img.crop((left, top, left + side, top + side)).resize((avatar_size, avatar_size))
-
-        mask = Image.new("L", (avatar_size, avatar_size), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, avatar_size, avatar_size), fill=255)
-
-        ring_pad = 16
-        ring_size = avatar_size + ring_pad * 2
-        ring_layer = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
-        ring_draw = ImageDraw.Draw(ring_layer)
-        ring_draw.ellipse((3, 3, ring_size - 3, ring_size - 3), outline=(0, 220, 255, 255), width=7)
-        ring_blur = ring_layer.filter(ImageFilter.GaussianBlur(7))
-        img.paste(ring_blur, (avatar_x - ring_pad, avatar_y - ring_pad), ring_blur)
-        img.paste(ring_layer, (avatar_x - ring_pad, avatar_y - ring_pad), ring_layer)
-        img.paste(avatar_img, (avatar_x, avatar_y), mask)
-
-        # ---- بلوکِ متنیِ سمت راست ----
-        right_x = avatar_x + avatar_size + 50
-        right_margin = 26
-        max_text_width = W - right_x - right_margin
-
-        # طبق گزارش «متن‌ها هنوز کوچیکن»، این نسخه فونت‌ها را به‌طور محسوس بزرگ‌تر
-        # کرده (نه فقط چند پیکسل) - چون تلگرام تصویرِ اینلاین را در حبابِ چت با
-        # عرضِ فیزیکیِ محدود نمایش می‌دهد، اندازه‌ی مؤثرِ فونت روی صفحه از نسبتِ
-        # «اندازه‌ی فونت به عرضِ کل تصویر» می‌آید، نه از رزولوشنِ خام؛ پس برای
-        # واقعاً بزرگ‌تر دیده‌شدن، این نسبت باید افزایش پیدا کند.
-        title_font = _load_card_font(104, bold=True)
-        sub_font_small = _load_card_font(30, bold=False)
-        title_text = "NOVA SELF"
-        title_y = 60
-
-        # اگر به هر دلیلی (مثلاً فونتِ Fallback) عنوان از عرضِ باقیمانده رد بشود،
-        # فونتش را تا حدی کوچک می‌کنیم که کامل جا شود (به‌جای بریده‌شدن).
-        tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
-        while tw_title > max_text_width and title_font.size > 50:
-            title_font = _load_card_font(title_font.size - 2, bold=True)
-            tw_title = _card_text_width(ImageDraw.Draw(img), title_text, title_font)
-
-        glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        glow_draw = ImageDraw.Draw(glow_layer)
-        glow_draw.text((right_x, title_y), title_text, font=title_font, fill=(0, 220, 255, 255))
-        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(16))
-        img = Image.alpha_composite(img.convert("RGBA"), glow_layer).convert("RGB")
-        draw = ImageDraw.Draw(img)
-        draw.text((right_x, title_y), title_text, font=title_font, fill=(255, 255, 255))
-
-        sub_text = "SELF MANAGEMENT PANEL"
-        draw.text((right_x + 4, title_y + 130), sub_text, font=sub_font_small, fill=(120, 170, 220))
-        draw.line([(right_x, title_y + 185), (right_x + 380, title_y + 185)], fill=(0, 150, 190), width=3)
-
-        info_font = _load_card_font(70, bold=True)
-        sub_font = _load_card_font(48, bold=False)
-        # نکته: فونت لاتین (DejaVu/Liberation) شکل‌دهیِ درستِ حروف فارسی/عربی را
-        # پشتیبانی نمی‌کند، پس عمداً همه‌ی متن‌های داخل خودِ تصویر انگلیسی هستند.
-        username_text = f"@{user.get('username')}" if user.get("username") else "No Username"
-        id_text = f"ID: {owner_id}"
-
-        # اگر یوزرنیم طولانی بود (تلگرام حداکثر ۳۲ کاراکتر مجاز می‌داند)، فونت را
-        # تا حدی کوچک می‌کنیم که در عرضِ باقیمانده جا شود.
-        uw = _card_text_width(draw, username_text, info_font)
-        while uw > max_text_width and info_font.size > 24:
-            info_font = _load_card_font(info_font.size - 2, bold=True)
-            uw = _card_text_width(draw, username_text, info_font)
-
-        draw.text((right_x, title_y + 228), username_text, font=info_font, fill=(255, 255, 255))
-        draw.text((right_x, title_y + 312), id_text, font=sub_font, fill=(150, 205, 255))
-
-        tag_font = _load_card_font(22, bold=False)
-        tag_text = "NOVASELF  •  DIGITAL IDENTITY CARD"
-        tgw = _card_text_width(draw, tag_text, tag_font)
-        draw.text(((W - tgw) / 2, H - 44), tag_text, font=tag_font, fill=(85, 115, 155))
-
-        out = io.BytesIO()
-        out.name = "novaself_panel.png"
-        img.save(out, "PNG")
-        out.seek(0)
-        return out
+        ping = await _measure_ping_ms(owner_id)
+        now = tehran_now()
+        initial_source = user.get("username") or str(owner_id)
+        data = {
+            "online": bool(user.get("status")),
+            "time": now.strftime("%H:%M"),
+            "date": format_date(now, user.get("date_type", "shamsi")),
+            "ping": ping,
+            "features": count_active_features(user),
+            "duration_fa": format_expiry(user.get("diamonds", 0)),
+            "duration_en": _expiry_en(user.get("diamonds", 0)),
+            "account_id": owner_id,
+            "avatar_bytes": avatar_bytes,
+            "initial": initial_source[0].upper(),
+        }
+        # رندر سنگین (CPU) در Thread جدا تا حلقه‌ی رویداد ربات قفل نشود
+        return await asyncio.get_running_loop().run_in_executor(None, nova_card.render_panel_card, data)
     except Exception as e:
         log_internal_error("panel_card_image", e)
         return None
-

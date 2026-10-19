@@ -1,4 +1,4 @@
-telethon>=1.45
+telethon>=1.44.0
 pytz
 psycopg2-binary
 jdatetime
@@ -6,3 +6,5 @@ hijridate
 aiohttp
 Pillow
 imageio-ffmpeg
+arabic-reshaper
+python-bidi

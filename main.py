@@ -26,6 +26,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, MessageNotModifiedError
 
 from webapp_api import create_webapp_app, run_webapp_server
+from telethon.tl.types import InputBotInlineMessageID
 import nova_state
 from nova_utils import (
     STYLE_OFF, STYLE_ON, build_receiver_receipt, build_sender_receipt,
@@ -404,6 +405,17 @@ async def callback_handler(event):
 
         # دکمه‌های نمایشیِ «void» (مثل صفحه‌ی حساب کاربری) فقط بعد از بازکردنِ پیشوند
         # قابل تشخیص‌اند؛ قبلاً داخل پنل بی‌پاسخ می‌ماندند و دکمه مدتی در حالت loading می‌ماند.
+        if data == b"void":
+            await event.answer()
+            return
+
+    elif isinstance(getattr(event.query, "msg_id", None), InputBotInlineMessageID) and not data.startswith(b"join_"):
+        # هر کلیک روی پیامِ «Inline» (فقط پنل `.پنل` این‌طور ساخته می‌شود؛ منوهای /start
+        # پیام‌های عادی‌اند) باید به‌عنوان کلیکِ پنل پردازش شود، حتی اگر به هر دلیلی
+        # دکمه پیشوند مالکیت (ip_) نداشته باشد. بدون این، همان کلیک مثل منوی /start
+        # پردازش می‌شد: کیبوردِ پنل (و دکمه‌ی بستن) با دکمه‌های شیشه‌ایِ منوی استارت
+        # جایگزین می‌شد.
+        panel_owner_id = user_id
         if data == b"void":
             await event.answer()
             return
@@ -2068,6 +2080,11 @@ async def callback_handler(event):
         if is_feature_locked(user_id, "secretary"):
             await event.answer("این قابلیت برای شما قفل شده است.", alert=True)
             return
+        # خروج از مرحله‌ی انتظارِ متن/تایم منشی (مثلاً با دکمه‌ی «بازگشت» از صفحه‌ی راهنما)
+        if str(user.get("step", "")).startswith("secretary_get"):
+            user["step"] = "managed"
+            user.pop("secretary_panel_chat_id", None)
+            user.pop("secretary_panel_msg_id", None)
         await safe_edit(event, get_secretary_menu_text(user), buttons=get_secretary_menu_keyboard(user))
         return
 
@@ -2424,7 +2441,8 @@ async def callback_handler(event):
             "📝 هر نوع محتوایی که می‌خواهید منشی به‌جای شما بفرستد را ارسال کنید:\n\n"
             "متن ساده، متنِ استایل‌دار (Bold/Italic/Underline/Strike/Spoiler/Quote/لینک)، "
             "عکس (+توضیح)، ویدیو (+توضیح)، GIF، استیکر، فایل، ویس، Video Note، موزیک، "
-            "یا حتی یک پیامِ Forward‌شده - همان محتوا عیناً به‌عنوان پاسخ منشی ذخیره می‌شود."
+            "یا حتی یک پیامِ Forward‌شده - همان محتوا عیناً به‌عنوان پاسخ منشی ذخیره می‌شود.",
+            buttons=[[styled_button("➜ بازگشت", b"menu_secretary", style=STYLE_OFF)]]
         )
         return
 
@@ -2442,7 +2460,8 @@ async def callback_handler(event):
             "نمونه:\n"
             "▫️ ۱ دقیقه = 60\n"
             "▫️ ۵ دقیقه = 300\n"
-            "▫️ ۱۰ دقیقه = 600"
+            "▫️ ۱۰ دقیقه = 600",
+            buttons=[[styled_button("➜ بازگشت", b"menu_secretary", style=STYLE_OFF)]]
         )
         return
 
